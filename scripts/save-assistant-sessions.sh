@@ -1262,17 +1262,17 @@ resolve_pane_candidates() {
 			claude)
 				session_id="$cached_sid"
 				# Keep legacy fallback behavior when cache misses (state file + --resume).
-				[ -z "$session_id" ] && session_id=$(get_claude_session "$cand_pid" "$cand_args")
+				[ -z "$session_id" ] && session_id=$(get_claude_session "$cand_pid" "$cand_args" || true)
 				;;
-			copilot) session_id=$(get_copilot_session "$cand_pid" "$cand_args" "$allow_deferred_fallback") ;;
+			copilot) session_id=$(get_copilot_session "$cand_pid" "$cand_args" "$allow_deferred_fallback" || true) ;;
 			opencode)
 				session_id="$cached_sid"
-				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_deferred_fallback")
+				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_deferred_fallback" || true)
 				;;
-			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
-			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
-			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty") ;;
-			grok) session_id=$(get_grok_session "$cand_pid" "$cand_args") ;;
+			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd" || true) ;;
+			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd" || true) ;;
+			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty" || true) ;;
+			grok) session_id=$(get_grok_session "$cand_pid" "$cand_args" || true) ;;
 			esac
 
 			if [ -n "$session_id" ]; then
@@ -1768,13 +1768,13 @@ emit_session() {
 	local log_missing="${7:-1}"
 	local session_id=""
 	case "$tool" in
-	claude) session_id=$(get_claude_session "$cpid" "$cargs") ;;
-	copilot) session_id=$(get_copilot_session "$cpid" "$cargs") ;;
-	opencode) session_id=$(get_opencode_session "$cpid" "$cargs" "$cwd" "$allow_opencode_db") ;;
-	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd") ;;
-	pi) session_id=$(get_pi_session "$cpid" "$cargs" "$cwd") ;;
-	omp) session_id=$(get_omp_session "$cpid" "$cargs" "$cwd" "") ;;
-	grok) session_id=$(get_grok_session "$cpid" "$cargs") ;;
+	claude) session_id=$(get_claude_session "$cpid" "$cargs" || true) ;;
+	copilot) session_id=$(get_copilot_session "$cpid" "$cargs" || true) ;;
+	opencode) session_id=$(get_opencode_session "$cpid" "$cargs" "$cwd" "$allow_opencode_db" || true) ;;
+	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd" || true) ;;
+	pi) session_id=$(get_pi_session "$cpid" "$cargs" "$cwd" || true) ;;
+	omp) session_id=$(get_omp_session "$cpid" "$cargs" "$cwd" "" || true) ;;
+	grok) session_id=$(get_grok_session "$cpid" "$cargs" || true) ;;
 	esac
 
 	if [ -n "$session_id" ]; then

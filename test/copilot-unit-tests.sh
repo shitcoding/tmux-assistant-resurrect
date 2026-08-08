@@ -170,6 +170,29 @@ assert_eq "native Windows returns no open-file mapping" "" \
 	"$(get_copilot_session 1001 "copilot" 0)"
 assert_missing "native Windows does not invoke Unix lsof" "$LSOF_MARKER"
 
+echo "== unresolved candidate is non-fatal under set -e =="
+UNRESOLVED_PARTS="$SANDBOX/unresolved-parts"
+UNRESOLVED_CACHE="$SANDBOX/unresolved-cache"
+: >"$UNRESOLVED_PARTS"
+: >"$UNRESOLVED_CACHE"
+if (
+	set -e
+	COPILOT_PLATFORM=Linux
+	export COPILOT_PLATFORM
+	resolve_pane_candidates \
+		"test:1.1" "/tmp" "/dev/ttys001" \
+		$'copilot\0379999\037copilot' $'\037' 0 \
+		"$UNRESOLVED_CACHE" "$UNRESOLVED_PARTS"
+); then
+	PASS=$((PASS + 1))
+	printf '  [pass] unresolved Copilot candidate does not abort save\n'
+else
+	FAIL=$((FAIL + 1))
+	printf '  [FAIL] unresolved Copilot candidate aborted save\n'
+fi
+assert_eq "unresolved candidate emits no session entry" "0" \
+	"$(wc -l <"$UNRESOLVED_PARTS" | tr -d ' ')"
+
 echo "== extract_cli_args =="
 unset _SESSION_FLAGS_copilot
 assert_eq "strip session selectors and one-shot prompt" \
