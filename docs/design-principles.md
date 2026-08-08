@@ -7,7 +7,8 @@ classification or screen content analysis. The save script:
 
 1. Takes a single `ps -eo pid=,ppid=,args=` snapshot (efficient, no per-pane calls)
 2. For each tmux pane, finds direct child processes of the pane's shell
-3. Matches binary names via `case` patterns (`*/claude`, `*/opencode`, `*/codex`, `*/pi`, `*/omp`, `*/grok`)
+3. Matches binary names via `case` patterns (`*/claude`, `*/copilot`,
+   `*/opencode`, `*/codex`, `*/pi`, `*/omp`, `*/grok`)
 4. Excludes known false positives (e.g., `opencode run ...` LSP subprocesses)
 
 This is simple, fast, and deterministic. No API calls, no LLM costs, no
@@ -32,6 +33,10 @@ before hooks/plugins have fired):
 - **Claude Code**: `SessionStart` hook state file keyed by Claude's PID
   (primary); `--resume <id>` in process args (fallback -- note: Claude
   overwrites its process title, so this only works if args are still visible)
+- **GitHub Copilot CLI**: PID-specific open-file lookup for
+  `~/.copilot/session-state/<uuid>/session.db` via `/proc/<pid>/fd` on
+  Linux/WSL or `lsof` on macOS/BSD (primary); `--session-id` / `--resume` in
+  process args (fallback). Native Windows supports the argv fallback only.
 - **OpenCode**: `-s` / `--session` flag in process args (fast path); plugin
   state file (fallback for runtime session switches); SQLite database query
   at `~/.local/share/opencode/opencode.db` matching the pane's cwd (version-
@@ -68,6 +73,10 @@ To add support for a new tool:
   `process.title = 'claude'`. This means `--resume <id>` is NOT visible in
   `ps` output -- the state file from the `SessionStart` hook is the only
   reliable source of session IDs for Claude.
+- **GitHub Copilot CLI** uses an npm loader plus a native child process. Both
+  may match detection, but only the native process holds the current
+  per-session `session.db` open. Candidate resolution therefore prefers
+  PID-specific open-file state before considering possibly stale loader argv.
 - **Codex CLI** runs via Node.js and preserves its full command line in `ps`,
   so `codex resume <id>` is always visible.
 - **OpenCode** is a native Go binary (distributed via npm as `opencode-ai`
@@ -85,5 +94,14 @@ To add support for a new tool:
 
 - `pgrep -P` is unreliable on macOS (silently misses children). Always use
   `ps -eo pid=,ppid=` with awk filtering instead.
+- Copilot's active session is resolved with the system `lsof`; Linux/WSL uses
+  `/proc/<pid>/fd` and does not invoke `lsof`.
 - tmux 3.4 converts tab characters to underscores in `-F` format output. The
   save script uses pipe `|` as the delimiter instead.
+
+## Windows considerations
+
+- WSL follows the Linux `/proc` path.
+- Native Windows has no PID-specific open-file implementation. Copilot sessions
+  are recoverable only when `--session-id <uuid>` or `--resume <uuid>` remains
+  visible in process args.

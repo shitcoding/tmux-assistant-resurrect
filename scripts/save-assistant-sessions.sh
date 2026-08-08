@@ -111,6 +111,135 @@ get_claude_session() {
 	fi
 }
 
+copilot_session_state_dir() {
+	echo "${COPILOT_SESSION_STATE_DIR:-$HOME/.copilot/session-state}"
+}
+
+copilot_session_id_from_path() {
+	local path="$1"
+	local state_dir sid rest
+	state_dir=$(copilot_session_state_dir)
+	case "$path" in
+	"$state_dir"/*/session.db)
+		rest="${path#"$state_dir"/}"
+		sid="${rest%%/*}"
+		[ "$rest" = "$sid/session.db" ] || return 0
+		if echo "$sid" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+			echo "$sid"
+		fi
+		;;
+	esac
+}
+
+copilot_lsof_bin() {
+	local lsof_bin="${COPILOT_LSOF:-}"
+	if [ -z "$lsof_bin" ]; then
+		lsof_bin=$(command -v lsof 2>/dev/null || true)
+		[ -z "$lsof_bin" ] && [ -x /usr/sbin/lsof ] && lsof_bin=/usr/sbin/lsof
+	fi
+	[ -n "$lsof_bin" ] && [ -x "$lsof_bin" ] && echo "$lsof_bin"
+}
+
+prime_copilot_open_files() {
+	local matches="$1"
+	local platform="${COPILOT_PLATFORM:-$(uname -s 2>/dev/null || echo unknown)}"
+	case "$platform" in
+	Darwin | FreeBSD | NetBSD | OpenBSD) ;;
+	*) return 0 ;;
+	esac
+
+	local pids lsof_bin
+	pids=$(printf '%s\n' "$matches" | awk -F'\t' '
+		$2 == "copilot" && !seen[$3]++ {
+			printf "%s%s", (count++ ? "," : ""), $3
+		}
+	')
+	[ -n "$pids" ] || return 0
+	lsof_bin=$(copilot_lsof_bin)
+	[ -n "$lsof_bin" ] || return 0
+
+	COPILOT_LSOF_SNAPSHOT=$("$lsof_bin" -a -p "$pids" -Fn 2>/dev/null || true)
+	COPILOT_LSOF_SNAPSHOT_READY=1
+	export COPILOT_LSOF_SNAPSHOT COPILOT_LSOF_SNAPSHOT_READY
+}
+
+get_copilot_session_from_proc() {
+	local child_pid="$1"
+	local proc_root="${COPILOT_PROC_ROOT:-/proc}"
+	local fd target sid
+	for fd in "$proc_root/$child_pid/fd"/*; do
+		[ -e "$fd" ] || [ -L "$fd" ] || continue
+		target=$(readlink "$fd" 2>/dev/null || true)
+		[ -n "$target" ] || continue
+		sid=$(copilot_session_id_from_path "$target")
+		if [ -n "$sid" ]; then
+			echo "$sid"
+			return
+		fi
+	done
+}
+
+get_copilot_session_from_lsof() {
+	local child_pid="$1"
+	local snapshot="${COPILOT_LSOF_SNAPSHOT:-}"
+	if [ "${COPILOT_LSOF_SNAPSHOT_READY:-0}" != "1" ]; then
+		local lsof_bin
+		lsof_bin=$(copilot_lsof_bin)
+		[ -n "$lsof_bin" ] || return 0
+		snapshot=$("$lsof_bin" -a -p "$child_pid" -Fn 2>/dev/null || true)
+	fi
+
+	local line path sid current_pid=""
+	while IFS= read -r line; do
+		case "$line" in
+		p*) current_pid="${line#p}"; continue ;;
+		n*) path="${line#n}" ;;
+		*) continue ;;
+		esac
+		[ -z "$current_pid" ] || [ "$current_pid" = "$child_pid" ] || continue
+		sid=$(copilot_session_id_from_path "$path")
+		if [ -n "$sid" ]; then
+			echo "$sid"
+			return
+		fi
+	done <<EOF
+$snapshot
+EOF
+}
+
+get_copilot_session() {
+	local child_pid="$1"
+	local args="$2"
+	local allow_args_fallback="${3:-1}"
+	local platform="${COPILOT_PLATFORM:-$(uname -s 2>/dev/null || echo unknown)}"
+	local sid=""
+
+	# Primary: the native Copilot process keeps its current session database
+	# open. This remains accurate after an in-process `/resume`, unlike launcher
+	# argv, and is PID-specific even when many panes share the same cwd.
+	case "$platform" in
+	Linux) sid=$(get_copilot_session_from_proc "$child_pid") ;;
+	Darwin | FreeBSD | NetBSD | OpenBSD) sid=$(get_copilot_session_from_lsof "$child_pid") ;;
+	CYGWIN* | MINGW* | MSYS* | Windows_NT) ;;
+	*)
+		sid=$(get_copilot_session_from_proc "$child_pid")
+		[ -z "$sid" ] && sid=$(get_copilot_session_from_lsof "$child_pid")
+		;;
+	esac
+	if [ -n "$sid" ]; then
+		echo "$sid"
+		return
+	fi
+
+	# Fallback: explicit session selector in argv. This is deferred to resolver
+	# pass 2 so a stale npm-loader argv cannot beat the native child's open DB.
+	[ "$allow_args_fallback" = "1" ] || return 0
+	sid=$(echo "$args" | sed -n 's/.*--session-id[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\).*/\1/p')
+	[ -z "$sid" ] && sid=$(echo "$args" | sed -n 's/.*--resume[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\).*/\1/p')
+	[ -z "$sid" ] && sid=$(echo "$args" | sed -n 's/.*-r[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\).*/\1/p')
+	[ -n "$sid" ] && echo "$sid"
+}
+
 get_opencode_session() {
 	local child_pid="$1"
 	local args="$2"
@@ -906,6 +1035,7 @@ _discover_session_subcmds() {
 # (--resume always means resume), so new flags like --resume-from are
 # auto-discovered without script changes.
 SESSION_FLAG_PATTERN_claude='^--(resume|continue|session-id|fork-session|from-pr)$'
+SESSION_FLAG_PATTERN_copilot='^--(connect|continue|interactive|prompt|resume|session-id)$'
 SESSION_FLAG_PATTERN_opencode='^--session$'
 SESSION_FLAG_PATTERN_pi='^--(session|resume|continue|fork)$'
 SESSION_FLAG_PATTERN_omp='^--(session|resume|continue|fork)$'
@@ -921,6 +1051,12 @@ SESSION_SUBCMD_FLAGS_codex='--last --all --include-non-interactive'
 SESSION_FLAGS_FALLBACK_claude="--continue -c
 --fork-session
 --from-pr
+--resume -r
+--session-id"
+SESSION_FLAGS_FALLBACK_copilot="--connect
+--continue
+--interactive -i
+--prompt -p
 --resume -r
 --session-id"
 SESSION_FLAGS_FALLBACK_opencode="--session -s"
@@ -1000,6 +1136,19 @@ extract_cli_args() {
 		;;
 	esac
 
+	# `ps` flattens argv and loses the quoting boundary around a multi-word
+	# Copilot --prompt/-p and --interactive/-i values. Token-wise stripping
+	# could therefore replay trailing prompt words as positional args and make
+	# resume fail. Keep flags before the initial prompt, but drop it and
+	# everything after it.
+	if [ "$tool" = "copilot" ]; then
+		args=$(echo "$args" | sed -E \
+			-e 's/(^| )--prompt([= ].*)?$//' \
+			-e 's/(^| )-p([= ].*)?$//' \
+			-e 's/(^| )--interactive([= ].*)?$//' \
+			-e 's/(^| )-i([= ].*)?$//')
+	fi
+
 	# Strip tool-specific session/resume flags.
 	local pattern_var="SESSION_FLAG_PATTERN_${tool}"
 	local pattern="${!pattern_var:-}"
@@ -1045,9 +1194,9 @@ extract_cli_args() {
 # Resolve all detected assistant candidates for one pane and emit at most one
 # session entry (first resolvable candidate in BFS order).
 #
-# Preserves legacy OpenCode behavior:
-#   pass 1: PID-specific only (no DB fallback)
-#   pass 2: OpenCode-only with DB fallback enabled
+# Defers ambiguous or potentially stale fallbacks:
+#   pass 1: PID-specific native state only
+#   pass 2: OpenCode DB fallback and Copilot launcher-argv fallback
 resolve_pane_candidates() {
 	local pane_target="$1"
 	local pane_cwd="$2"
@@ -1061,15 +1210,19 @@ resolve_pane_candidates() {
 	local resolved=0 first_tool="" first_pid=""
 	for pass in 1 2; do
 		[ "$resolved" -eq 1 ] && break
-		local allow_opencode_db=0
-		[ "$pass" -eq 2 ] && allow_opencode_db=1
+		local allow_deferred_fallback=0
+		[ "$pass" -eq 2 ] && allow_deferred_fallback=1
 		while IFS="$us" read -r cand_tool cand_pid cand_args; do
 			[ -z "$cand_tool" ] && continue
 			[ -z "$first_tool" ] && first_tool="$cand_tool" && first_pid="$cand_pid"
 
-			# Pass 2 is only for OpenCode DB fallback.
-			if [ "$pass" -eq 2 ] && [ "$cand_tool" != "opencode" ]; then
-				continue
+			# Pass 2 is only for fallbacks that can misidentify a live session:
+			# OpenCode's cwd-scoped DB and Copilot's possibly stale loader argv.
+			if [ "$pass" -eq 2 ]; then
+				case "$cand_tool" in
+				opencode | copilot) ;;
+				*) continue ;;
+				esac
 			fi
 
 			local cached="" cached_sid="" cached_model="" cached_env="null"
@@ -1093,9 +1246,10 @@ resolve_pane_candidates() {
 				# Keep legacy fallback behavior when cache misses (state file + --resume).
 				[ -z "$session_id" ] && session_id=$(get_claude_session "$cand_pid" "$cand_args")
 				;;
+			copilot) session_id=$(get_copilot_session "$cand_pid" "$cand_args" "$allow_deferred_fallback") ;;
 			opencode)
 				session_id="$cached_sid"
-				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_opencode_db")
+				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_deferred_fallback")
 				;;
 			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
 			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
@@ -1361,6 +1515,7 @@ main() {
 			# - opencode excludes "opencode run " subprocesses
 			# - omp excludes hidden "__omp_worker_" subprocesses
 			if      (line ~ /(^claude( |$)|\/claude( |$))/)                                      proc_tool[pid] = "claude"
+			else if (line ~ /(^copilot( |$)|\/copilot( |$))/)                                    proc_tool[pid] = "copilot"
 			else if (line ~ /(^opencode( |$)|\/opencode( |$))/ && line !~ /opencode run /)       proc_tool[pid] = "opencode"
 			else if (line ~ /(^codex( |$)|\/codex( |$))/)                                        proc_tool[pid] = "codex"
 			else if (line ~ /(^pi( |$)|\/pi( |$))/)                                              proc_tool[pid] = "pi"
@@ -1408,6 +1563,10 @@ main() {
 	' "$PANE_FILE" "$PS_FILE")
 
 	rm -f "$PS_FILE" "$PANE_FILE"
+
+	# macOS/BSD: collect all Copilot open files in one lsof call. Per-candidate
+	# extraction runs in subshells, so export the immutable snapshot once.
+	prime_copilot_open_files "$MATCHES"
 
 	# --- Pre-cache all state files in one jq call (requires jq 1.7+) ---
 	# Replaces ~58 per-file jq invocations with one jq + bash associative array.
@@ -1592,6 +1751,7 @@ emit_session() {
 	local session_id=""
 	case "$tool" in
 	claude) session_id=$(get_claude_session "$cpid" "$cargs") ;;
+	copilot) session_id=$(get_copilot_session "$cpid" "$cargs") ;;
 	opencode) session_id=$(get_opencode_session "$cpid" "$cargs" "$cwd" "$allow_opencode_db") ;;
 	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd") ;;
 	pi) session_id=$(get_pi_session "$cpid" "$cargs" "$cwd") ;;

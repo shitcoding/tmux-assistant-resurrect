@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Integration tests for tmux-assistant-resurrect.
-# Runs inside Docker with real assistant CLI binaries (claude/opencode/codex/pi/omp).
+# Runs inside Docker with real assistant CLI binaries
+# (claude/copilot/opencode/codex/pi/omp).
 set -euo pipefail
 
 REPO_DIR="$HOME/tmux-assistant-resurrect"
@@ -214,6 +215,22 @@ kill_pane_children() {
 	fi
 }
 
+# --- Focused Copilot unit suite ---
+
+suite "copilot_unit"
+echo ""
+echo "=== Focused Copilot platform/session tests ==="
+echo ""
+
+copilot_unit_output=""
+if copilot_unit_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/copilot-unit-tests.sh" 2>&1); then
+	echo "$copilot_unit_output"
+	pass "Copilot focused unit suite"
+else
+	echo "$copilot_unit_output"
+	fail "Copilot focused unit suite"
+fi
+
 # --- Test 1: Installation ---
 
 suite "install"
@@ -267,6 +284,7 @@ echo ""
 
 # Start a tmux server
 tmux new-session -d -s test-claude -c /tmp
+tmux new-session -d -s test-copilot -c /tmp
 tmux new-session -d -s test-opencode -c /tmp
 tmux new-session -d -s test-codex -c /tmp
 tmux new-session -d -s test-opencode-nosid -c /tmp
@@ -282,6 +300,46 @@ tmux new-session -d -s test-omp -c "$OMP_TEST_CWD"
 # Launch mock assistants inside tmux panes
 # Claude: just a bare claude process (session ID comes from hook state file)
 tmux send-keys -t test-claude "claude --resume ses_claude_test_123" Enter
+# Copilot: model the npm wrapper plus native child. The wrapper has a stale
+# session selector; only the child holds the current session.db open. This pins
+# the resolver's native-state-before-argv priority.
+copilot_sid="550e8400-e29b-41d4-a716-446655440000"
+copilot_stale_sid="11111111-2222-4333-8444-555555555555"
+copilot_db="$HOME/.copilot/session-state/$copilot_sid/session.db"
+mkdir -p "$(dirname "$copilot_db")"
+: >"$copilot_db"
+copilot_native_holder="/tmp/copilot-native-holder"
+cat >"${copilot_native_holder}.c" <<'COPILOT_NATIVE'
+#include <fcntl.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void) {
+	const char *db = getenv("COPILOT_TEST_DB");
+	if (db == NULL || open(db, O_RDONLY) < 0) {
+		return 1;
+	}
+	for (;;) {
+		pause();
+	}
+}
+COPILOT_NATIVE
+gcc -O2 -o "$copilot_native_holder" "${copilot_native_holder}.c"
+copilot_holder="/tmp/copilot-holder.sh"
+cat >"$copilot_holder" <<'COPILOT_HOLDER'
+#!/usr/bin/env bash
+set -e
+db="$1"
+native="$2"
+(
+	COPILOT_TEST_DB="$db" exec -a copilot "$native" --allow-all --autopilot
+) &
+wait
+COPILOT_HOLDER
+chmod +x "$copilot_holder"
+tmux send-keys -t test-copilot \
+	"bash -c 'exec -a copilot bash \"$copilot_holder\" \"$copilot_db\" \"$copilot_native_holder\" --session-id=$copilot_stale_sid'" Enter
 # OpenCode: with -s flag (session ID comes from plugin state file — the Go
 # binary overwrites its process title so -s is NOT visible in ps)
 tmux send-keys -t test-opencode "opencode -s ses_opencode_test_456" Enter
@@ -301,6 +359,7 @@ tmux send-keys -t test-omp "bash -c 'exec -a omp cat'" Enter
 # Wait for each assistant to appear as a child process (replaces fixed sleep 4).
 # OpenCode spawns node → native binary chain, so it takes longer than claude/codex.
 claude_pane_shell_pid=$(tmux display-message -t test-claude -p '#{pane_pid}')
+copilot_pane_shell_pid=$(tmux display-message -t test-copilot -p '#{pane_pid}')
 opencode_pane_shell_pid=$(tmux display-message -t test-opencode -p '#{pane_pid}')
 codex_pane_shell_pid=$(tmux display-message -t test-codex -p '#{pane_pid}')
 nosid_pane_shell_pid=$(tmux display-message -t test-opencode-nosid -p '#{pane_pid}')
@@ -308,6 +367,11 @@ pi_pane_shell_pid=$(tmux display-message -t test-pi -p '#{pane_pid}')
 omp_pane_shell_pid=$(tmux display-message -t test-omp -p '#{pane_pid}')
 
 wait_for_child "$claude_pane_shell_pid" "claude" 10 >/dev/null || echo "WARN: claude child not found (may still work via tree walk)"
+if wait_for_descendant "$copilot_pane_shell_pid" 10 >/dev/null; then
+	pass "Copilot native process is running in test-copilot pane"
+else
+	fail "Copilot native process not found in test-copilot pane"
+fi
 wait_for_child "$opencode_pane_shell_pid" "opencode" 10 >/dev/null || echo "WARN: opencode child not found"
 wait_for_child "$codex_pane_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found"
 wait_for_child "$nosid_pane_shell_pid" "opencode" 10 >/dev/null || echo "WARN: opencode-nosid child not found"
@@ -387,18 +451,25 @@ SAVED="$HOME/.tmux/resurrect/assistant-sessions.json"
 assert_file_exists "assistant-sessions.json created" "$SAVED"
 
 session_count=$(jq '.sessions | length' "$SAVED")
-# We expect: claude (1) + opencode with -s (1) + codex (1) + pi (1) + omp (1) = 5 with session IDs
+# We expect: claude + copilot + opencode + codex + pi + omp = 6 with IDs.
 # opencode-nosid detected but no session ID, so excluded from sessions array
 # lsp subprocess should be excluded entirely
-if [ "$session_count" -ge 5 ]; then
-	pass "Detected at least 5 assistant sessions (got $session_count)"
+if [ "$session_count" -ge 6 ]; then
+	pass "Detected at least 6 assistant sessions (got $session_count)"
 else
-	fail "Expected at least 5 sessions, got $session_count"
+	fail "Expected at least 6 sessions, got $session_count"
 fi
 
 # Verify Claude was detected with correct session ID
 claude_sid=$(jq -r '.sessions[] | select(.tool == "claude") | .session_id' "$SAVED")
 assert_eq "Claude session ID extracted" "ses_claude_test_123" "$claude_sid"
+
+# Verify native open-file state beats stale wrapper argv.
+copilot_detected_sid=$(jq -r '.sessions[] | select(.tool == "copilot") | .session_id' "$SAVED")
+assert_eq "Copilot session ID extracted from native open session.db" "$copilot_sid" "$copilot_detected_sid"
+copilot_detected_args=$(jq -r '.sessions[] | select(.tool == "copilot") | .cli_args' "$SAVED")
+assert_eq "Copilot operational flags captured from native process" \
+	"--allow-all --autopilot" "$copilot_detected_args"
 
 # Verify OpenCode was detected with correct session ID (from plugin state file)
 opencode_sid=$(jq -r '[.sessions[] | select(.tool == "opencode" and .session_id != "")] | first | .session_id' "$SAVED")
@@ -504,7 +575,7 @@ echo "=== Test 3: restore (resume commands) ==="
 echo ""
 
 # Kill all assistants first (so panes are empty shells)
-for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-false-positive test-pi test-omp; do
+for sess in test-claude test-copilot test-opencode test-codex test-opencode-nosid test-lsp test-false-positive test-pi test-omp; do
 	kill_pane_children "$sess"
 done
 sleep 1
@@ -522,6 +593,7 @@ assert_file_exists "Restore log created" "$RESTORE_LOG"
 restore_log_content=$(cat "$RESTORE_LOG")
 omp_restore_line=$(echo "$restore_log_content" | grep "restoring omp" || true)
 assert_contains "Restore log mentions claude" "$restore_log_content" "restoring claude"
+assert_contains "Restore log mentions copilot" "$restore_log_content" "restoring copilot"
 assert_contains "Restore log mentions opencode" "$restore_log_content" "restoring opencode"
 assert_contains "Restore log mentions codex" "$restore_log_content" "restoring codex"
 assert_contains "Restore log mentions pi" "$restore_log_content" "restoring pi"
@@ -530,6 +602,9 @@ assert_contains "Restore log mentions omp" "$restore_log_content" "restoring omp
 # Verify the restore log contains the correct resume commands
 # (pane content is unreliable — real CLIs take over the terminal and clear it)
 assert_contains "Restore sent claude --resume" "$restore_log_content" "ses_claude_test_123"
+assert_contains "Restore sent copilot --resume" "$restore_log_content" "--resume='$copilot_sid'"
+assert_contains "Restore preserves Copilot operational flags" "$restore_log_content" \
+	"command copilot '--allow-all' '--autopilot'"
 assert_contains "Restore sent opencode -s" "$restore_log_content" "ses_opencode_test_456"
 assert_contains "Restore sent codex resume" "$restore_log_content" "ses_codex_test_789"
 assert_contains "Restore sent pi --session" "$restore_log_content" "$pi_sid"
@@ -538,6 +613,7 @@ assert_contains "Restore sent omp --resume" "$omp_restore_line" "--resume"
 
 # Verify restore uses 'command' prefix to bypass shell aliases
 assert_contains "Restore uses 'command claude' prefix" "$restore_log_content" "command claude"
+assert_contains "Restore uses 'command copilot' prefix" "$restore_log_content" "command copilot"
 assert_contains "Restore uses 'command opencode' prefix" "$restore_log_content" "command opencode"
 assert_contains "Restore uses 'command codex' prefix" "$restore_log_content" "command codex"
 assert_contains "Restore uses 'command pi' prefix" "$restore_log_content" "command pi"
@@ -576,7 +652,7 @@ echo "=== Test 3b2: restore Guard 2 — skips panes with background assistant ==
 echo ""
 
 # Kill existing assistants so panes return to shells
-for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-pi test-omp; do
+for sess in test-claude test-copilot test-opencode test-codex test-opencode-nosid test-lsp test-pi test-omp; do
 	kill_pane_children "$sess"
 done
 sleep 1
@@ -625,7 +701,7 @@ echo "=== Test 3c: restore handles tricky cwd values ==="
 echo ""
 
 # Kill assistants so panes are clean shells
-for sess in test-claude test-opencode test-codex test-opencode-nosid test-lsp test-pi test-omp; do
+for sess in test-claude test-copilot test-opencode test-codex test-opencode-nosid test-lsp test-pi test-omp; do
 	kill_pane_children "$sess"
 done
 sleep 1
@@ -1983,6 +2059,7 @@ awk_detect_tool_save() {
 	echo "$line" | awk '
 		{
 			if      ($0 ~ /(^claude( |$)|\/claude( |$))/)                                    print "claude"
+			else if ($0 ~ /(^copilot( |$)|\/copilot( |$))/)                                  print "copilot"
 			else if ($0 ~ /(^opencode( |$)|\/opencode( |$))/ && $0 !~ /opencode run /)      print "opencode"
 			else if ($0 ~ /(^codex( |$)|\/codex( |$))/)                                      print "codex"
 			else if ($0 ~ /(^pi( |$)|\/pi( |$))/)                                            print "pi"
@@ -1993,6 +2070,7 @@ awk_detect_tool_save() {
 
 # Bare names (no path) — how native binaries appear on Linux
 assert_eq "detect bare 'claude'" "claude" "$(detect_tool "claude")"
+assert_eq "detect bare 'copilot'" "copilot" "$(detect_tool "copilot")"
 assert_eq "detect bare 'opencode'" "opencode" "$(detect_tool "opencode")"
 assert_eq "detect bare 'codex'" "codex" "$(detect_tool "codex")"
 assert_eq "detect bare 'pi'" "pi" "$(detect_tool "pi")"
@@ -2000,6 +2078,8 @@ assert_eq "detect bare 'omp'" "omp" "$(detect_tool "omp")"
 
 # Bare names with arguments
 assert_eq "detect 'claude --resume ses_123'" "claude" "$(detect_tool "claude --resume ses_123")"
+assert_eq "detect 'copilot --resume=<uuid>'" "copilot" \
+	"$(detect_tool "copilot --resume=550e8400-e29b-41d4-a716-446655440000")"
 assert_eq "detect 'opencode -s ses_456'" "opencode" "$(detect_tool "opencode -s ses_456")"
 assert_eq "detect 'codex resume ses_789'" "codex" "$(detect_tool "codex resume ses_789")"
 assert_eq "detect 'pi --session 019e99-test'" "pi" "$(detect_tool "pi --session 019e99-test")"
@@ -2007,6 +2087,8 @@ assert_eq "detect 'omp --resume 019e99-test'" "omp" "$(detect_tool "omp --resume
 
 # Full paths (how they appear on macOS or via shebang)
 assert_eq "detect '/usr/local/bin/claude'" "claude" "$(detect_tool "/usr/local/bin/claude")"
+assert_eq "detect node Copilot launcher" "copilot" \
+	"$(detect_tool "node /opt/homebrew/bin/copilot --no-auto-update")"
 assert_eq "detect '/opt/homebrew/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/opt/homebrew/bin/opencode -s ses_456")"
 assert_eq "detect '/bin/bash /usr/local/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/bin/bash /usr/local/bin/opencode -s ses_456")"
 assert_eq "detect '/usr/local/bin/pi --session 019e99-test'" "pi" "$(detect_tool "/usr/local/bin/pi --session 019e99-test")"
@@ -2021,6 +2103,7 @@ assert_eq "exclude OMP worker subprocess" "" "$(detect_tool "omp __omp_worker_ti
 assert_eq "ignore 'bash'" "" "$(detect_tool "bash")"
 assert_eq "ignore 'vim'" "" "$(detect_tool "vim")"
 assert_eq "ignore 'node server.js'" "" "$(detect_tool "node server.js")"
+assert_eq "ignore copilot-helper binary" "" "$(detect_tool "/usr/local/bin/copilot-helper --watch")"
 assert_eq "ignore arg value 'omp'" "" "$(detect_tool "python3 -c 'import time; time.sleep(300)' --profile omp")"
 
 # Parity guard: detect_tool() and save's awk detector should classify the same
@@ -2028,6 +2111,8 @@ assert_eq "ignore arg value 'omp'" "" "$(detect_tool "python3 -c 'import time; t
 parity_cases=(
 	"claude --resume ses_123|claude"
 	"/usr/local/bin/claude --resume ses_123|claude"
+	"copilot --resume=550e8400-e29b-41d4-a716-446655440000|copilot"
+	"node /opt/homebrew/bin/copilot --no-auto-update|copilot"
 	"opencode -s ses_456|opencode"
 	"/opt/homebrew/bin/opencode -s ses_456|opencode"
 	"bash /usr/local/bin/opencode -s ses_456|opencode"
@@ -2042,6 +2127,7 @@ parity_cases=(
 	"python3 -c 'import time; time.sleep(300)' --profile codex|"
 	"python3 -c 'import time; time.sleep(300)' --profile pi|"
 	"python3 -c 'import time; time.sleep(300)' --profile omp|"
+	"/tmp/tools/copilot-helper --foo|"
 	"omp __omp_worker_tiny_inference|"
 	"/tmp/tools/codex-helper --foo|"
 )
@@ -2791,6 +2877,19 @@ assert_eq "Claude bare binary" "" \
 assert_eq "OpenCode strip -s" "--verbose" \
 	"$(extract_cli_args "opencode" "opencode --verbose -s ses_abc")"
 
+# Copilot: preserve operational mode but never replay session selectors or a
+# one-shot prompt into the resumed conversation.
+assert_eq "Copilot strip --session-id and multi-word --prompt tail" "--allow-all --autopilot" \
+	"$(extract_cli_args "copilot" "copilot --allow-all --session-id=550e8400-e29b-41d4-a716-446655440000 --autopilot --prompt run this once --model ignored")"
+assert_eq "Copilot strip --resume and short -p" "--no-remote" \
+	"$(extract_cli_args "copilot" "copilot --no-remote --resume 550e8400-e29b-41d4-a716-446655440000 -p run this once --autopilot")"
+assert_eq "Copilot strip multi-word --interactive tail" "--allow-all" \
+	"$(extract_cli_args "copilot" "copilot --allow-all --interactive fix the login bug --autopilot")"
+assert_eq "Copilot strip multi-word short -i tail" "--allow-all --autopilot" \
+	"$(extract_cli_args "copilot" "copilot --allow-all --autopilot -i fix the login bug --model ignored")"
+assert_eq "Copilot preserve operational flags" "--allow-all --autopilot --max-autopilot-continues 20" \
+	"$(extract_cli_args "copilot" "copilot --allow-all --autopilot --max-autopilot-continues 20")"
+
 # OpenCode: strip --session <id>
 assert_eq "OpenCode strip --session" "--verbose" \
 	"$(extract_cli_args "opencode" "opencode --verbose --session ses_abc")"
@@ -3017,6 +3116,24 @@ if echo "$_OPENCODE_DISCOVERED" | grep -q -- '--session'; then
 	pass "OpenCode discovery finds --session"
 else
 	fail "OpenCode discovery missed --session"
+fi
+
+# Copilot: discovery must find both resume identity and non-replayable prompt.
+_COPILOT_DISCOVERED=$(_discover_session_flags copilot "$SESSION_FLAG_PATTERN_copilot")
+if echo "$_COPILOT_DISCOVERED" | grep -q -- '--resume'; then
+	pass "Copilot discovery finds --resume"
+else
+	fail "Copilot discovery missed --resume"
+fi
+if echo "$_COPILOT_DISCOVERED" | grep -q -- '--prompt'; then
+	pass "Copilot discovery finds --prompt"
+else
+	fail "Copilot discovery missed --prompt"
+fi
+if echo "$_COPILOT_DISCOVERED" | grep -q -- '--interactive'; then
+	pass "Copilot discovery finds --interactive"
+else
+	fail "Copilot discovery missed --interactive"
 fi
 
 # Pi: discovery must find --session

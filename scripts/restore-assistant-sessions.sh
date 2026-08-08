@@ -185,6 +185,13 @@ while read -r entry; do
 			resume_cmd="command claude --resume ${safe_sid}"
 		fi
 		;;
+	copilot)
+		if [ -n "$safe_cli_args" ]; then
+			resume_cmd="command copilot${safe_cli_args} --resume=${safe_sid}"
+		else
+			resume_cmd="command copilot --resume=${safe_sid}"
+		fi
+		;;
 	opencode)
 		if [ -n "$safe_cli_args" ]; then
 			resume_cmd="command opencode${safe_cli_args} -s ${safe_sid}"

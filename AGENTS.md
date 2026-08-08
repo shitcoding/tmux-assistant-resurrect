@@ -3,7 +3,8 @@
 ## Project overview
 
 tmux-assistant-resurrect persists AI coding assistant sessions (Claude Code,
-OpenCode, Codex CLI, Pi, Oh My Pi, Grok) across tmux restarts. It hooks into
+GitHub Copilot CLI, OpenCode, Codex CLI, Pi, Oh My Pi, Grok) across tmux
+restarts. It hooks into
 tmux-resurrect to save session IDs and restore them automatically.
 
 ## Architecture
@@ -20,8 +21,9 @@ tmux-resurrect to save session IDs and restore them automatically.
 
 ## Design constraints
 
-- **No wrapper scripts**: Do not create wrapper functions/aliases around `claude`,
-  `opencode`, `codex`, or `pi`. Use native hook/plugin systems instead.
+- **No wrapper scripts**: Do not create wrapper functions/aliases around
+  `claude`, `copilot`, `opencode`, `codex`, or `pi`. Use native runtime state or
+  hook/plugin systems instead.
 - **Restore hook is the sole launcher**: Assistants must NOT be listed in
   `@resurrect-processes`. The post-restore hook handles all resuming with correct
   session IDs. Adding them to `@resurrect-processes` causes double-launch.
@@ -71,7 +73,7 @@ process args as a reliable fallback.
 - The `env` object in state files captures `TMUX_PANE` and `SHELL` by default,
   plus user-configured vars via `@assistant-resurrect-capture-env` tmux option
   (space-separated list, set in tmux.conf)
-- For assistants **without** a hook/plugin (Codex, Pi, Oh My Pi, Grok) there is
+- For assistants **without** a hook/plugin (Copilot, Codex, Pi, Oh My Pi, Grok) there is
   no state file to read `env` from, so `save-assistant-sessions.sh` captures the
   configured vars directly from the live process: `read_process_env()` reads
   `/proc/<pid>/environ` (Linux/WSL only; returns `null` where `/proc` is absent,
@@ -82,6 +84,11 @@ process args as a reliable fallback.
   cannot read another process's env unprivileged, so hookless tools capture no
   env there — document the shell-profile / `tmux set-environment` workaround
   instead.
+- Copilot exposes a PID-specific active-session signal: its native process
+  keeps `~/.copilot/session-state/<uuid>/session.db` open. Resolve it through
+  `/proc/<pid>/fd` on Linux/WSL or `lsof` on macOS/BSD. Native Windows uses
+  explicit `--session-id`/`--resume` argv only. Batch all matched PIDs into one
+  `lsof` snapshot per save; do not fork `lsof` once per pane.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
@@ -103,7 +110,8 @@ process args as a reliable fallback.
   with binary name and session/resume args stripped), `env` (from state file).
   All are optional for backward compatibility.
 - `extract_cli_args()` in `save-assistant-sessions.sh` strips per-tool session
-  args: Claude `--resume[= ]<id>`, OpenCode `--session[= ]<id>` and `-s <id>`,
+  args: Claude `--resume[= ]<id>`, Copilot session selectors and initial-prompt
+  `--prompt`/`--interactive` plus trailing argv, OpenCode `--session[= ]<id>` and `-s <id>`,
   Codex `resume <id>`, Pi `--session[= ]<id>`, Grok `--resume`/`-r`/`--session-id`/
   `--continue`. Returns normalized whitespace-trimmed string. (Grok's restore
   ignores the result — see `restore-assistant-sessions.sh` — but the field is
@@ -120,6 +128,7 @@ changes after an upgrade, check the relevant source to confirm.
 | Assumption | Why it matters | Where to verify |
 |-----------|---------------|----------------|
 | **Claude sets `process.title = 'claude'`** | Node.js sets the process title, but on macOS arm64 (v2.1.44) `ps -eo args=` still shows full args (e.g., `claude --dangerously-skip-permissions`). The save script's `extract_cli_args()` relies on this. If a future version hides args, `cli_args` will be empty and restore falls back to bare `<binary> <resume_arg>`. | Run `ps -eo args=` on a running Claude process; Claude Code source: search for `process.title` |
+| **Copilot keeps `<session-state>/<uuid>/session.db` open** | Primary PID-to-session mapping for bare launches and in-process `/resume`; avoids same-cwd ambiguity and stale npm-loader argv | Run `lsof -p <native-copilot-pid>` on macOS/BSD or inspect `/proc/<pid>/fd` on Linux/WSL |
 | **Claude hook spawns intermediate `sh -c`** | `$PPID` in the hook is NOT Claude's PID; hooks walk the process tree via `find_claude_pid()` (max 5 levels) | Run `ps -eo pid=,ppid=,args=` while a hook is executing |
 | **OpenCode plugins run in-process** | `process.pid` in the plugin IS the opencode binary's PID; state file is keyed by this PID | OpenCode source: search for `await import(` in the plugin loader (approx. `packages/opencode/src/plugin/index.ts` -- path may move) |
 | **OpenCode Go binary overwrites process title** | `-s <id>` is NOT visible in `ps`; plugin state file or SQLite DB are the reliable sources | Run `ps -eo args=` on a running `opencode -s <id>` process |
@@ -148,8 +157,10 @@ These are hard-won lessons. Do not "simplify" them away.
 ## Testing
 
 Tests run in Docker with real CLI binaries (`@anthropic-ai/claude-code`,
-`opencode-ai`, `@openai/codex`, `@earendil-works/pi-coding-agent`). No mocks,
-no API keys needed.
+`@github/copilot`, `opencode-ai`, `@openai/codex`,
+`@earendil-works/pi-coding-agent`). No API keys are needed. Copilot's
+open-file lifecycle uses a hermetic process fixture while its installed binary
+drives real `--help` flag discovery.
 
 ```bash
 # Run the full test suite in Docker
@@ -172,8 +183,8 @@ cat ~/.local/share/tmux/resurrect/assistant-restore.log
   `wait_for_death`) instead of fixed `sleep` -- fast on fast machines,
   tolerant on slow CI.
 - `kill_pane_children()` does tree-walk cleanup instead of inline kill patterns.
-- npm packages are pinned to major versions: `claude-code@^2`, `codex@^0`,
-  `opencode-ai@^1`, `pi-coding-agent@^0`.
+- npm packages are pinned to major versions: `claude-code@^2`,
+  `@github/copilot@^1`, `codex@^0`, `opencode-ai@^1`, `pi-coding-agent@^0`.
 
 ## Adding a new assistant
 
