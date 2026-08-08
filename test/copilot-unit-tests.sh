@@ -226,6 +226,23 @@ assert_eq "multi-word --name leaves no stray positional" "--allow-all" \
 	"$(extract_cli_args copilot "copilot --name my nightly run --allow-all")"
 assert_eq "flattened value at end of argv" "--autopilot" \
 	"$(extract_cli_args copilot "copilot --autopilot --agent my custom agent")"
+
+# `--name="my feature"` reaches ps as `--name=my feature`: the bare run is only
+# one token, but the equals already bounded the value, so the extra word can
+# only be a lost fragment.
+assert_eq "drop equals-form option whose value lost its quoting" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --name=my feature --allow-all")"
+assert_eq "drop equals-form --add-dir with a space in the path" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --add-dir=/tmp/My Project --allow-all")"
+assert_eq "equals-form value without spaces is kept" \
+	"--add-dir=/tmp/project --allow-all" \
+	"$(extract_cli_args copilot "copilot --add-dir=/tmp/project --allow-all")"
+
+# Argv is data: a quoted wildcard must not be expanded against the save hook's
+# cwd and persisted as whatever files happen to live there.
+assert_eq "wildcard option value is not glob-expanded" \
+	"--allow-tool * --allow-all" \
+	"$(cd "$SANDBOX/bin" && extract_cli_args copilot "copilot --allow-tool * --allow-all")"
 assert_eq "variadic list detected from real --help spelling" \
 	"--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars" \
 	"$(_copilot_variadic_flags)"

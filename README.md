@@ -635,8 +635,8 @@ fields are missing (old-format JSON), falls back to bare resume commands.
   command line, so a value like `--add-dir "/tmp/My Project"` cannot be told
   apart from several arguments. Since Copilot rejects positional arguments
   outright, such options are dropped from `cli_args` rather than replayed —
-  the session resumes, without that flag. Options given as `--flag=value`, and
-  values without spaces, are unaffected.
+  the session resumes, without that flag. Values without spaces are unaffected,
+  in both `--flag value` and `--flag=value` form.
 - **Copilot session names**: Copilot refuses `--name` together with `--resume`,
   so a session started with `--name` is resumed without it.
 - **Copilot killed with SIGKILL**: the lock is removed on graceful exit but

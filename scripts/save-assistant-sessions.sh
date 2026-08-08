@@ -922,17 +922,34 @@ _copilot_drop_flattened_values() {
 	local variadic
 	variadic=" $(_copilot_variadic_flags) "
 
+	# Word-split with pathname expansion off: argv is data, and a legitimate
+	# quoted value such as `--allow-tool '*'` must not be expanded against the
+	# save hook's working directory and persisted as a list of filenames.
+	local reglob=""
+	case "$-" in
+	*f*) ;;
+	*) reglob=1 ;;
+	esac
+	set -f
 	# shellcheck disable=SC2206  # deliberate word-split of a flattened argv
 	local -a words=($args)
+	[ -n "$reglob" ] && set +f
+
 	local -a out=()
 	local -a run=()
-	local i=0 n=${#words[@]} last_flag="" keep w
+	local i=0 n=${#words[@]} last_flag="" last_had_eq=0 keep w
 
 	while [ "$i" -lt "$n" ]; do
 		case "${words[$i]}" in
 		-*)
 			out[${#out[@]}]="${words[$i]}"
 			last_flag="${words[$i]%%=*}"
+			# `--flag=value` carries its own boundary, so anything bare that
+			# follows can only be the rest of a value whose quoting was lost.
+			last_had_eq=0
+			case "${words[$i]}" in
+			*=*) last_had_eq=1 ;;
+			esac
 			i=$((i + 1))
 			continue
 			;;
@@ -948,8 +965,11 @@ _copilot_drop_flattened_values() {
 			i=$((i + 1))
 		done
 
+		# One bare token after a space-form option is its value, and unambiguous.
+		# More than one, or any at all after an equals-form option, means the
+		# value contained whitespace that cannot be restored.
 		keep=1
-		if [ "${#run[@]}" -gt 1 ]; then
+		if [ "${#run[@]}" -gt 1 ] || [ "$last_had_eq" -eq 1 ]; then
 			keep=0
 			case "$variadic" in
 			*" $last_flag "*) keep=1 ;;
@@ -965,6 +985,7 @@ _copilot_drop_flattened_values() {
 			unset "out[$((${#out[@]} - 1))]"
 			out=(${out[@]+"${out[@]}"})
 		fi
+		last_had_eq=0
 		last_flag=""
 	done
 

@@ -102,7 +102,11 @@ process args as a reliable fallback.
   arguments". `_copilot_drop_flattened_values()` drops any option whose value
   arrived split, exempting variadic options (`--allow-tool[=tools...]`), whose
   several tokens round-trip correctly. It must run *before* the session-flag
-  strippers, which consume only one token and would strand the rest.
+  strippers, which consume only one token and would strand the rest. Two
+  non-obvious cases: after an **equals-form** option (`--name=my feature`) even a
+  single trailing bare token is a lost fragment, because the `=` already bounded
+  the value; and the word-split runs under `set -f`, since argv is data and
+  `--allow-tool '*'` must not be expanded against the hook's cwd.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
