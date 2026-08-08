@@ -112,11 +112,29 @@ get_claude_session() {
 }
 
 copilot_session_state_dir() {
-	echo "${COPILOT_SESSION_STATE_DIR:-$HOME/.copilot/session-state}"
+	local dir="${COPILOT_SESSION_STATE_DIR:-$HOME/.copilot/session-state}"
+	if [ -d "$dir" ]; then
+		(cd "$dir" 2>/dev/null && pwd -P) || echo "$dir"
+	else
+		echo "$dir"
+	fi
 }
 
 copilot_session_id_from_path() {
 	local path="$1"
+	case "$path" in
+	*/session.db) ;;
+	*) return 0 ;;
+	esac
+
+	local parent base physical_parent
+	parent="${path%/*}"
+	base="${path##*/}"
+	if [ -d "$parent" ]; then
+		physical_parent=$(cd "$parent" 2>/dev/null && pwd -P) || physical_parent=""
+		[ -n "$physical_parent" ] && path="$physical_parent/$base"
+	fi
+
 	local state_dir sid rest
 	state_dir=$(copilot_session_state_dir)
 	case "$path" in

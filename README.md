@@ -545,7 +545,8 @@ Copilot keeps the active conversation database open at
 back to the owning Copilot PID using `/proc/<pid>/fd` on Linux/WSL or `lsof` on
 macOS/BSD. This is PID-specific, so multiple Copilot sessions in the same
 directory remain unambiguous, and it follows an in-process `/resume` even when
-the original launcher argv is stale.
+the original launcher argv is stale. The configured state root is resolved to
+its physical path so macOS aliases such as `/tmp` → `/private/tmp` still match.
 
 An explicit `--session-id <uuid>` or `--resume <uuid>` in process args is the
 fallback during the short startup window before the database is open. Native

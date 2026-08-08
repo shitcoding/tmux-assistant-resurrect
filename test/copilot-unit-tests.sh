@@ -118,6 +118,16 @@ else
 	printf '  [FAIL] macOS lookup did not invoke lsof\n'
 fi
 
+echo "== macOS canonical path lookup =="
+ln -s "$COPILOT_SESSION_STATE_DIR" "$SANDBOX/copilot-state-link"
+COPILOT_SESSION_STATE_DIR="$SANDBOX/copilot-state-link"
+export COPILOT_SESSION_STATE_DIR
+export COPILOT_TEST_LSOF_PATH="$SANDBOX/copilot-state/$SID_CURRENT/session.db"
+assert_eq "macOS matches canonical lsof path through symlinked state root" \
+	"$SID_CURRENT" "$(get_copilot_session 2001 "copilot")"
+COPILOT_SESSION_STATE_DIR="$SANDBOX/copilot-state"
+export COPILOT_SESSION_STATE_DIR
+
 echo "== batched macOS lsof snapshot =="
 rm -f "$LSOF_MARKER"
 unset COPILOT_LSOF_SNAPSHOT COPILOT_LSOF_SNAPSHOT_READY
