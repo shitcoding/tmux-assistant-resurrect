@@ -307,6 +307,12 @@ tmux new-session -d -s test-claude -c /tmp
 tmux new-session -d -s test-copilot -c /tmp
 tmux new-session -d -s test-opencode -c /tmp
 tmux new-session -d -s test-codex -c /tmp
+# Own cwd, deliberately: this pane asserts that an OpenCode with no -s and no
+# plugin state yields *no* session ID. Sharing /tmp with test-opencode made that
+# a race — once the real opencode there registered a /tmp session in its SQLite
+# database, the cwd-scoped DB fallback handed that session to this pane instead,
+# and the "no session ID available" warning was never logged (seen in CI, not
+# locally). An empty cwd of its own has nothing for the fallback to match.
 OPENCODE_NOSID_CWD="/tmp/opencode-nosid-test-cwd"
 mkdir -p "$OPENCODE_NOSID_CWD"
 tmux new-session -d -s test-opencode-nosid -c "$OPENCODE_NOSID_CWD"

@@ -898,6 +898,7 @@ merge_process_env() {
 
 # Copilot's variadic options -- the ones whose --help spelling ends in `...`,
 # e.g. `--allow-tool[=tools...]`. They legitimately occupy several argv tokens.
+SESSION_EXTRA_WARM_copilot=_copilot_variadic_flags
 SESSION_VARIADIC_FALLBACK_copilot="--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars"
 
 _copilot_variadic_flags() {
@@ -982,10 +983,16 @@ _copilot_drop_flattened_values() {
 		done
 
 		# One bare token after a space-form option is its value, and unambiguous.
-		# More than one, or any at all after an equals-form option, means the
-		# value contained whitespace that cannot be restored.
+		#
+		# The variadic exemption applies only to the space form: `--deny-tool a b`
+		# really is two values, but `--deny-tool='shell(git push)'` reaches ps as
+		# `--deny-tool=shell(git push)` and Copilot then reads the fragment as a
+		# positional ("too many arguments"). An equals sign already delimited the
+		# value, so anything bare after it is a leak either way.
 		keep=1
-		if [ "${#run[@]}" -gt 1 ] || [ "$last_had_eq" -eq 1 ]; then
+		if [ "$last_had_eq" -eq 1 ]; then
+			keep=0
+		elif [ "${#run[@]}" -gt 1 ]; then
 			keep=0
 			if [ "$last_had_eq" -eq 0 ]; then
 				case "$variadic" in
@@ -1228,13 +1235,18 @@ SESSION_FLAGS_FALLBACK_grok="--continue -c
 _warm_session_discovery() {
 	local matches="$1"
 	[ -n "$matches" ] || return 0
-	local tool flag_pat sub_pat
+	local tool flag_pat sub_pat extra_warm
 	while IFS= read -r tool; do
 		# Skip blanks and names that are not valid shell identifier suffixes:
 		# the indirect expansions below would otherwise abort under set -e.
 		case "$tool" in
 		'' | *[!A-Za-z0-9_]*) continue ;;
 		esac
+		# Populate the help cache in *this* shell. The discovery helpers below
+		# read it through $(), where their own cache write would be discarded --
+		# so without this direct call `<tool> --help` re-execs for every pane.
+		_tool_help "$tool" >/dev/null
+
 		flag_pat="SESSION_FLAG_PATTERN_${tool}"
 		sub_pat="SESSION_SUBCMD_PATTERN_${tool}"
 		if [ -n "${!flag_pat:-}" ]; then
@@ -1242,6 +1254,11 @@ _warm_session_discovery() {
 		fi
 		if [ -n "${!sub_pat:-}" ]; then
 			_discover_session_subcmds "$tool" "${!sub_pat}" >/dev/null
+		fi
+		# Per-tool extras that also parse --help and cache into a shell var.
+		extra_warm="SESSION_EXTRA_WARM_${tool}"
+		if [ -n "${!extra_warm:-}" ]; then
+			"${!extra_warm}" >/dev/null
 		fi
 	done < <(printf '%s\n' "$matches" | cut -f2 | sort -u)
 	return 0
@@ -1296,6 +1313,13 @@ extract_cli_args() {
 		# would leave the tail of a flattened multi-word value stranded as a
 		# positional.
 		args=$(_copilot_drop_flattened_values "$args")
+		# Restore always resumes interactively, and Copilot refuses --attachment
+		# there ("only supported in non-interactive prompt mode"). The prompt
+		# truncation above misses it whenever it was written *before* the prompt,
+		# so drop it explicitly wherever it sat. Verified against 1.0.78; the
+		# other non-interactive-flavored flags (--silent, --share, --share-gist,
+		# --enable-memory) resume without complaint and are left alone.
+		args=$(_strip_long_opt '--attachment' "$args")
 	fi
 
 	# Strip tool-specific session/resume flags.

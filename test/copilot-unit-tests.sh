@@ -21,8 +21,11 @@ mkdir -p "$TMUX_RESURRECT_DIR" "$TMUX_ASSISTANT_RESURRECT_DIR" \
 # Keep CLI-flag discovery deterministic and exercise the real help parser.
 # Spellings copied verbatim from `copilot --help` (1.0.78) so the real parsers
 # are exercised: `<value>` = one value, `[=name...]` = variadic.
-cat >"$SANDBOX/bin/copilot" <<'EOF'
+HELP_CALLS="$SANDBOX/help-calls"
+: >"$HELP_CALLS"
+cat >"$SANDBOX/bin/copilot" <<EOF
 #!/usr/bin/env bash
+echo call >>"$HELP_CALLS"
 cat <<'HELP'
   --add-dir <directory>                 Add a directory to the allowed list
   --agent <agent>                       Specify a custom agent to use
@@ -261,6 +264,38 @@ assert_eq "wildcard option value is not glob-expanded" \
 assert_eq "variadic list detected from real --help spelling" \
 	"--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars" \
 	"$(_copilot_variadic_flags)"
+
+# `--deny-tool='shell(git push)'` reaches ps as `--deny-tool=shell(git push)`.
+# Being variadic does not make that reconstructable: the `=` already delimited
+# the value, and Copilot reads the fragment as a positional.
+assert_eq "equals-form variadic value is not exempt" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --deny-tool=shell(git push) --allow-all")"
+assert_eq "space-form variadic value is still exempt" \
+	"--deny-tool shell write --allow-all" \
+	"$(extract_cli_args copilot "copilot --deny-tool shell write --allow-all")"
+
+echo "== prompt-only options =="
+# Copilot refuses --attachment on an interactive resume, and the prompt
+# truncation only reaches flags written after the prompt.
+assert_eq "strip --attachment placed before the prompt" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --allow-all --attachment /tmp/a.png -p summarize this")"
+assert_eq "strip --attachment with no prompt at all" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --attachment /tmp/a.png --allow-all")"
+assert_eq "strip equals-form --attachment" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --attachment=/tmp/a.png --allow-all")"
+
+echo "== --help probe cost =="
+# The save hook runs every few minutes: discovery must not exec the CLI once per
+# pane. The caches live in shell vars, and extract_cli_args runs in a $()
+# subshell, so they only pay off when warmed in the parent shell.
+unset _TOOL_HELP_copilot _SESSION_FLAGS_copilot _COPILOT_VARIADIC_FLAGS
+: >"$HELP_CALLS"
+_warm_session_discovery "$(printf 'pane\tcopilot\t1\targs\n')"
+for _ in 1 2 3 4 5 6 7 8; do
+	extract_cli_args copilot "copilot --allow-all --deny-tool a" >/dev/null
+done
+assert_eq "one --help exec per save, not per pane" "1" \
+	"$(wc -l <"$HELP_CALLS" | tr -d ' ')"
 
 echo
 echo "copilot unit tests: $PASS passed, $FAIL failed"

@@ -106,8 +106,21 @@ process args as a reliable fallback.
   strippers, which consume only one token and would strand the rest. Two
   non-obvious cases: after an **equals-form** option (`--name=my feature`) even a
   single trailing bare token is a lost fragment, because the `=` already bounded
-  the value; and the word-split runs under `set -f`, since argv is data and
-  `--allow-tool '*'` must not be expanded against the hook's cwd.
+  the value — and that beats the variadic exemption, since
+  `--deny-tool='shell(git push)'` flattens the same way; and the word-split runs
+  under `set -f`, since argv is data and `--allow-tool '*'` must not be expanded
+  against the hook's cwd.
+- `--attachment` is stripped unconditionally for Copilot: restore always resumes
+  interactively and Copilot refuses it there ("only supported in non-interactive
+  prompt mode"). The `--prompt`/`--interactive` truncation only reaches flags
+  written *after* the prompt, so position-independent stripping is required.
+  Verified against 1.0.78 — `--silent`, `--share`, `--share-gist` and
+  `--enable-memory` resume without complaint and are deliberately left alone.
+- Discovery caches live in shell variables and every caller runs inside a `$()`
+  subshell, so a cache written there is discarded. `_warm_session_discovery()`
+  must therefore call `_tool_help` **directly** in the parent shell, and any new
+  helper that parses `--help` needs a `SESSION_EXTRA_WARM_<tool>` entry.
+  Otherwise `<tool> --help` re-execs once per pane on every save.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
