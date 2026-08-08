@@ -33,10 +33,10 @@ before hooks/plugins have fired):
 - **Claude Code**: `SessionStart` hook state file keyed by Claude's PID
   (primary); `--resume <id>` in process args (fallback -- note: Claude
   overwrites its process title, so this only works if args are still visible)
-- **GitHub Copilot CLI**: PID-specific open-file lookup for
-  `~/.copilot/session-state/<uuid>/session.db` via `/proc/<pid>/fd` on
-  Linux/WSL or `lsof` on macOS/BSD (primary); `--session-id` / `--resume` in
-  process args (fallback). Native Windows supports the argv fallback only.
+- **GitHub Copilot CLI**: the live session's own
+  `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` marker, matched by the
+  native PID (primary); `--session-id` / `--resume` in process args (fallback,
+  for the startup window before the lock exists).
 - **OpenCode**: `-s` / `--session` flag in process args (fast path); plugin
   state file (fallback for runtime session switches); SQLite database query
   at `~/.local/share/opencode/opencode.db` matching the pane's cwd (version-
@@ -74,9 +74,9 @@ To add support for a new tool:
   `ps` output -- the state file from the `SessionStart` hook is the only
   reliable source of session IDs for Claude.
 - **GitHub Copilot CLI** uses an npm loader plus a native child process. Both
-  may match detection, but only the native process holds the current
-  per-session `session.db` open. Candidate resolution therefore prefers
-  PID-specific open-file state before considering possibly stale loader argv.
+  match detection, but only the native child owns the session lock. Candidate
+  resolution therefore prefers PID-specific lock state before considering
+  possibly stale loader argv.
 - **Codex CLI** runs via Node.js and preserves its full command line in `ps`,
   so `codex resume <id>` is always visible.
 - **OpenCode** is a native Go binary (distributed via npm as `opencode-ai`
@@ -94,14 +94,13 @@ To add support for a new tool:
 
 - `pgrep -P` is unreliable on macOS (silently misses children). Always use
   `ps -eo pid=,ppid=` with awk filtering instead.
-- Copilot's active session is resolved with the system `lsof`; Linux/WSL uses
-  `/proc/<pid>/fd` and does not invoke `lsof`.
+- Copilot's active session is resolved with a plain glob over its own state
+  directory — deliberately no `lsof` and no `/proc`, so it behaves identically
+  on every platform and costs no fork.
 - tmux 3.4 converts tab characters to underscores in `-F` format output. The
   save script uses pipe `|` as the delimiter instead.
 
 ## Windows considerations
 
-- WSL follows the Linux `/proc` path.
-- Native Windows has no PID-specific open-file implementation. Copilot sessions
-  are recoverable only when `--session-id <uuid>` or `--resume <uuid>` remains
-  visible in process args.
+- Copilot's lock-file lookup is pure filesystem work, so WSL and native Windows
+  both use the same path as Linux and macOS — no platform-specific fallback.

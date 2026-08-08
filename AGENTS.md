@@ -84,11 +84,13 @@ process args as a reliable fallback.
   cannot read another process's env unprivileged, so hookless tools capture no
   env there — document the shell-profile / `tmux set-environment` workaround
   instead.
-- Copilot exposes a PID-specific active-session signal: its native process
-  keeps `~/.copilot/session-state/<uuid>/session.db` open. Resolve it through
-  `/proc/<pid>/fd` on Linux/WSL or `lsof` on macOS/BSD. Native Windows uses
-  explicit `--session-id`/`--resume` argv only. Batch all matched PIDs into one
-  `lsof` snapshot per save; do not fork `lsof` once per pane.
+- Copilot exposes a PID-specific active-session signal: the live session writes
+  `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` (content = the same PID).
+  Resolve it with a single glob — no `/proc`, no `lsof`, no platform branch, and
+  it works on native Windows too. `COPILOT_HOME` replaces the whole `~/.copilot`
+  path, same convention as `GROK_HOME`. There is NO per-session database:
+  `session-store.db` sits at the root of `COPILOT_HOME` and is shared by every
+  session, so it cannot identify one.
 - Session lookup helpers may legitimately find no ID. Every `get_<tool>_session`
   command substitution in the resolver and compatibility emitter must be
   explicitly non-fatal (`|| true` inside the substitution), because a failed
@@ -133,7 +135,7 @@ changes after an upgrade, check the relevant source to confirm.
 | Assumption | Why it matters | Where to verify |
 |-----------|---------------|----------------|
 | **Claude sets `process.title = 'claude'`** | Node.js sets the process title, but on macOS arm64 (v2.1.44) `ps -eo args=` still shows full args (e.g., `claude --dangerously-skip-permissions`). The save script's `extract_cli_args()` relies on this. If a future version hides args, `cli_args` will be empty and restore falls back to bare `<binary> <resume_arg>`. | Run `ps -eo args=` on a running Claude process; Claude Code source: search for `process.title` |
-| **Copilot keeps `<session-state>/<uuid>/session.db` open** | Primary PID-to-session mapping for bare launches and in-process `/resume`; avoids same-cwd ambiguity and stale npm-loader argv | Run `lsof -p <native-copilot-pid>` on macOS/BSD or inspect `/proc/<pid>/fd` on Linux/WSL |
+| **Copilot writes `<session-state>/<uuid>/inuse.<pid>.lock`** | Primary PID-to-session mapping for bare launches and in-process `/resume`; avoids same-cwd ambiguity and stale npm-loader argv. Undocumented upstream, hence the contract test | `test/copilot-contract-test.sh` asserts it against the real binary; manually, `ls ~/.copilot/session-state/*/inuse.*.lock` while Copilot runs |
 | **Claude hook spawns intermediate `sh -c`** | `$PPID` in the hook is NOT Claude's PID; hooks walk the process tree via `find_claude_pid()` (max 5 levels) | Run `ps -eo pid=,ppid=,args=` while a hook is executing |
 | **OpenCode plugins run in-process** | `process.pid` in the plugin IS the opencode binary's PID; state file is keyed by this PID | OpenCode source: search for `await import(` in the plugin loader (approx. `packages/opencode/src/plugin/index.ts` -- path may move) |
 | **OpenCode Go binary overwrites process title** | `-s <id>` is NOT visible in `ps`; plugin state file or SQLite DB are the reliable sources | Run `ps -eo args=` on a running `opencode -s <id>` process |
@@ -163,9 +165,21 @@ These are hard-won lessons. Do not "simplify" them away.
 
 Tests run in Docker with real CLI binaries (`@anthropic-ai/claude-code`,
 `@github/copilot`, `opencode-ai`, `@openai/codex`,
-`@earendil-works/pi-coding-agent`). No API keys are needed. Copilot's
-open-file lifecycle uses a hermetic process fixture while its installed binary
-drives real `--help` flag discovery.
+`@earendil-works/pi-coding-agent`). No API keys are needed.
+
+Copilot is covered at three layers, because a hermetic test that fabricates the
+artifact it then looks for cannot notice upstream changing the layout:
+
+| Layer | File | Catches |
+|-------|------|---------|
+| Contract | `test/copilot-contract-test.sh` | upstream changing the on-disk contract we depend on |
+| End-to-end | `test/run-tests.sh` Test 2/3, real binary | save/restore wiring against reality |
+| Hermetic | `test/copilot-unit-tests.sh` | lock integrity, stale locks, argv fallback, `extract_cli_args` |
+
+The contract and end-to-end layers need **no authentication**: Copilot creates
+the session directory and its lock before the auth check runs. Launch it in the
+integration test with *no* session selector, so the UUID exists only in the lock
+and a regressed lookup cannot be masked by the argv fallback.
 
 ```bash
 # Run the full test suite in Docker

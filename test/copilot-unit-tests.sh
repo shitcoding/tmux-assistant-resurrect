@@ -10,10 +10,13 @@ trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
 export TMUX_RESURRECT_DIR="$SANDBOX/resurrect"
 export TMUX_ASSISTANT_RESURRECT_DIR="$SANDBOX/state"
-export COPILOT_SESSION_STATE_DIR="$SANDBOX/copilot-state"
-export COPILOT_PROC_ROOT="$SANDBOX/proc"
+# COPILOT_HOME is Copilot's own override for the whole ~/.copilot path, so the
+# tests drive the same variable a user would (no test-only path hook).
+export COPILOT_HOME="$SANDBOX/copilot-home"
+# Distinct name: the sourced save script owns a global STATE_DIR of its own.
+COPILOT_STATE="$COPILOT_HOME/session-state"
 mkdir -p "$TMUX_RESURRECT_DIR" "$TMUX_ASSISTANT_RESURRECT_DIR" \
-	"$COPILOT_SESSION_STATE_DIR" "$COPILOT_PROC_ROOT" "$SANDBOX/bin"
+	"$COPILOT_STATE" "$SANDBOX/bin"
 
 # Keep CLI-flag discovery deterministic and exercise the real help parser.
 cat >"$SANDBOX/bin/copilot" <<'EOF'
@@ -61,8 +64,14 @@ assert_missing() {
 
 SID_CURRENT="550e8400-e29b-41d4-a716-446655440000"
 SID_STALE="11111111-2222-4333-8444-555555555555"
-mkdir -p "$COPILOT_SESSION_STATE_DIR/$SID_CURRENT"
-: >"$COPILOT_SESSION_STATE_DIR/$SID_CURRENT/session.db"
+
+# Mirror the real layout: session-state/<uuid>/inuse.<pid>.lock, content = PID.
+# See test/copilot-contract-test.sh, which pins this against the real binary.
+make_lock() {
+	local sid="$1" pid="$2"
+	mkdir -p "$COPILOT_STATE/$sid"
+	printf '%s\n' "$pid" >"$COPILOT_STATE/$sid/inuse.$pid.lock"
+}
 
 echo "== detect_tool =="
 assert_eq "bare copilot" "copilot" "$(detect_tool "copilot")"
@@ -75,81 +84,49 @@ assert_eq "no false positive copilot-helper" "" \
 assert_eq "unrelated argument value" "" \
 	"$(detect_tool "python3 worker.py --profile copilot")"
 
-echo "== Linux /proc open-file lookup =="
-mkdir -p "$COPILOT_PROC_ROOT/1001/fd"
-ln -s "$COPILOT_SESSION_STATE_DIR/$SID_CURRENT/session.db" \
-	"$COPILOT_PROC_ROOT/1001/fd/9"
-
-LSOF_MARKER="$SANDBOX/lsof-called"
-cat >"$SANDBOX/bin/fake-lsof" <<EOF
-#!/usr/bin/env bash
-touch "$LSOF_MARKER"
-printf 'p%s\\n' "\${3:-unknown}"
-printf 'n%s\\n' "\${COPILOT_TEST_LSOF_PATH:-}"
-EOF
-chmod +x "$SANDBOX/bin/fake-lsof"
-export COPILOT_LSOF="$SANDBOX/bin/fake-lsof"
-
-export COPILOT_PLATFORM="Linux"
-assert_eq "Linux resolves UUID from open session.db" "$SID_CURRENT" \
+echo "== inuse lock lookup =="
+make_lock "$SID_CURRENT" 1001
+assert_eq "resolves UUID from inuse.<pid>.lock" "$SID_CURRENT" \
 	"$(get_copilot_session 1001 "copilot")"
-assert_eq "open session.db wins over stale launcher argv" "$SID_CURRENT" \
+assert_eq "live lock wins over stale launcher argv" "$SID_CURRENT" \
 	"$(get_copilot_session 1001 "copilot --session-id=$SID_STALE")"
-assert_missing "Linux lookup does not invoke lsof" "$LSOF_MARKER"
 
-mkdir -p "$COPILOT_PROC_ROOT/1002/fd" "$SANDBOX/not-copilot/$SID_STALE"
-: >"$SANDBOX/not-copilot/$SID_STALE/session.db"
-ln -s "$SANDBOX/not-copilot/$SID_STALE/session.db" \
-	"$COPILOT_PROC_ROOT/1002/fd/7"
-assert_eq "Linux ignores session.db outside Copilot state root" "" \
+# The lookup is keyed on PID, so sessions sharing a cwd stay unambiguous and a
+# lock belonging to a different Copilot is never picked up.
+make_lock "$SID_STALE" 1002
+assert_eq "another PID's lock is not borrowed" "$SID_STALE" \
 	"$(get_copilot_session 1002 "copilot")"
+assert_eq "PID with no lock resolves nothing" "" \
+	"$(get_copilot_session 1003 "copilot" 0)"
 
-echo "== macOS lsof lookup =="
-rm -f "$LSOF_MARKER"
-export COPILOT_PLATFORM="Darwin"
-export COPILOT_TEST_LSOF_PATH="$COPILOT_SESSION_STATE_DIR/$SID_CURRENT/session.db"
-assert_eq "macOS resolves UUID from lsof output" "$SID_CURRENT" \
-	"$(get_copilot_session 2001 "copilot")"
-if [ -e "$LSOF_MARKER" ]; then
-	PASS=$((PASS + 1))
-	printf '  [pass] macOS lookup invokes lsof\n'
-else
-	FAIL=$((FAIL + 1))
-	printf '  [FAIL] macOS lookup did not invoke lsof\n'
-fi
+echo "== lock integrity =="
+mkdir -p "$COPILOT_STATE/not-a-uuid"
+printf '%s\n' 1004 >"$COPILOT_STATE/not-a-uuid/inuse.1004.lock"
+assert_eq "non-UUID session directory is ignored" "" \
+	"$(get_copilot_session 1004 "copilot" 0)"
 
-echo "== macOS canonical path lookup =="
-ln -s "$COPILOT_SESSION_STATE_DIR" "$SANDBOX/copilot-state-link"
-COPILOT_SESSION_STATE_DIR="$SANDBOX/copilot-state-link"
-export COPILOT_SESSION_STATE_DIR
-export COPILOT_TEST_LSOF_PATH="$SANDBOX/copilot-state/$SID_CURRENT/session.db"
-assert_eq "macOS matches canonical lsof path through symlinked state root" \
-	"$SID_CURRENT" "$(get_copilot_session 2001 "copilot")"
-COPILOT_SESSION_STATE_DIR="$SANDBOX/copilot-state"
-export COPILOT_SESSION_STATE_DIR
+SID_MISMATCH="22222222-3333-4444-8555-666666666666"
+mkdir -p "$COPILOT_STATE/$SID_MISMATCH"
+printf '%s\n' 9999 >"$COPILOT_STATE/$SID_MISMATCH/inuse.1005.lock"
+assert_eq "lock whose content disagrees with its name is ignored" "" \
+	"$(get_copilot_session 1005 "copilot" 0)"
 
-echo "== batched macOS lsof snapshot =="
-rm -f "$LSOF_MARKER"
-unset COPILOT_LSOF_SNAPSHOT COPILOT_LSOF_SNAPSHOT_READY
-prime_copilot_open_files $'pane\tcopilot\t2001\tcopilot\t/tmp\t/dev/ttys001'
-assert_eq "batched lsof snapshot resolves matching PID" "$SID_CURRENT" \
-	"$(get_copilot_session 2001 "copilot")"
-if [ -e "$LSOF_MARKER" ]; then
-	PASS=$((PASS + 1))
-	printf '  [pass] batched lsof snapshot invoked lsof once\n'
-else
-	FAIL=$((FAIL + 1))
-	printf '  [FAIL] batched lsof snapshot did not invoke lsof\n'
-fi
-rm -f "$LSOF_MARKER"
-assert_eq "cached lookup does not invoke lsof again" "$SID_CURRENT" \
-	"$(get_copilot_session 2001 "copilot")"
-assert_missing "cached lookup reused the exported snapshot" "$LSOF_MARKER"
-unset COPILOT_LSOF_SNAPSHOT COPILOT_LSOF_SNAPSHOT_READY
+echo "== stale lock from a recycled PID =="
+# A SIGKILLed Copilot leaves its lock behind; if the PID is later recycled, the
+# stale lock must not map the new process onto the dead session. This needs a
+# PID that is genuinely alive so get_process_start_epoch() returns something to
+# compare against — the test shell itself is the simplest such process.
+LIVE_PID=$$
+SID_RECYCLED="33333333-4444-4555-8666-777777777777"
+make_lock "$SID_RECYCLED" "$LIVE_PID"
+assert_eq "lock newer than the process is accepted" "$SID_RECYCLED" \
+	"$(get_copilot_session "$LIVE_PID" "copilot" 0)"
+touch -t 200001010000 "$COPILOT_STATE/$SID_RECYCLED/inuse.$LIVE_PID.lock"
+assert_eq "lock predating the process is rejected as stale" "" \
+	"$(get_copilot_session "$LIVE_PID" "copilot" 0)"
+rm -rf "$COPILOT_STATE/$SID_RECYCLED"
 
 echo "== argv fallback =="
-rm -rf "$COPILOT_PROC_ROOT/3001"
-export COPILOT_PLATFORM="Linux"
 assert_eq "--session-id=<uuid>" "$SID_CURRENT" \
 	"$(get_copilot_session 3001 "copilot --session-id=$SID_CURRENT")"
 assert_eq "--session-id <uuid>" "$SID_CURRENT" \
@@ -163,12 +140,14 @@ assert_eq "reject non-UUID resume selector" "" \
 assert_eq "deferred argv fallback can be disabled" "" \
 	"$(get_copilot_session 3001 "copilot --resume=$SID_CURRENT" 0)"
 
-echo "== native Windows =="
-rm -f "$LSOF_MARKER"
-export COPILOT_PLATFORM="Windows_NT"
-assert_eq "native Windows returns no open-file mapping" "" \
-	"$(get_copilot_session 1001 "copilot" 0)"
-assert_missing "native Windows does not invoke Unix lsof" "$LSOF_MARKER"
+echo "== state root resolution =="
+assert_eq "COPILOT_HOME overrides the whole ~/.copilot path" \
+	"$COPILOT_HOME/session-state" "$(copilot_session_state_dir)"
+assert_eq "defaults to ~/.copilot when COPILOT_HOME is unset" \
+	"$HOME/.copilot/session-state" \
+	"$(COPILOT_HOME= copilot_session_state_dir)"
+assert_eq "missing state root resolves nothing, quietly" "" \
+	"$(COPILOT_HOME="$SANDBOX/absent" get_copilot_session 1001 "copilot" 0)"
 
 echo "== unresolved candidate is non-fatal under set -e =="
 UNRESOLVED_PARTS="$SANDBOX/unresolved-parts"
@@ -177,8 +156,6 @@ UNRESOLVED_CACHE="$SANDBOX/unresolved-cache"
 : >"$UNRESOLVED_CACHE"
 if (
 	set -e
-	COPILOT_PLATFORM=Linux
-	export COPILOT_PLATFORM
 	resolve_pane_candidates \
 		"test:1.1" "/tmp" "/dev/ttys001" \
 		$'copilot\0379999\037copilot' $'\037' 0 \

@@ -385,9 +385,14 @@ test:
 test-grok:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/test/grok-unit-tests.sh"
 
-# Run hermetic Copilot session-discovery tests (no login required)
+# Run hermetic Copilot session-discovery tests (no binary or login required)
 test-copilot:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/test/copilot-unit-tests.sh"
+
+# Assert Copilot's upstream on-disk contract against the real binary.
+# Needs `copilot` on PATH (skips if absent); no login required.
+test-copilot-contract:
+    @"${TEST_BASH:-bash}" "{{repo_dir}}/test/copilot-contract-test.sh"
 
 # Run save-hook benchmark matrix in Docker (writes CSV + Markdown summary)
 benchmark runs='7' base_repo='':

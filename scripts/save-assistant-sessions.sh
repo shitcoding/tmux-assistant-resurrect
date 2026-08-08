@@ -111,151 +111,110 @@ get_claude_session() {
 	fi
 }
 
+# --- GitHub Copilot CLI ---
+#
+# A live Copilot session marks its own state directory with an
+# `inuse.<pid>.lock` file (whose content is the same PID):
+#
+#   $COPILOT_HOME/session-state/<uuid>/inuse.<native-pid>.lock
+#
+# That is an exact PID -> session-ID mapping resolvable with a single glob: no
+# /proc, no lsof, no platform branch, and it works on native Windows too. The
+# lock is written at TUI startup (before the first prompt) and removed on
+# graceful exit, so it also follows an in-process `/resume` — unlike the
+# launcher argv, which goes stale.
+#
+# There is NO per-session database: `session-store.db` lives at the root of
+# COPILOT_HOME and is shared by every session, so it cannot identify one.
+# test/copilot-contract-test.sh pins all of this against the real binary.
+
+# COPILOT_HOME replaces the whole ~/.copilot path (same convention as GROK_HOME).
 copilot_session_state_dir() {
-	local dir="${COPILOT_SESSION_STATE_DIR:-$HOME/.copilot/session-state}"
-	if [ -d "$dir" ]; then
-		(cd "$dir" 2>/dev/null && pwd -P) || echo "$dir"
-	else
-		echo "$dir"
-	fi
+	echo "${COPILOT_HOME:-$HOME/.copilot}/session-state"
 }
 
-copilot_session_id_from_path() {
-	local path="$1"
-	case "$path" in
-	*/session.db) ;;
-	*) return 0 ;;
+# 8-4-4-4-12 hex. Glob-only so it costs no fork: the character class rejects
+# anything but hex digits and dashes, and the `?` runs pin the dash positions.
+_copilot_is_uuid() {
+	[ "${#1}" -eq 36 ] || return 1
+	case "$1" in
+	*[!0-9a-fA-F-]*) return 1 ;;
+	????????-????-????-????-????????????) return 0 ;;
 	esac
+	return 1
+}
 
-	local parent base physical_parent
-	parent="${path%/*}"
-	base="${path##*/}"
-	if [ -d "$parent" ]; then
-		physical_parent=$(cd "$parent" 2>/dev/null && pwd -P) || physical_parent=""
-		[ -n "$physical_parent" ] && path="$physical_parent/$base"
-	fi
+# Portable file mtime in epoch seconds: GNU stat, then BSD stat.
+_file_mtime_epoch() {
+	stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
 
-	local state_dir sid rest
+# A SIGKILLed Copilot leaves its lock behind. If that PID is later recycled by a
+# new Copilot, the stale lock would map the new process onto the dead session.
+# The lock is written at session start, so one older than the process claiming
+# it is stale. Advisory: when either timestamp is unavailable, accept the lock
+# rather than lose a real session.
+_copilot_lock_is_live() {
+	local lock="$1" pid="$2"
+	local lock_mtime proc_start
+	lock_mtime=$(_file_mtime_epoch "$lock")
+	[ -n "$lock_mtime" ] || return 0
+	proc_start=$(get_process_start_epoch "$pid")
+	[ -n "$proc_start" ] || return 0
+	# Slack: the macOS start time is derived from second-granular elapsed time.
+	[ "$lock_mtime" -ge "$((proc_start - 5))" ]
+}
+
+get_copilot_session_from_lock() {
+	local child_pid="$1"
+	local state_dir lock sid recorded
 	state_dir=$(copilot_session_state_dir)
-	case "$path" in
-	"$state_dir"/*/session.db)
-		rest="${path#"$state_dir"/}"
-		sid="${rest%%/*}"
-		[ "$rest" = "$sid/session.db" ] || return 0
-		if echo "$sid" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
-			echo "$sid"
-		fi
-		;;
-	esac
-}
+	[ -d "$state_dir" ] || return 0
 
-copilot_lsof_bin() {
-	local lsof_bin="${COPILOT_LSOF:-}"
-	if [ -z "$lsof_bin" ]; then
-		lsof_bin=$(command -v lsof 2>/dev/null || true)
-		[ -z "$lsof_bin" ] && [ -x /usr/sbin/lsof ] && lsof_bin=/usr/sbin/lsof
-	fi
-	[ -n "$lsof_bin" ] && [ -x "$lsof_bin" ] && echo "$lsof_bin"
-}
-
-prime_copilot_open_files() {
-	local matches="$1"
-	local platform="${COPILOT_PLATFORM:-$(uname -s 2>/dev/null || echo unknown)}"
-	case "$platform" in
-	Darwin | FreeBSD | NetBSD | OpenBSD) ;;
-	*) return 0 ;;
-	esac
-
-	local pids lsof_bin
-	pids=$(printf '%s\n' "$matches" | awk -F'\t' '
-		$2 == "copilot" && !seen[$3]++ {
-			printf "%s%s", (count++ ? "," : ""), $3
-		}
-	')
-	[ -n "$pids" ] || return 0
-	lsof_bin=$(copilot_lsof_bin)
-	[ -n "$lsof_bin" ] || return 0
-
-	COPILOT_LSOF_SNAPSHOT=$("$lsof_bin" -a -p "$pids" -Fn 2>/dev/null || true)
-	COPILOT_LSOF_SNAPSHOT_READY=1
-	export COPILOT_LSOF_SNAPSHOT COPILOT_LSOF_SNAPSHOT_READY
-}
-
-get_copilot_session_from_proc() {
-	local child_pid="$1"
-	local proc_root="${COPILOT_PROC_ROOT:-/proc}"
-	local fd target sid
-	for fd in "$proc_root/$child_pid/fd"/*; do
-		[ -e "$fd" ] || [ -L "$fd" ] || continue
-		target=$(readlink "$fd" 2>/dev/null || true)
-		[ -n "$target" ] || continue
-		sid=$(copilot_session_id_from_path "$target")
-		if [ -n "$sid" ]; then
-			echo "$sid"
-			return
-		fi
+	for lock in "$state_dir"/*/"inuse.${child_pid}.lock"; do
+		[ -f "$lock" ] || continue
+		sid="${lock%/*}"
+		sid="${sid##*/}"
+		_copilot_is_uuid "$sid" || continue
+		# The lock records its owner; a mismatch means we misread the layout.
+		recorded=""
+		IFS= read -r recorded <"$lock" 2>/dev/null || true
+		[ -z "$recorded" ] || [ "$recorded" = "$child_pid" ] || continue
+		_copilot_lock_is_live "$lock" "$child_pid" || continue
+		echo "$sid"
+		return 0
 	done
-}
-
-get_copilot_session_from_lsof() {
-	local child_pid="$1"
-	local snapshot="${COPILOT_LSOF_SNAPSHOT:-}"
-	if [ "${COPILOT_LSOF_SNAPSHOT_READY:-0}" != "1" ]; then
-		local lsof_bin
-		lsof_bin=$(copilot_lsof_bin)
-		[ -n "$lsof_bin" ] || return 0
-		snapshot=$("$lsof_bin" -a -p "$child_pid" -Fn 2>/dev/null || true)
-	fi
-
-	local line path sid current_pid=""
-	while IFS= read -r line; do
-		case "$line" in
-		p*) current_pid="${line#p}"; continue ;;
-		n*) path="${line#n}" ;;
-		*) continue ;;
-		esac
-		[ -z "$current_pid" ] || [ "$current_pid" = "$child_pid" ] || continue
-		sid=$(copilot_session_id_from_path "$path")
-		if [ -n "$sid" ]; then
-			echo "$sid"
-			return
-		fi
-	done <<EOF
-$snapshot
-EOF
+	return 0
 }
 
 get_copilot_session() {
 	local child_pid="$1"
 	local args="$2"
 	local allow_args_fallback="${3:-1}"
-	local platform="${COPILOT_PLATFORM:-$(uname -s 2>/dev/null || echo unknown)}"
 	local sid=""
 
-	# Primary: the native Copilot process keeps its current session database
-	# open. This remains accurate after an in-process `/resume`, unlike launcher
-	# argv, and is PID-specific even when many panes share the same cwd.
-	case "$platform" in
-	Linux) sid=$(get_copilot_session_from_proc "$child_pid") ;;
-	Darwin | FreeBSD | NetBSD | OpenBSD) sid=$(get_copilot_session_from_lsof "$child_pid") ;;
-	CYGWIN* | MINGW* | MSYS* | Windows_NT) ;;
-	*)
-		sid=$(get_copilot_session_from_proc "$child_pid")
-		[ -z "$sid" ] && sid=$(get_copilot_session_from_lsof "$child_pid")
-		;;
-	esac
+	# Primary: PID-specific, platform-independent, and current after /resume.
+	sid=$(get_copilot_session_from_lock "$child_pid")
 	if [ -n "$sid" ]; then
 		echo "$sid"
-		return
+		return 0
 	fi
 
-	# Fallback: explicit session selector in argv. This is deferred to resolver
-	# pass 2 so a stale npm-loader argv cannot beat the native child's open DB.
+	# Fallback: explicit session selector in argv. Covers the startup window
+	# before the lock exists and setups where the state root is unreadable.
+	# Deferred to resolver pass 2 so a stale npm-loader argv cannot beat a live
+	# lock held by the native child.
 	[ "$allow_args_fallback" = "1" ] || return 0
-	sid=$(echo "$args" | sed -n 's/.*--session-id[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\).*/\1/p')
-	[ -z "$sid" ] && sid=$(echo "$args" | sed -n 's/.*--resume[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\).*/\1/p')
-	[ -z "$sid" ] && sid=$(echo "$args" | sed -n 's/.*-r[= ] *\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\).*/\1/p')
-	[ -n "$sid" ] && echo "$sid"
+	local uuid='\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)'
+	local flag
+	for flag in '--session-id' '--resume' '-r'; do
+		sid=$(echo "$args" | sed -n "s/.*$flag[= ] *$uuid.*/\1/p")
+		if [ -n "$sid" ]; then
+			echo "$sid"
+			return 0
+		fi
+	done
+	return 0
 }
 
 get_opencode_session() {
@@ -977,6 +936,24 @@ _strip_subcmds() {
 	return 0
 }
 
+# Run `<tool> --help`, neutralizing any side effects the tool performs on
+# startup. The save hook fires every few minutes, so a probe that phones home is
+# not acceptable: Copilot's native binary runs its auto-updater unless told not
+# to. Per-tool overrides live in HELP_PROBE_ENV_<tool> (word-split on purpose).
+HELP_PROBE_ENV_copilot="COPILOT_AUTO_UPDATE=false"
+
+_tool_help() {
+	local tool="$1"
+	local probe_env_var="HELP_PROBE_ENV_${tool}"
+	local probe_env="${!probe_env_var:-}"
+	if [ -n "$probe_env" ]; then
+		# shellcheck disable=SC2086  # deliberate split into env KEY=VAL args
+		env $probe_env "$tool" --help 2>/dev/null
+	else
+		"$tool" --help 2>/dev/null
+	fi
+}
+
 # Discover session-identity flags from a tool's --help output.
 # Matches long option names against a keyword pattern and emits lines of
 # "long [short]" pairs (e.g. "--resume -r" or "--fork-session").
@@ -993,7 +970,7 @@ _discover_session_flags() {
 	local help_out result=""
 	local fallback_var="SESSION_FLAGS_FALLBACK_${tool}"
 	local fallback="${!fallback_var:-}"
-	help_out=$("$tool" --help 2>/dev/null) || true
+	help_out=$(_tool_help "$tool") || true
 	if [ -n "$help_out" ]; then
 		local line long short
 		while IFS= read -r line; do
@@ -1035,7 +1012,7 @@ _discover_session_subcmds() {
 	# cannot resolve the binary), assume every candidate is supported so known
 	# session subcommands are still stripped — matches prior behavior.
 	local help_out subcmd result=""
-	help_out=$("$tool" --help 2>/dev/null) || true
+	help_out=$(_tool_help "$tool") || true
 	for subcmd in $(echo "$subcmd_pattern" | tr '|' ' '); do
 		if [ -z "$help_out" ] || echo "$help_out" | grep -qw "$subcmd"; then
 			result="${result}${subcmd}
@@ -1581,10 +1558,6 @@ main() {
 	' "$PANE_FILE" "$PS_FILE")
 
 	rm -f "$PS_FILE" "$PANE_FILE"
-
-	# macOS/BSD: collect all Copilot open files in one lsof call. Per-candidate
-	# extraction runs in subshells, so export the immutable snapshot once.
-	prime_copilot_open_files "$MATCHES"
 
 	# --- Pre-cache all state files in one jq call (requires jq 1.7+) ---
 	# Replaces ~58 per-file jq invocations with one jq + bash associative array.

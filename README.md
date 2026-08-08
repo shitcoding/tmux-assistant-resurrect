@@ -60,7 +60,7 @@ Session ID extraction uses tool-native mechanisms (infrastructure plumbing):
 | Tool | Primary method | Fallback 1 | Fallback 2 | Notes |
 |------|---------------|------------|------------|-------|
 | **Claude Code** | `SessionStart` hook state file (keyed by Claude PID) | `--resume` in process args | - | Claude overwrites its process title, so args fallback only works if args are visible |
-| **GitHub Copilot CLI** | Open `~/.copilot/session-state/<uuid>/session.db` lookup by PID | `--session-id` / `--resume` in process args | - | Uses `/proc/<pid>/fd` on Linux/WSL and `lsof` on macOS/BSD; native Windows requires an explicit session selector |
+| **GitHub Copilot CLI** | `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` written by the live session | `--session-id` / `--resume` in process args | - | Plain glob keyed on the native PID — no `/proc`, no `lsof`, works on every platform including native Windows |
 | **OpenCode** | `-s` / `--session` in process args | Plugin state file | SQLite DB query (`~/.local/share/opencode/opencode.db`) | Go binary overwrites process title; DB fallback matches most recent session by cwd |
 | **Codex CLI** | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | - | Codex runs via Node.js, so args are always visible in `ps` |
 | **Pi** | Session header lookup in `~/.pi/agent/sessions/--<cwd>--/*.jsonl` | `--session` in process args | - | Session-file lookup is cwd-scoped and uses process-time scoring + dedup |
@@ -110,7 +110,7 @@ and automatically set up:
 
 - tmux-resurrect + tmux-continuum settings
 - Claude Code hooks in `~/.claude/settings.json`
-- Copilot support via its open per-session database (no hook/plugin required)
+- Copilot support via its per-session `inuse.<pid>.lock` file (no hook/plugin required)
 - OpenCode session-tracker plugin in `~/.config/opencode/plugins/`
 - Pi support via session-file lookup in `~/.pi/agent/sessions` (no hook/plugin required)
 - Oh My Pi support via terminal/session-file lookup in `$XDG_STATE_HOME/omp`, `$XDG_DATA_HOME/omp`, or `~/.omp` (no hook/plugin required)
@@ -354,7 +354,7 @@ cat ~/.local/share/tmux/resurrect/assistant-save.log
 |---------|-------|
 | Save finds 0 sessions | Run `ps -eo pid=,ppid=,args= \| grep -E 'claude\|copilot\|opencode\|codex\|pi'` to verify assistants are running |
 | Session ID missing for Claude | Verify the hook is installed: `jq '.hooks.SessionStart' ~/.claude/settings.json` |
-| Session ID missing for Copilot | On Linux/WSL, verify `/proc/<copilot-pid>/fd` exposes `~/.copilot/session-state/<uuid>/session.db`; on macOS/BSD, verify `lsof -p <copilot-pid>` does. Native Windows needs Copilot launched with `--session-id <uuid>` or `--resume <uuid>` |
+| Session ID missing for Copilot | Check `ls ~/.copilot/session-state/*/inuse.*.lock` — the number in the filename must be the native Copilot PID from `ps`. If you set `COPILOT_HOME`, the save hook must see it too (tmux hooks do not inherit your shell profile; use `tmux set-environment -g COPILOT_HOME ...`) |
 | Session ID missing for OpenCode | Launch with `-s <id>`, or verify the plugin: `ls ~/.config/opencode/plugins/session-tracker.js` |
 | Session ID missing for Pi | Verify session files exist under `~/.pi/agent/sessions/--<cwd>--/*.jsonl` and that pane cwd matches the Pi session cwd |
 | Codex/OpenCode/Pi session ID missing (python3 methods) | The save hook auto-detects `python3` in common locations. If your setup uses a non-standard path, set it in tmux: `set-environment -g PATH "/your/python3/dir:$PATH"` |
@@ -540,18 +540,33 @@ additional hook is needed.
 
 ### GitHub Copilot CLI
 
-Copilot keeps the active conversation database open at
-`~/.copilot/session-state/<uuid>/session.db`. The save hook maps that open file
-back to the owning Copilot PID using `/proc/<pid>/fd` on Linux/WSL or `lsof` on
-macOS/BSD. This is PID-specific, so multiple Copilot sessions in the same
-directory remain unambiguous, and it follows an in-process `/resume` even when
-the original launcher argv is stale. The configured state root is resolved to
-its physical path so macOS aliases such as `/tmp` → `/private/tmp` still match.
+A live Copilot session marks its own state directory with a lock file naming
+the process that owns it:
+
+```
+~/.copilot/session-state/<uuid>/inuse.<native-pid>.lock
+```
+
+The save hook resolves the session with one glob against the detected PID. It is
+PID-specific, so multiple Copilot sessions in the same directory stay
+unambiguous, and because the lock is rewritten as the session changes it follows
+an in-process `/resume` even when the original launcher argv is stale. Copilot
+runs as an npm loader plus a native child; only the child owns the lock, which
+is what makes the mapping exact.
+
+Note there is no *per-session* database. `session-store.db` lives at the root of
+`~/.copilot` and is shared by every session, so it cannot identify one.
+`COPILOT_HOME` replaces the whole `~/.copilot` path, and the save hook honors
+it — but a tmux hook does not inherit your shell profile, so if you set it, set
+it for tmux too (`tmux set-environment -g COPILOT_HOME ...`).
+
+The lock file is not part of Copilot's documented interface, so
+`test/copilot-contract-test.sh` asserts it against the real binary (no
+authentication required) and fails loudly if a future release changes it.
 
 An explicit `--session-id <uuid>` or `--resume <uuid>` in process args is the
-fallback during the short startup window before the database is open. Native
-Windows has no open-file lookup in this plugin; it therefore requires one of
-those explicit selectors. Restore uses `copilot --resume=<uuid>`, preserves
+fallback for the brief startup window before the lock exists. Restore uses
+`copilot --resume=<uuid>`, preserves
 operational flags such as `--allow-all` and `--autopilot`, and strips
 session-selection flags. Because process inspection loses the quoting boundary
 of multi-word `--prompt` and `--interactive` values, either initial-prompt flag
@@ -602,9 +617,9 @@ fields are missing (old-format JSON), falls back to bare resume commands.
   history loaded, but any in-flight tool calls or pending operations are lost.
 - **First save after install (chicken-and-egg)**: An assistant must expose a
   session ID before it can be saved. Claude and OpenCode normally do this at
-  session start. A blank Copilot TUI does not open its session database until
-  the first prompt, so it cannot be restored until then. Codex/OpenCode (`-s`)
-  and Pi (`--session`) can also expose IDs directly in process args.
+  session start; Copilot writes its session lock at TUI startup, before the
+  first prompt. Codex/OpenCode (`-s`) and Pi (`--session`) can also expose IDs
+  directly in process args.
 - **Claude process title**: Claude Code sets `process.title = 'claude'`, but on
   macOS arm64 (v2.1.44+) `ps -eo args=` still shows full args. CLI flags like
   `--dangerously-skip-permissions` are captured from `ps` at save time. If a
@@ -612,13 +627,14 @@ fields are missing (old-format JSON), falls back to bare resume commands.
   bare resume commands.
 - **OpenCode without plugin**: If the OpenCode plugin isn't installed and the
   process was started without `-s`, the session ID cannot be detected.
-- **Copilot storage contract**: Copilot support relies on the native process
-  keeping `~/.copilot/session-state/<uuid>/session.db` open. Explicit
-  `--session-id`/`--resume` argv remains the fallback if that internal behavior
-  changes.
-- **Native Windows Copilot**: The PID-specific open-file lookup supports
-  Linux/WSL (`/proc`) and macOS/BSD (`lsof`). Native Windows can only restore
-  sessions whose UUID is present in process args.
+- **Copilot storage contract**: Copilot support relies on the live session
+  writing `session-state/<uuid>/inuse.<pid>.lock`, which is not a documented
+  interface. `test/copilot-contract-test.sh` pins it against the real binary;
+  explicit `--session-id`/`--resume` argv remains the fallback if it changes.
+- **Copilot killed with SIGKILL**: the lock is removed on graceful exit but
+  survives `kill -9`. A stale lock is rejected by comparing its mtime against
+  the claiming process's start time, so a recycled PID cannot resurrect a dead
+  session.
 - **OpenCode DB fallback (same-cwd ambiguity)**: When the plugin state file is
   unavailable and no `-s` flag was used, the save script falls back to the
   OpenCode SQLite database, matching sessions by working directory. If multiple
