@@ -389,6 +389,12 @@ test-grok:
 test-copilot:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/test/copilot-unit-tests.sh"
 
+# Authenticated Copilot round trip: prompt -> save -> kill -> restore -> recall.
+# Needs a real Copilot login and spends a few AI credits; skips without a token.
+#   GH_TOKEN=$(gh auth token) just test-copilot-e2e
+test-copilot-e2e:
+    @"${TEST_BASH:-bash}" "{{repo_dir}}/test/copilot-e2e-authenticated.sh"
+
 # Assert Copilot's upstream on-disk contract against the real binary.
 # Needs `copilot` on PATH (skips if absent); no login required.
 test-copilot-contract:

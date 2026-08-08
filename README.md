@@ -553,17 +553,26 @@ unambiguous. An in-process `/resume` can leave the prior session's lock behind,
 so the newest valid lock for the PID is selected. Copilot runs as an npm loader
 plus a native child; only the child owns the lock.
 
-Authenticated sessions may open a per-session `session.db`, but it is not part
-of the pre-auth startup contract and mapping its open file back to a PID is
-platform-specific. The lock is available earlier and works on every platform.
-The root `session-store.db` remains shared by every session.
+Copilot writes `session.db` into that directory once the conversation has real
+content, and **only such a session can be resumed** — `--resume=<uuid>` on a
+still-empty one exits with `No session, task, or name matched`. The save hook
+therefore requires `session.db` before saving a session, so restore never
+replays a command that would error in your pane. The lock still does the
+PID-to-session mapping, so this gate costs nothing but a file test. If an
+in-process `/resume` leaves more than one lock for the same process, the newest
+one wins.
+
+(Not to be confused with `session-store.db`, which lives at the root of
+`~/.copilot`, is shared by every session, and cannot identify one.)
 `COPILOT_HOME` replaces the whole `~/.copilot` path, and the save hook honors
 it — but a tmux hook does not inherit your shell profile, so if you set it, set
 it for tmux too (`tmux set-environment -g COPILOT_HOME ...`).
 
-The lock file is not part of Copilot's documented interface, so
-`test/copilot-contract-test.sh` asserts it against the real binary (no
-authentication required) and fails loudly if a future release changes it.
+Neither the lock file nor the `session.db` gate is part of Copilot's documented
+interface, so `test/copilot-contract-test.sh` asserts both against the real
+binary (no authentication required) and fails loudly if a future release changes
+them. The full authenticated round trip — prompt, save, kill, restore, and
+confirm the conversation is still there — was verified by hand against 1.0.78.
 
 An explicit `--session-id <uuid>` or `--resume <uuid>` in process args is the
 fallback for the brief startup window before the lock exists. Restore uses
@@ -618,9 +627,10 @@ fields are missing (old-format JSON), falls back to bare resume commands.
   history loaded, but any in-flight tool calls or pending operations are lost.
 - **First save after install (chicken-and-egg)**: An assistant must expose a
   session ID before it can be saved. Claude and OpenCode normally do this at
-  session start; Copilot writes its session lock at TUI startup, before the
-  first prompt. Codex/OpenCode (`-s`) and Pi (`--session`) can also expose IDs
-  directly in process args.
+  session start. **A Copilot session you have not typed into yet cannot be
+  restored**: Copilot only makes a session resumable once it has content, so an
+  idle pane sitting at a fresh Copilot prompt comes back as a plain shell.
+  Codex/OpenCode (`-s`) and Pi (`--session`) can expose IDs directly in args.
 - **Claude process title**: Claude Code sets `process.title = 'claude'`, but on
   macOS arm64 (v2.1.44+) `ps -eo args=` still shows full args. CLI flags like
   `--dangerously-skip-permissions` are captured from `ps` at save time. If a

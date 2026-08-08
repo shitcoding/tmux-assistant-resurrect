@@ -384,6 +384,12 @@ if wait_for_descendant "$copilot_pane_shell_pid" 30 >/dev/null; then
 	done
 	if [ -n "$copilot_sid" ]; then
 		pass "Copilot published a session lock (session $copilot_sid)"
+		# Copilot writes session.db only once a conversation has content, which
+		# needs an authenticated API call. The UUID and the PID mapping above
+		# are entirely real; this one file stands in for "the user has typed
+		# something", so the save hook's resumability gate is satisfied.
+		# test/copilot-contract-test.sh pins the real behaviour on both sides.
+		: >"$(dirname "$copilot_lock")/session.db"
 	else
 		fail "Copilot never wrote an inuse.<pid>.lock under ~/.copilot/session-state"
 	fi

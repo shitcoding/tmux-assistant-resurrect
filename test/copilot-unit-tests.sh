@@ -82,10 +82,15 @@ SID_STALE="11111111-2222-4333-8444-555555555555"
 
 # Mirror the real layout: session-state/<uuid>/inuse.<pid>.lock, content = PID.
 # See test/copilot-contract-test.sh, which pins this against the real binary.
+# A *resumable* session: the lock names the owning PID, and session.db marks it
+# as having real content. Copilot writes the lock at TUI startup but session.db
+# only once the conversation has content, and `--resume` rejects a session
+# without it. See test/copilot-contract-test.sh.
 make_lock() {
 	local sid="$1" pid="$2"
 	mkdir -p "$COPILOT_STATE/$sid"
 	printf '%s\n' "$pid" >"$COPILOT_STATE/$sid/inuse.$pid.lock"
+	: >"$COPILOT_STATE/$sid/session.db"
 }
 
 echo "== detect_tool =="
@@ -126,6 +131,19 @@ assert_eq "another PID's lock is not borrowed" "$SID_STALE" \
 	"$(get_copilot_session 1002 "copilot")"
 assert_eq "PID with no lock resolves nothing" "" \
 	"$(get_copilot_session 1003 "copilot" 0)"
+
+echo "== resumability gate =="
+# A freshly opened TUI has a lock but no session.db. Saving that UUID would make
+# restore replay `--resume=<uuid>` and print "No session, task, or name matched"
+# into the user's pane, so it must resolve to nothing until content exists.
+SID_EMPTY="55555555-6666-4777-8888-999999999999"
+mkdir -p "$COPILOT_STATE/$SID_EMPTY"
+printf '%s\n' 1007 >"$COPILOT_STATE/$SID_EMPTY/inuse.1007.lock"
+assert_eq "session with no session.db is not saved" "" \
+	"$(get_copilot_session 1007 "copilot" 0)"
+: >"$COPILOT_STATE/$SID_EMPTY/session.db"
+assert_eq "same session resolves once session.db appears" "$SID_EMPTY" \
+	"$(get_copilot_session 1007 "copilot" 0)"
 
 echo "== lock integrity =="
 mkdir -p "$COPILOT_STATE/not-a-uuid"
@@ -175,6 +193,7 @@ SID_CFGDIR="44444444-5555-4666-8777-888888888888"
 CFG_ROOT="$SANDBOX/alt-config"
 mkdir -p "$CFG_ROOT/session-state/$SID_CFGDIR"
 printf '%s\n' 1006 >"$CFG_ROOT/session-state/$SID_CFGDIR/inuse.1006.lock"
+: >"$CFG_ROOT/session-state/$SID_CFGDIR/session.db"
 assert_eq "--config-dir <path> relocates the state root" \
 	"$CFG_ROOT/session-state" \
 	"$(copilot_session_state_dir "copilot --config-dir $CFG_ROOT --allow-all")"
@@ -193,6 +212,28 @@ assert_eq "defaults to ~/.copilot when COPILOT_HOME is unset" \
 	"$(COPILOT_HOME= copilot_session_state_dir)"
 assert_eq "missing state root resolves nothing, quietly" "" \
 	"$(COPILOT_HOME="$SANDBOX/absent" get_copilot_session 1001 "copilot" 0)"
+
+# A tmux hook does not inherit the interactive shell's environment, so a
+# COPILOT_HOME exported from a profile is invisible to the save hook. On
+# Linux/WSL it is read back from the Copilot process's own environment.
+if [ -r "/proc/$$/environ" ]; then
+	PROC_ROOT="$SANDBOX/proc-home"
+	SID_PROCENV="66666666-7777-4888-8999-aaaaaaaaaaaa"
+	mkdir -p "$PROC_ROOT/session-state/$SID_PROCENV"
+	# A live child that carries COPILOT_HOME in its environment, as a Copilot
+	# launched from a shell that exported it would.
+	env COPILOT_HOME="$PROC_ROOT" sleep 15 &
+	ENV_PID=$!
+	printf '%s\n' "$ENV_PID" >"$PROC_ROOT/session-state/$SID_PROCENV/inuse.$ENV_PID.lock"
+	: >"$PROC_ROOT/session-state/$SID_PROCENV/session.db"
+	assert_eq "COPILOT_HOME is read from the Copilot process environment" \
+		"$SID_PROCENV" "$(COPILOT_HOME= get_copilot_session "$ENV_PID" "copilot" 0)"
+	assert_eq "--config-dir still outranks the process environment" \
+		"$CFG_ROOT/session-state" \
+		"$(copilot_session_state_dir "copilot --config-dir $CFG_ROOT" "$ENV_PID")"
+else
+	printf '  [skip] COPILOT_HOME from process env (no /proc on this platform)\n'
+fi
 
 echo "== unresolved candidate is non-fatal under set -e =="
 UNRESOLVED_PARTS="$SANDBOX/unresolved-parts"

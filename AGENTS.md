@@ -90,8 +90,19 @@ process args as a reliable fallback.
   it works on native Windows too. `COPILOT_HOME` replaces the whole `~/.copilot`
   path, same convention as `GROK_HOME`. An in-process `/resume` can leave more
   than one valid lock for the same PID, so the newest valid lock is authoritative.
-  Authenticated sessions may also open a per-session `session.db`, but it is not
-  part of the pre-auth contract and requires platform-specific PID inspection.
+- The lock alone is not enough: it appears at TUI startup, but Copilot writes
+  `<session-state>/<uuid>/session.db` only once the conversation has content,
+  and only such a session is resumable (`--resume` on an empty one exits with
+  "No session, task, or name matched"). The save hook gates on `session.db` so
+  restore never replays a command that errors in the pane. This costs no process
+  inspection: the lock already identified the directory, so the gate is a plain
+  file test. Do not confuse it with `session-store.db`, which sits at the root of
+  `COPILOT_HOME`, is shared by every session, and cannot identify one.
+- Testing that gate unauthenticated only reaches the negative half: a container
+  session never gains content, so `session.db` never appears. The contract test
+  asserts that half; `run-tests.sh` touches the file to stand in for "the user
+  typed something". The positive half needs a real login and is verified by
+  `test/copilot-e2e-authenticated.sh`.
 - Session lookup helpers may legitimately find no ID. Every `get_<tool>_session`
   command substitution in the resolver and compatibility emitter must be
   explicitly non-fatal (`|| true` inside the substitution), because a failed
@@ -209,6 +220,14 @@ artifact it then looks for cannot notice upstream changing the layout:
 | Contract | `test/copilot-contract-test.sh` | upstream changing the on-disk contract we depend on |
 | End-to-end | `test/run-tests.sh` Test 2/3, real binary | save/restore wiring against reality |
 | Hermetic | `test/copilot-unit-tests.sh` | lock integrity, stale locks, argv fallback, `extract_cli_args` |
+| Authenticated | `test/copilot-e2e-authenticated.sh` | whether a real conversation actually comes back |
+
+**Run the authenticated test after touching Copilot session discovery**
+(`GH_TOKEN=$(gh auth token) just test-copilot-e2e`). It is the only layer that
+can tell a resumable session from an unresumable one: unauthenticated Copilot
+still creates a session directory and lock, so a lookup returning a UUID that
+`--resume` rejects looks exactly like a correct one. That blind spot already
+shipped one bug. It cannot run in CI — fork pull requests cannot read secrets.
 
 The contract and end-to-end layers need **no authentication**: Copilot creates
 the session directory and its lock before the auth check runs. Launch it in the

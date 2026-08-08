@@ -136,6 +136,7 @@ get_claude_session() {
 # argv. Callers that have no argv handy may omit it.
 copilot_session_state_dir() {
 	local args="${1:-}"
+	local pid="${2:-}"
 	local root=""
 	case " $args " in
 	*" --config-dir="*)
@@ -147,8 +148,34 @@ copilot_session_state_dir() {
 		root="${root%% *}"
 		;;
 	esac
+	# A tmux hook does not inherit the interactive shell's environment, so a
+	# COPILOT_HOME exported from a shell profile is invisible here and the
+	# session would be silently skipped. Read it from the Copilot process itself
+	# where the kernel allows it (Linux/WSL). macOS cannot read another
+	# process's environment unprivileged -- documented, same as capture-env.
+	if [ -z "$root" ] && [ -n "$pid" ]; then
+		root=$(_copilot_home_from_process "$pid")
+	fi
 	[ -n "$root" ] || root="${COPILOT_HOME:-$HOME/.copilot}"
 	echo "$root/session-state"
+}
+
+_copilot_home_from_process() {
+	local pid="$1"
+	local environ_file="/proc/${pid}/environ"
+	# Open first: the process may exit between detection and inspection.
+	{ exec 3<"$environ_file"; } 2>/dev/null || return 0
+	local entry
+	while IFS= read -r -d '' entry; do
+		case "$entry" in
+		COPILOT_HOME=?*)
+			printf '%s' "${entry#COPILOT_HOME=}"
+			break
+			;;
+		esac
+	done <&3
+	exec 3<&-
+	return 0
 }
 
 # 8-4-4-4-12 hex. Glob-only so it costs no fork: the character class rejects
@@ -196,7 +223,7 @@ get_copilot_session_from_lock() {
 	local args="${2:-}"
 	local state_dir lock sid recorded lock_key
 	local newest_sid="" newest_key="" fallback_sid=""
-	state_dir=$(copilot_session_state_dir "$args")
+	state_dir=$(copilot_session_state_dir "$args" "$child_pid")
 	[ -d "$state_dir" ] || return 0
 
 	for lock in "$state_dir"/*/"inuse.${child_pid}.lock"; do
@@ -204,6 +231,13 @@ get_copilot_session_from_lock() {
 		sid="${lock%/*}"
 		sid="${sid##*/}"
 		_copilot_is_uuid "$sid" || continue
+		# Resumability gate. The lock appears at TUI startup, but Copilot only
+		# writes session.db (and events.jsonl) once the session has real
+		# content, and only such a session can be resumed -- `--resume=<uuid>`
+		# on a still-empty one exits with "No session, task, or name matched".
+		# Saving it would replay a command that errors in the user's pane, so
+		# treat "no session.db yet" as "nothing to save yet".
+		[ -f "${lock%/*}/session.db" ] || continue
 		# The lock records its owner; a mismatch means we misread the layout.
 		recorded=""
 		IFS= read -r recorded <"$lock" 2>/dev/null || true

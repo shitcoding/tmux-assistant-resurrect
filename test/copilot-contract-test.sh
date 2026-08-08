@@ -177,11 +177,40 @@ if [ -e "$lock" ]; then
 	pass "mapping is available on a blank TUI (no prompt submitted)"
 fi
 
-# --- Contract 3: production resolver follows the real lock -------------------
+# --- Contract 3: the production resolver, and the resumability gate ----------
+#
+# This session has never been prompted, so it has no content and Copilot has not
+# written session.db. Such a session is NOT resumable -- `--resume=<uuid>` on it
+# exits with "No session, task, or name matched" -- so the resolver must decline
+# it rather than hand restore a command that errors in the user's pane.
+#
+# The positive half (a session WITH content gains session.db and events.jsonl,
+# and does resume) needs a real login: test/copilot-e2e-authenticated.sh.
 
-echo "== production resolver =="
-assert_eq "resolver maps the native PID to the live session UUID" \
+echo "== resumability gate =="
+if [ ! -f "$session_dir/session.db" ]; then
+	pass "a never-prompted session has no session.db"
+else
+	fail "unexpected session.db in a session with no content" \
+		"the resumability gate no longer distinguishes empty sessions"
+fi
+
+assert_eq "production resolver declines a session that cannot be resumed" \
+	"" "$(get_copilot_session_from_lock "$native_pid")"
+
+# Now stand in for "the user typed something" -- the one artifact that needs a
+# paid API call. The PID, the lock and the UUID below are all real.
+: >"$session_dir/session.db"
+assert_eq "production resolver maps the native PID to the live session UUID" \
 	"$session_id" "$(get_copilot_session_from_lock "$native_pid")"
+rm -f "$session_dir/session.db"
+
+if [ -z "$(find "$COPILOT_HOME" -maxdepth 1 -name 'session-store.db' 2>/dev/null)" ]; then
+	fail "expected the shared session-store.db at the COPILOT_HOME root" \
+		"present: $(ls -A "$COPILOT_HOME" 2>/dev/null | tr '\n' ' ')"
+else
+	pass "shared session-store.db sits at the root, not inside the session dir"
+fi
 
 # --- Contract 4: the lock is released on graceful shutdown -------------------
 
