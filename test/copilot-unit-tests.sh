@@ -19,14 +19,26 @@ mkdir -p "$TMUX_RESURRECT_DIR" "$TMUX_ASSISTANT_RESURRECT_DIR" \
 	"$COPILOT_STATE" "$SANDBOX/bin"
 
 # Keep CLI-flag discovery deterministic and exercise the real help parser.
+# Spellings copied verbatim from `copilot --help` (1.0.78) so the real parsers
+# are exercised: `<value>` = one value, `[=name...]` = variadic.
 cat >"$SANDBOX/bin/copilot" <<'EOF'
 #!/usr/bin/env bash
 cat <<'HELP'
+  --add-dir <directory>                 Add a directory to the allowed list
+  --agent <agent>                       Specify a custom agent to use
+  --allow-tool[=tools...]               Tools the CLI has permission to use
+  --allow-url[=urls...]                 Allow access to specific URLs or domains
+  --available-tools[=tools...]          Only these tools will be available
   --connect[=sessionId]                 Connect to a remote session
   --continue                            Resume the most recent session
+  --deny-tool[=tools...]                Tools the CLI does not have permission
+  --deny-url[=urls...]                  Deny access to specific URLs or domains
+  --excluded-tools[=tools...]           These tools will not be available
   -i, --interactive <prompt>            Start interactive mode and execute prompt
+  -n, --name <name>                     Set a name for the new session
   -p, --prompt <prompt>                 Submit one non-interactive prompt
   -r, --resume[=value]                  Resume a previous session
+  --secret-env-vars[=vars...]           Environment variable names to redact
   --session-id <id>                     Use a specific session ID
 HELP
 EOF
@@ -190,6 +202,33 @@ assert_eq "strip resume and connect selectors" "--no-remote" \
 assert_eq "preserve operational flags" \
 	"--allow-all --autopilot --max-autopilot-continues 20" \
 	"$(extract_cli_args copilot "copilot --allow-all --autopilot --max-autopilot-continues 20")"
+
+# `copilot --name x --resume=<id>` is rejected outright ("cannot be used with"),
+# so a named session must lose its name to be resumable at all.
+assert_eq "strip --name so it cannot collide with --resume" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --name nightly-triage --allow-all")"
+assert_eq "strip short -n too" "--allow-all" \
+	"$(extract_cli_args copilot "copilot -n nightly-triage --allow-all")"
+
+echo "== flattened multi-word values =="
+# Copilot takes zero positional arguments, so replaying the tail of a value
+# whose quoting `ps` erased makes it exit with "too many arguments". Options
+# that cannot be reconstructed are dropped instead.
+assert_eq "drop an option whose value lost its quoting" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --add-dir /tmp/My Project --allow-all")"
+assert_eq "single-token value is unambiguous and kept" \
+	"--add-dir /tmp/project --allow-all" \
+	"$(extract_cli_args copilot "copilot --add-dir /tmp/project --allow-all")"
+assert_eq "variadic options keep all their values" \
+	"--allow-tool shell write --allow-all" \
+	"$(extract_cli_args copilot "copilot --allow-tool shell write --allow-all")"
+assert_eq "multi-word --name leaves no stray positional" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --name my nightly run --allow-all")"
+assert_eq "flattened value at end of argv" "--autopilot" \
+	"$(extract_cli_args copilot "copilot --autopilot --agent my custom agent")"
+assert_eq "variadic list detected from real --help spelling" \
+	"--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars" \
+	"$(_copilot_variadic_flags)"
 
 echo
 echo "copilot unit tests: $PASS passed, $FAIL failed"

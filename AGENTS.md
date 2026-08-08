@@ -96,6 +96,13 @@ process args as a reliable fallback.
   explicitly non-fatal (`|| true` inside the substitution), because a failed
   bare command-substitution assignment triggers `set -e` in supported Bash
   versions.
+- Copilot accepts **zero** positional arguments, which makes flattened argv
+  fatal rather than merely lossy: `--add-dir "/tmp/My Project"` reaches `ps` as
+  three tokens, and replaying the tail makes Copilot exit with "too many
+  arguments". `_copilot_drop_flattened_values()` drops any option whose value
+  arrived split, exempting variadic options (`--allow-tool[=tools...]`), whose
+  several tokens round-trip correctly. It must run *before* the session-flag
+  strippers, which consume only one token and would strand the rest.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
@@ -117,7 +124,8 @@ process args as a reliable fallback.
   with binary name and session/resume args stripped), `env` (from state file).
   All are optional for backward compatibility.
 - `extract_cli_args()` in `save-assistant-sessions.sh` strips per-tool session
-  args: Claude `--resume[= ]<id>`, Copilot session selectors and initial-prompt
+  args: Claude `--resume[= ]<id>`, Copilot session selectors (including
+  `--name`, which Copilot refuses to combine with `--resume`) and initial-prompt
   `--prompt`/`--interactive` plus trailing argv, OpenCode `--session[= ]<id>` and `-s <id>`,
   Codex `resume <id>`, Pi `--session[= ]<id>`, Grok `--resume`/`-r`/`--session-id`/
   `--continue`. Returns normalized whitespace-trimmed string. (Grok's restore

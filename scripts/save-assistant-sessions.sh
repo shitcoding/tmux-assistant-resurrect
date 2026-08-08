@@ -880,6 +880,98 @@ merge_process_env() {
 
 # --- CLI args extraction helpers ---
 
+# Copilot's variadic options -- the ones whose --help spelling ends in `...`,
+# e.g. `--allow-tool[=tools...]`. They legitimately occupy several argv tokens.
+SESSION_VARIADIC_FALLBACK_copilot="--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars"
+
+_copilot_variadic_flags() {
+	local cached="${_COPILOT_VARIADIC_FLAGS:-}"
+	if [ -n "$cached" ]; then
+		[ "$cached" = "-" ] || echo "$cached"
+		return 0
+	fi
+
+	local help_out result=""
+	help_out=$(_tool_help copilot)
+	if [ -n "$help_out" ]; then
+		result=$(echo "$help_out" |
+			grep -E '^[[:space:]]+(-[a-zA-Z],[[:space:]]+)?--[a-z][-a-z]*\[=[^]]*\.\.\.\]' |
+			grep -oE -- '--[a-z][-a-z]*' | sort -u | tr '\n' ' ')
+		result="${result% }"
+	fi
+	[ -n "$result" ] || result="$SESSION_VARIADIC_FALLBACK_copilot"
+
+	printf -v _COPILOT_VARIADIC_FLAGS '%s' "${result:--}"
+	[ -n "$result" ] && echo "$result"
+	return 0
+}
+
+# Copilot accepts zero positional arguments, so every bare token in its argv is
+# an option value. `ps` has already lost the quoting, so a value that contained
+# spaces arrives as several bare tokens -- and `cli_args` is a whitespace-joined
+# string that cannot express it again. Restore would replay the extra words as
+# positionals and Copilot exits with "too many arguments" before it can resume.
+#
+# Drop those options instead: a session that resumes with one flag missing beats
+# a command line Copilot rejects outright. Variadic options are exempt because
+# their several tokens round-trip correctly. Discovering the *variadic* set
+# (rather than the single-valued one) is the fail-safe direction: if --help is
+# unavailable we drop slightly too much rather than emit something invalid.
+_copilot_drop_flattened_values() {
+	local args="$1"
+	local variadic
+	variadic=" $(_copilot_variadic_flags) "
+
+	# shellcheck disable=SC2206  # deliberate word-split of a flattened argv
+	local -a words=($args)
+	local -a out=()
+	local -a run=()
+	local i=0 n=${#words[@]} last_flag="" keep w
+
+	while [ "$i" -lt "$n" ]; do
+		case "${words[$i]}" in
+		-*)
+			out[${#out[@]}]="${words[$i]}"
+			last_flag="${words[$i]%%=*}"
+			i=$((i + 1))
+			continue
+			;;
+		esac
+
+		# Collect the whole run of consecutive bare tokens.
+		run=()
+		while [ "$i" -lt "$n" ]; do
+			case "${words[$i]}" in
+			-*) break ;;
+			esac
+			run[${#run[@]}]="${words[$i]}"
+			i=$((i + 1))
+		done
+
+		keep=1
+		if [ "${#run[@]}" -gt 1 ]; then
+			keep=0
+			case "$variadic" in
+			*" $last_flag "*) keep=1 ;;
+			esac
+		fi
+
+		if [ "$keep" -eq 1 ]; then
+			for w in "${run[@]}"; do
+				out[${#out[@]}]="$w"
+			done
+		elif [ -n "$last_flag" ] && [ "${#out[@]}" -gt 0 ]; then
+			# Drop the option the unreconstructable value belonged to.
+			unset "out[$((${#out[@]} - 1))]"
+			out=(${out[@]+"${out[@]}"})
+		fi
+		last_flag=""
+	done
+
+	[ "${#out[@]}" -gt 0 ] && echo "${out[*]}"
+	return 0
+}
+
 # Strip a long option: --flag, --flag=val, or --flag val.
 # Value (if space-separated) must not start with "-" to avoid consuming next flag.
 _strip_long_opt() {
@@ -942,16 +1034,30 @@ _strip_subcmds() {
 # to. Per-tool overrides live in HELP_PROBE_ENV_<tool> (word-split on purpose).
 HELP_PROBE_ENV_copilot="COPILOT_AUTO_UPDATE=false"
 
+# Cached per tool in _TOOL_HELP_<tool>: several discovery passes read the same
+# help text, and the callers run in a $() subshell per pane.
 _tool_help() {
 	local tool="$1"
+	local cache_var="_TOOL_HELP_${tool}"
+	local cached="${!cache_var:-}"
+	if [ -n "$cached" ]; then
+		[ "$cached" = "-" ] || printf '%s\n' "$cached"
+		return 0
+	fi
+
 	local probe_env_var="HELP_PROBE_ENV_${tool}"
 	local probe_env="${!probe_env_var:-}"
+	local out=""
 	if [ -n "$probe_env" ]; then
 		# shellcheck disable=SC2086  # deliberate split into env KEY=VAL args
-		env $probe_env "$tool" --help 2>/dev/null
+		out=$(env $probe_env "$tool" --help 2>/dev/null) || out=""
 	else
-		"$tool" --help 2>/dev/null
+		out=$("$tool" --help 2>/dev/null) || out=""
 	fi
+
+	printf -v "$cache_var" '%s' "${out:--}"
+	[ -n "$out" ] && printf '%s\n' "$out"
+	return 0
 }
 
 # Discover session-identity flags from a tool's --help output.
@@ -1030,7 +1136,7 @@ _discover_session_subcmds() {
 # (--resume always means resume), so new flags like --resume-from are
 # auto-discovered without script changes.
 SESSION_FLAG_PATTERN_claude='^--(resume|continue|session-id|fork-session|from-pr)$'
-SESSION_FLAG_PATTERN_copilot='^--(connect|continue|interactive|prompt|resume|session-id)$'
+SESSION_FLAG_PATTERN_copilot='^--(connect|continue|interactive|name|prompt|resume|session-id)$'
 SESSION_FLAG_PATTERN_opencode='^--session$'
 SESSION_FLAG_PATTERN_pi='^--(session|resume|continue|fork)$'
 SESSION_FLAG_PATTERN_omp='^--(session|resume|continue|fork)$'
@@ -1048,9 +1154,13 @@ SESSION_FLAGS_FALLBACK_claude="--continue -c
 --from-pr
 --resume -r
 --session-id"
+# --name is included deliberately: `copilot --name x --resume=<id>` is rejected
+# outright ("cannot be used with"), so a named session must lose its name to be
+# resumable at all.
 SESSION_FLAGS_FALLBACK_copilot="--connect
 --continue
 --interactive -i
+--name -n
 --prompt -p
 --resume -r
 --session-id"
@@ -1142,6 +1252,11 @@ extract_cli_args() {
 			-e 's/(^| )-p([= ].*)?$//' \
 			-e 's/(^| )--interactive([= ].*)?$//' \
 			-e 's/(^| )-i([= ].*)?$//')
+		# Before the session-flag pass, while each value is still adjacent to the
+		# option it belongs to: the strippers below consume only one token, which
+		# would leave the tail of a flattened multi-word value stranded as a
+		# positional.
+		args=$(_copilot_drop_flattened_values "$args")
 	fi
 
 	# Strip tool-specific session/resume flags.

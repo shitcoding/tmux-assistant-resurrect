@@ -631,6 +631,14 @@ fields are missing (old-format JSON), falls back to bare resume commands.
   writing `session-state/<uuid>/inuse.<pid>.lock`, which is not a documented
   interface. `test/copilot-contract-test.sh` pins it against the real binary;
   explicit `--session-id`/`--resume` argv remains the fallback if it changes.
+- **Copilot options with spaces in their values**: `ps` shows a flattened
+  command line, so a value like `--add-dir "/tmp/My Project"` cannot be told
+  apart from several arguments. Since Copilot rejects positional arguments
+  outright, such options are dropped from `cli_args` rather than replayed —
+  the session resumes, without that flag. Options given as `--flag=value`, and
+  values without spaces, are unaffected.
+- **Copilot session names**: Copilot refuses `--name` together with `--resume`,
+  so a session started with `--name` is resumed without it.
 - **Copilot killed with SIGKILL**: the lock is removed on graceful exit but
   survives `kill -9`. A stale lock is rejected by comparing its mtime against
   the claiming process's start time, so a recycled PID cannot resurrect a dead
