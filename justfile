@@ -1,5 +1,6 @@
 # tmux-assistant-resurrect — session persistence for AI coding assistants
-# Preserves Claude Code, OpenCode, Codex CLI, Pi, Oh My Pi, and Grok sessions across tmux restarts.
+# Preserves Claude Code, GitHub Copilot CLI, OpenCode, Codex CLI, Pi, Oh My Pi,
+# and Grok sessions across tmux restarts.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 

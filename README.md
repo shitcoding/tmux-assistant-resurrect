@@ -3,7 +3,7 @@
 > **Disclaimer**: This project was entirely vibecoded (designed and implemented
 > through conversation with AI coding assistants). It has been end-to-end tested
 > in Docker with real CLI binaries (Claude/Copilot/OpenCode/Codex/Pi/Oh My Pi)
-> (350+ automated tests + full save/kill/restore lifecycle smoke test),
+> (400+ automated tests + full save/kill/restore lifecycle smoke test),
 > but has **limited real-world usage** so far. Expect
 > rough edges. Contributions and bug reports welcome.
 
@@ -600,11 +600,11 @@ fields are missing (old-format JSON), falls back to bare resume commands.
 
 - **Running state is not preserved**: Assistants restart with their conversation
   history loaded, but any in-flight tool calls or pending operations are lost.
-- **First save after install (chicken-and-egg)**: On initial install, no session
-  IDs exist yet. Assistants must complete at least one session (triggering the
-  hooks) before their IDs can be saved. For Codex/OpenCode (`-s`) and Pi
-  (`--session`), this is less of an issue since IDs are available in args after
-  a restored launch.
+- **First save after install (chicken-and-egg)**: An assistant must expose a
+  session ID before it can be saved. Claude and OpenCode normally do this at
+  session start. A blank Copilot TUI does not open its session database until
+  the first prompt, so it cannot be restored until then. Codex/OpenCode (`-s`)
+  and Pi (`--session`) can also expose IDs directly in process args.
 - **Claude process title**: Claude Code sets `process.title = 'claude'`, but on
   macOS arm64 (v2.1.44+) `ps -eo args=` still shows full args. CLI flags like
   `--dangerously-skip-permissions` are captured from `ps` at save time. If a

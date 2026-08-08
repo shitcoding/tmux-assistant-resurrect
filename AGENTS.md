@@ -91,8 +91,9 @@ process args as a reliable fallback.
   `lsof` snapshot per save; do not fork `lsof` once per pane.
 - Session lookup helpers may legitimately find no ID. Every `get_<tool>_session`
   command substitution in the resolver and compatibility emitter must be
-  explicitly non-fatal (`|| true` inside the substitution), because macOS Bash
-  3.2 applies `set -e` to a failed assignment more aggressively than Bash 5.
+  explicitly non-fatal (`|| true` inside the substitution), because a failed
+  bare command-substitution assignment triggers `set -e` in supported Bash
+  versions.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
