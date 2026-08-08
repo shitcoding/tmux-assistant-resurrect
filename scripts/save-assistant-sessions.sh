@@ -130,8 +130,25 @@ get_claude_session() {
 # contract. test/copilot-contract-test.sh pins it against the real binary.
 
 # COPILOT_HOME replaces the whole ~/.copilot path (same convention as GROK_HOME).
+# The deprecated `--config-dir <path>` does the same thing per process and is
+# still honored by 1.0.78 -- a session launched with it writes its lock there and
+# nothing at all under ~/.copilot -- so it wins when present in the candidate's
+# argv. Callers that have no argv handy may omit it.
 copilot_session_state_dir() {
-	echo "${COPILOT_HOME:-$HOME/.copilot}/session-state"
+	local args="${1:-}"
+	local root=""
+	case " $args " in
+	*" --config-dir="*)
+		root="${args##*--config-dir=}"
+		root="${root%% *}"
+		;;
+	*" --config-dir "*)
+		root="${args##*--config-dir }"
+		root="${root%% *}"
+		;;
+	esac
+	[ -n "$root" ] || root="${COPILOT_HOME:-$HOME/.copilot}"
+	echo "$root/session-state"
 }
 
 # 8-4-4-4-12 hex. Glob-only so it costs no fork: the character class rejects
@@ -176,9 +193,10 @@ _copilot_lock_is_live() {
 
 get_copilot_session_from_lock() {
 	local child_pid="$1"
+	local args="${2:-}"
 	local state_dir lock sid recorded lock_key
 	local newest_sid="" newest_key="" fallback_sid=""
-	state_dir=$(copilot_session_state_dir)
+	state_dir=$(copilot_session_state_dir "$args")
 	[ -d "$state_dir" ] || return 0
 
 	for lock in "$state_dir"/*/"inuse.${child_pid}.lock"; do
@@ -210,7 +228,7 @@ get_copilot_session() {
 	local sid=""
 
 	# Primary: PID-specific, platform-independent, and current after /resume.
-	sid=$(get_copilot_session_from_lock "$child_pid")
+	sid=$(get_copilot_session_from_lock "$child_pid" "$args")
 	if [ -n "$sid" ]; then
 		echo "$sid"
 		return 0
@@ -1320,6 +1338,12 @@ extract_cli_args() {
 		# other non-interactive-flavored flags (--silent, --share, --share-gist,
 		# --enable-memory) resume without complaint and are left alone.
 		args=$(_strip_long_opt '--attachment' "$args")
+		# Copilot hides --worktree/-w and --cloud from --help, so the discovery
+		# pattern can never learn them, yet both are refused alongside --resume
+		# ("cannot be used with"). Strip them explicitly. Verified on 1.0.78.
+		args=$(_strip_long_opt '--worktree' "$args")
+		args=$(_strip_short_opt '-w' "$args")
+		args=$(_strip_bool_opt '--cloud' "$args")
 	fi
 
 	# Strip tool-specific session/resume flags.

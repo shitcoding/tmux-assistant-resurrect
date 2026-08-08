@@ -169,6 +169,23 @@ assert_eq "deferred argv fallback can be disabled" "" \
 	"$(get_copilot_session 3001 "copilot --resume=$SID_CURRENT" 0)"
 
 echo "== state root resolution =="
+# Deprecated but still honored: --config-dir moves the whole state root, and a
+# session launched with it writes nothing under ~/.copilot.
+SID_CFGDIR="44444444-5555-4666-8777-888888888888"
+CFG_ROOT="$SANDBOX/alt-config"
+mkdir -p "$CFG_ROOT/session-state/$SID_CFGDIR"
+printf '%s\n' 1006 >"$CFG_ROOT/session-state/$SID_CFGDIR/inuse.1006.lock"
+assert_eq "--config-dir <path> relocates the state root" \
+	"$CFG_ROOT/session-state" \
+	"$(copilot_session_state_dir "copilot --config-dir $CFG_ROOT --allow-all")"
+assert_eq "--config-dir=<path> relocates the state root" \
+	"$CFG_ROOT/session-state" \
+	"$(copilot_session_state_dir "copilot --config-dir=$CFG_ROOT")"
+assert_eq "lock is found under --config-dir" "$SID_CFGDIR" \
+	"$(get_copilot_session 1006 "copilot --config-dir $CFG_ROOT" 0)"
+assert_eq "same PID resolves nothing without --config-dir" "" \
+	"$(get_copilot_session 1006 "copilot" 0)"
+
 assert_eq "COPILOT_HOME overrides the whole ~/.copilot path" \
 	"$COPILOT_HOME/session-state" "$(copilot_session_state_dir)"
 assert_eq "defaults to ~/.copilot when COPILOT_HOME is unset" \
@@ -283,6 +300,18 @@ assert_eq "strip --attachment with no prompt at all" "--allow-all" \
 	"$(extract_cli_args copilot "copilot --attachment /tmp/a.png --allow-all")"
 assert_eq "strip equals-form --attachment" "--allow-all" \
 	"$(extract_cli_args copilot "copilot --attachment=/tmp/a.png --allow-all")"
+
+echo "== hidden launch-mode selectors =="
+# --worktree/-w and --cloud never appear in --help, so discovery cannot learn
+# them, yet Copilot refuses each one alongside --resume.
+assert_eq "strip --worktree" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --worktree --allow-all")"
+assert_eq "strip --worktree=<name>" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --worktree=feature-x --allow-all")"
+assert_eq "strip short -w" "--allow-all" \
+	"$(extract_cli_args copilot "copilot -w --allow-all")"
+assert_eq "strip --cloud" "--experimental --allow-all" \
+	"$(extract_cli_args copilot "copilot --experimental --cloud --allow-all")"
 
 echo "== --help probe cost =="
 # The save hook runs every few minutes: discovery must not exec the CLI once per

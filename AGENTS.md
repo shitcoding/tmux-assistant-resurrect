@@ -116,6 +116,14 @@ process args as a reliable fallback.
   written *after* the prompt, so position-independent stripping is required.
   Verified against 1.0.78 — `--silent`, `--share`, `--share-gist` and
   `--enable-memory` resume without complaint and are deliberately left alone.
+- Two Copilot options are **hidden from `--help`** yet refused alongside
+  `--resume`: `--worktree`/`-w` and `--cloud`. Flag discovery can never learn
+  them, so they are stripped from a static list. Re-check that list when
+  Copilot's experimental surface changes.
+- The deprecated `--config-dir <path>` relocates the whole state root per
+  process (verified on 1.0.78: the lock lands there and nothing under
+  `~/.copilot`), so `copilot_session_state_dir()` takes the candidate's argv and
+  prefers it over `COPILOT_HOME`.
 - Discovery caches live in shell variables and every caller runs inside a `$()`
   subshell, so a cache written there is discarded. `_warm_session_discovery()`
   must therefore call `_tool_help` **directly** in the parent shell, and any new
