@@ -307,7 +307,9 @@ tmux new-session -d -s test-claude -c /tmp
 tmux new-session -d -s test-copilot -c /tmp
 tmux new-session -d -s test-opencode -c /tmp
 tmux new-session -d -s test-codex -c /tmp
-tmux new-session -d -s test-opencode-nosid -c /tmp
+OPENCODE_NOSID_CWD="/tmp/opencode-nosid-test-cwd"
+mkdir -p "$OPENCODE_NOSID_CWD"
+tmux new-session -d -s test-opencode-nosid -c "$OPENCODE_NOSID_CWD"
 tmux new-session -d -s test-lsp -c /tmp
 tmux new-session -d -s test-false-positive -c /tmp
 PI_TEST_CWD="/tmp/pi-session-test-cwd"
@@ -506,9 +508,9 @@ assert_eq "LSP subprocess excluded from detection" "0" "$lsp_count"
 false_positive_count=$(jq '[.sessions[] | select(.pane | contains("test-false-positive"))] | length' "$SAVED")
 assert_eq "Argument value 'codex' does not trigger false-positive detection" "0" "$false_positive_count"
 
-# Verify the log mentions the opencode without session ID
+# Verify the isolated OpenCode pane cannot resolve an unrelated DB session.
 LOG="$HOME/.tmux/resurrect/assistant-save.log"
-if grep -q "no session ID available" "$LOG"; then
+if grep -q "detected opencode in test-opencode-nosid.*no session ID available" "$LOG"; then
 	pass "Log warns about opencode without session ID"
 else
 	fail "Expected log warning about missing session ID"

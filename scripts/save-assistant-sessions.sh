@@ -971,9 +971,11 @@ _copilot_drop_flattened_values() {
 		keep=1
 		if [ "${#run[@]}" -gt 1 ] || [ "$last_had_eq" -eq 1 ]; then
 			keep=0
-			case "$variadic" in
-			*" $last_flag "*) keep=1 ;;
-			esac
+			if [ "$last_had_eq" -eq 0 ]; then
+				case "$variadic" in
+				*" $last_flag "*) keep=1 ;;
+				esac
+			fi
 		fi
 
 		if [ "$keep" -eq 1 ]; then

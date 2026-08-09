@@ -234,6 +234,8 @@ assert_eq "drop equals-form option whose value lost its quoting" "--allow-all" \
 	"$(extract_cli_args copilot "copilot --name=my feature --allow-all")"
 assert_eq "drop equals-form --add-dir with a space in the path" "--allow-all" \
 	"$(extract_cli_args copilot "copilot --add-dir=/tmp/My Project --allow-all")"
+assert_eq "drop equals-form variadic option with flattened values" "--allow-all" \
+	"$(extract_cli_args copilot "copilot --allow-tool=shell write --allow-all")"
 assert_eq "equals-form value without spaces is kept" \
 	"--add-dir=/tmp/project --allow-all" \
 	"$(extract_cli_args copilot "copilot --add-dir=/tmp/project --allow-all")"
