@@ -103,6 +103,19 @@ assert_eq "resolves UUID from inuse.<pid>.lock" "$SID_CURRENT" \
 assert_eq "live lock wins over stale launcher argv" "$SID_CURRENT" \
 	"$(get_copilot_session 1001 "copilot --session-id=$SID_STALE")"
 
+# Copilot can leave the old session's lock behind after an in-process /resume.
+# The newest valid lock for the PID is the current session.
+SID_SWITCH_OLD="77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+SID_SWITCH_NEW="88888888-9999-4aaa-8bbb-cccccccccccc"
+make_lock "$SID_SWITCH_OLD" 1006
+touch -t 202601010000.00 "$COPILOT_STATE/$SID_SWITCH_OLD/inuse.1006.lock"
+make_lock "$SID_SWITCH_NEW" 1006
+# Give both locks the same whole-second mtime. Their high-resolution ctime
+# still records creation order and must break the tie.
+touch -t 202601010000.00 "$COPILOT_STATE/$SID_SWITCH_NEW/inuse.1006.lock"
+assert_eq "newest lock wins when mtimes share the same second" "$SID_SWITCH_NEW" \
+	"$(get_copilot_session 1006 "copilot")"
+
 # The lookup is keyed on PID, so sessions sharing a cwd stay unambiguous and a
 # lock belonging to a different Copilot is never picked up.
 make_lock "$SID_STALE" 1002

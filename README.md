@@ -549,13 +549,14 @@ the process that owns it:
 
 The save hook resolves the session with one glob against the detected PID. It is
 PID-specific, so multiple Copilot sessions in the same directory stay
-unambiguous, and because the lock is rewritten as the session changes it follows
-an in-process `/resume` even when the original launcher argv is stale. Copilot
-runs as an npm loader plus a native child; only the child owns the lock, which
-is what makes the mapping exact.
+unambiguous. An in-process `/resume` can leave the prior session's lock behind,
+so the newest valid lock for the PID is selected. Copilot runs as an npm loader
+plus a native child; only the child owns the lock.
 
-Note there is no *per-session* database. `session-store.db` lives at the root of
-`~/.copilot` and is shared by every session, so it cannot identify one.
+Authenticated sessions may open a per-session `session.db`, but it is not part
+of the pre-auth startup contract and mapping its open file back to a PID is
+platform-specific. The lock is available earlier and works on every platform.
+The root `session-store.db` remains shared by every session.
 `COPILOT_HOME` replaces the whole `~/.copilot` path, and the save hook honors
 it — but a tmux hook does not inherit your shell profile, so if you set it, set
 it for tmux too (`tmux set-environment -g COPILOT_HOME ...`).

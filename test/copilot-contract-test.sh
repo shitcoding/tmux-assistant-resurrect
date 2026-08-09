@@ -34,7 +34,16 @@ SANDBOX="$(mktemp -d)"
 export COPILOT_HOME="$SANDBOX/copilot-home"
 # Never let a save-hook-adjacent probe reach the network during CI.
 export COPILOT_AUTO_UPDATE=false
+export TMUX_RESURRECT_DIR="$SANDBOX/resurrect"
+export TMUX_ASSISTANT_RESURRECT_DIR="$SANDBOX/state"
 mkdir -p "$COPILOT_HOME"
+
+# Source the production resolver after all path overrides are set.
+# shellcheck source=/dev/null
+source "$REPO_DIR/scripts/save-assistant-sessions.sh" >/dev/null 2>&1
+# The sourced production hook enables errexit. This test harness records
+# failures explicitly and must keep running to print the complete contract.
+set +e
 
 cleanup() {
 	tmux -L "$TMUX_SOCKET" kill-server 2>/dev/null
@@ -168,16 +177,11 @@ if [ -e "$lock" ]; then
 	pass "mapping is available on a blank TUI (no prompt submitted)"
 fi
 
-# --- Contract 3: guard against the mechanism we do NOT have -------------------
+# --- Contract 3: production resolver follows the real lock -------------------
 
-echo "== negative: no per-session sqlite database =="
-stray_db=$(find "$COPILOT_HOME/session-state" -name 'session.db' 2>/dev/null | head -1)
-if [ -z "$stray_db" ]; then
-	pass "no per-session session.db (shared session-store.db is not PID-specific)"
-else
-	fail "unexpected per-session database at $stray_db" \
-		"Copilot gained a per-session DB; revisit the lookup strategy"
-fi
+echo "== production resolver =="
+assert_eq "resolver maps the native PID to the live session UUID" \
+	"$session_id" "$(get_copilot_session_from_lock "$native_pid")"
 
 # --- Contract 4: the lock is released on graceful shutdown -------------------
 

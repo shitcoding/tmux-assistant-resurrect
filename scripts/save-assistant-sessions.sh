@@ -118,15 +118,16 @@ get_claude_session() {
 #
 #   $COPILOT_HOME/session-state/<uuid>/inuse.<native-pid>.lock
 #
-# That is an exact PID -> session-ID mapping resolvable with a single glob: no
-# /proc, no lsof, no platform branch, and it works on native Windows too. The
-# lock is written at TUI startup (before the first prompt) and removed on
-# graceful exit, so it also follows an in-process `/resume` — unlike the
-# launcher argv, which goes stale.
+# That is a PID -> session-ID mapping resolvable with one glob: no /proc, no
+# lsof, no platform branch, and it works on native Windows too. The lock is
+# written at TUI startup, before the first prompt. Copilot can leave the prior
+# session's lock behind after an in-process `/resume`, so when one PID has
+# multiple valid locks the newest lock is authoritative.
 #
-# There is NO per-session database: `session-store.db` lives at the root of
-# COPILOT_HOME and is shared by every session, so it cannot identify one.
-# test/copilot-contract-test.sh pins all of this against the real binary.
+# Authenticated sessions may also open a per-session `session.db`, but that is
+# not available in the pre-auth contract and mapping it to a PID needs
+# platform-specific process inspection. The lock is the portable primary
+# contract. test/copilot-contract-test.sh pins it against the real binary.
 
 # COPILOT_HOME replaces the whole ~/.copilot path (same convention as GROK_HOME).
 copilot_session_state_dir() {
@@ -149,6 +150,14 @@ _file_mtime_epoch() {
 	stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
 }
 
+# Portable high-resolution recency key: GNU stat first, then BSD stat.
+# mtime orders normal session switches; ctime breaks ties when two lock mtimes
+# land in the same second or are made equal by a filesystem/tooling quirk.
+_file_recency_key() {
+	LC_ALL=C stat -c '%y|%z' "$1" 2>/dev/null ||
+		LC_ALL=C stat -f '%Fm|%Fc' "$1" 2>/dev/null
+}
+
 # A SIGKILLed Copilot leaves its lock behind. If that PID is later recycled by a
 # new Copilot, the stale lock would map the new process onto the dead session.
 # The lock is written at session start, so one older than the process claiming
@@ -167,7 +176,8 @@ _copilot_lock_is_live() {
 
 get_copilot_session_from_lock() {
 	local child_pid="$1"
-	local state_dir lock sid recorded
+	local state_dir lock sid recorded lock_key
+	local newest_sid="" newest_key="" fallback_sid=""
 	state_dir=$(copilot_session_state_dir)
 	[ -d "$state_dir" ] || return 0
 
@@ -181,9 +191,15 @@ get_copilot_session_from_lock() {
 		IFS= read -r recorded <"$lock" 2>/dev/null || true
 		[ -z "$recorded" ] || [ "$recorded" = "$child_pid" ] || continue
 		_copilot_lock_is_live "$lock" "$child_pid" || continue
-		echo "$sid"
-		return 0
+		[ -n "$fallback_sid" ] || fallback_sid="$sid"
+		lock_key=$(_file_recency_key "$lock")
+		[ -n "$lock_key" ] || continue
+		if [ -z "$newest_key" ] || [[ "$lock_key" > "$newest_key" ]]; then
+			newest_key="$lock_key"
+			newest_sid="$sid"
+		fi
 	done
+	[ -n "$newest_sid" ] && echo "$newest_sid" || echo "$fallback_sid"
 	return 0
 }
 

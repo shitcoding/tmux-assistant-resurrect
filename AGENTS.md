@@ -88,9 +88,10 @@ process args as a reliable fallback.
   `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` (content = the same PID).
   Resolve it with a single glob — no `/proc`, no `lsof`, no platform branch, and
   it works on native Windows too. `COPILOT_HOME` replaces the whole `~/.copilot`
-  path, same convention as `GROK_HOME`. There is NO per-session database:
-  `session-store.db` sits at the root of `COPILOT_HOME` and is shared by every
-  session, so it cannot identify one.
+  path, same convention as `GROK_HOME`. An in-process `/resume` can leave more
+  than one valid lock for the same PID, so the newest valid lock is authoritative.
+  Authenticated sessions may also open a per-session `session.db`, but it is not
+  part of the pre-auth contract and requires platform-specific PID inspection.
 - Session lookup helpers may legitimately find no ID. Every `get_<tool>_session`
   command substitution in the resolver and compatibility emitter must be
   explicitly non-fatal (`|| true` inside the substitution), because a failed
