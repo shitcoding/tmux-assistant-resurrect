@@ -138,16 +138,28 @@ copilot_session_state_dir() {
 	local args="${1:-}"
 	local pid="${2:-}"
 	local root=""
+	local tail=""
 	case " $args " in
-	*" --config-dir="*)
-		root="${args##*--config-dir=}"
-		root="${root%% *}"
-		;;
-	*" --config-dir "*)
-		root="${args##*--config-dir }"
-		root="${root%% *}"
-		;;
+	*" --config-dir="*) tail="${args##*--config-dir=}" ;;
+	*" --config-dir "*) tail="${args##*--config-dir }" ;;
 	esac
+	if [ -n "$tail" ]; then
+		# `ps` has flattened the quoting, so a root containing spaces arrives as
+		# several tokens. Prefer the longest prefix that is actually a directory
+		# holding a session-state/, then fall back to the first token.
+		local candidate="$tail"
+		root="${tail%% *}"
+		while [ -n "$candidate" ]; do
+			if [ -d "$candidate/session-state" ]; then
+				root="$candidate"
+				break
+			fi
+			case "$candidate" in
+			*" "*) candidate="${candidate% *}" ;;
+			*) break ;;
+			esac
+		done
+	fi
 	# A tmux hook does not inherit the interactive shell's environment, so a
 	# COPILOT_HOME exported from a shell profile is invisible here and the
 	# session would be silently skipped. Read it from the Copilot process itself
@@ -274,10 +286,16 @@ get_copilot_session() {
 	# lock held by the native child.
 	[ "$allow_args_fallback" = "1" ] || return 0
 	local uuid='\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)'
-	local flag
+	local flag state_dir
+	state_dir=$(copilot_session_state_dir "$args" "$child_pid")
 	for flag in '--session-id' '--resume' '-r'; do
 		sid=$(echo "$args" | sed -n "s/.*$flag[= ] *$uuid.*/\1/p")
 		if [ -n "$sid" ]; then
+			# Same resumability gate as the lock path. `copilot --session-id
+			# <uuid>` on a blank TUI puts a UUID in argv long before the session
+			# can be resumed, so without this the fallback happily saves one
+			# that restore can only fail on.
+			[ -f "$state_dir/$sid/session.db" ] || continue
 			echo "$sid"
 			return 0
 		fi

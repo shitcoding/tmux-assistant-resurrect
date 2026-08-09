@@ -192,6 +192,17 @@ assert_eq "reject non-UUID resume selector" "" \
 assert_eq "deferred argv fallback can be disabled" "" \
 	"$(get_copilot_session 3001 "copilot --resume=$SID_CURRENT" 0)"
 
+# `copilot --session-id <uuid>` puts a UUID in argv at launch, long before the
+# session can be resumed. The fallback must apply the same gate as the lock path
+# or it re-introduces exactly the unresumable saves the gate exists to prevent.
+SID_ARGV_EMPTY="99999999-aaaa-4bbb-8ccc-dddddddddddd"
+mkdir -p "$COPILOT_STATE/$SID_ARGV_EMPTY"
+assert_eq "argv fallback declines a session with no session.db" "" \
+	"$(get_copilot_session 3002 "copilot --session-id=$SID_ARGV_EMPTY")"
+: >"$COPILOT_STATE/$SID_ARGV_EMPTY/session.db"
+assert_eq "argv fallback accepts it once session.db appears" "$SID_ARGV_EMPTY" \
+	"$(get_copilot_session 3002 "copilot --session-id=$SID_ARGV_EMPTY")"
+
 echo "== state root resolution =="
 # Deprecated but still honored: --config-dir moves the whole state root, and a
 # session launched with it writes nothing under ~/.copilot.
@@ -206,6 +217,18 @@ assert_eq "--config-dir <path> relocates the state root" \
 assert_eq "--config-dir=<path> relocates the state root" \
 	"$CFG_ROOT/session-state" \
 	"$(copilot_session_state_dir "copilot --config-dir=$CFG_ROOT")"
+# `ps` flattens the quoting, so a root with spaces arrives as several tokens.
+CFG_SPACED="$SANDBOX/My State Dir"
+SID_SPACED="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+mkdir -p "$CFG_SPACED/session-state/$SID_SPACED"
+printf '%s\n' 1008 >"$CFG_SPACED/session-state/$SID_SPACED/inuse.1008.lock"
+: >"$CFG_SPACED/session-state/$SID_SPACED/session.db"
+assert_eq "--config-dir with spaces is not truncated" \
+	"$CFG_SPACED/session-state" \
+	"$(copilot_session_state_dir "copilot --config-dir $CFG_SPACED --allow-all")"
+assert_eq "lock is found under a spaced --config-dir" "$SID_SPACED" \
+	"$(get_copilot_session 1008 "copilot --config-dir $CFG_SPACED" 0)"
+
 assert_eq "lock is found under --config-dir" "$SID_CFGDIR" \
 	"$(get_copilot_session 1006 "copilot --config-dir $CFG_ROOT" 0)"
 assert_eq "same PID resolves nothing without --config-dir" "" \
@@ -228,8 +251,12 @@ if [ -r "/proc/$$/environ" ]; then
 	mkdir -p "$PROC_ROOT/session-state/$SID_PROCENV"
 	# A live child that carries COPILOT_HOME in its environment, as a Copilot
 	# launched from a shell that exported it would.
-	env COPILOT_HOME="$PROC_ROOT" sleep 15 &
+	# Long-lived and explicitly killed afterwards: a short sleep made this
+	# depend on the suite reaching the assertion before it expired, which it
+	# did not under load in CI.
+	env COPILOT_HOME="$PROC_ROOT" sleep 300 &
 	ENV_PID=$!
+	disown "$ENV_PID" 2>/dev/null || true
 	printf '%s\n' "$ENV_PID" >"$PROC_ROOT/session-state/$SID_PROCENV/inuse.$ENV_PID.lock"
 	: >"$PROC_ROOT/session-state/$SID_PROCENV/session.db"
 	assert_eq "COPILOT_HOME is read from the Copilot process environment" \
@@ -237,6 +264,9 @@ if [ -r "/proc/$$/environ" ]; then
 	assert_eq "--config-dir still outranks the process environment" \
 		"$CFG_ROOT/session-state" \
 		"$(copilot_session_state_dir "copilot --config-dir $CFG_ROOT" "$ENV_PID")"
+	# kill without wait: bash re-raises the signal to itself when waiting on a
+	# job that a signal terminated.
+	kill "$ENV_PID" 2>/dev/null
 else
 	printf '  [skip] COPILOT_HOME from process env (no /proc on this platform)\n'
 fi
