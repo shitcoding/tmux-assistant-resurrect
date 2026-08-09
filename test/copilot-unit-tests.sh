@@ -362,11 +362,46 @@ assert_eq "variadic list detected from real --help spelling" \
 # `--deny-tool='shell(git push)'` reaches ps as `--deny-tool=shell(git push)`.
 # Being variadic does not make that reconstructable: the `=` already delimited
 # the value, and Copilot reads the fragment as a positional.
-assert_eq "equals-form variadic value is not exempt" "--allow-all" \
-	"$(extract_cli_args copilot "copilot --deny-tool=shell(git push) --allow-all")"
-assert_eq "space-form variadic value is still exempt" \
-	"--deny-tool shell write --allow-all" \
+echo "== permission safety =="
+# A restricting option whose value we cannot reproduce must not be guessed at:
+# `--deny-tool 'shell(git push)'` and `--deny-tool a b` are identical after ps
+# flattens them, and preserving the wrong one quietly widens what the agent may
+# do. Dropping the denial alone would do the same, so the blanket allow goes too
+# and the restored session falls back to prompting.
+assert_eq "ambiguous denial drops, taking the blanket allow with it" "" \
 	"$(extract_cli_args copilot "copilot --deny-tool shell write --allow-all")"
+assert_eq "equals-form denial likewise" "" \
+	"$(extract_cli_args copilot "copilot --deny-tool=shell(git push) --allow-all")"
+assert_eq "other blanket allows are neutralized too" "--autopilot" \
+	"$(extract_cli_args copilot "copilot --deny-tool a b --yolo --allow-all-tools --autopilot")"
+# Granting options keep the variadic exemption: mis-splitting one only ever
+# narrows access, so there is no escalation to guard against.
+assert_eq "granting variadic keeps its values and the blanket allow" \
+	"--allow-tool shell write --allow-all" \
+	"$(extract_cli_args copilot "copilot --allow-tool shell write --allow-all")"
+assert_eq "a denial we can reproduce is preserved" \
+	"--deny-tool shell --allow-all" \
+	"$(extract_cli_args copilot "copilot --deny-tool shell --allow-all")"
+
+# Linux/WSL never has to guess: /proc/<pid>/cmdline keeps argv boundaries that
+# ps destroys, so a quoted value and a genuine list are distinguishable.
+if [ -r "/proc/$$/cmdline" ]; then
+	echo "== exact argv (/proc/<pid>/cmdline) =="
+	bash -c 'sleep 30; :' copilot --deny-tool "shell(git push)" --allow-all &
+	QUOTED_PID=$!
+	bash -c 'sleep 30; :' copilot --deny-tool a b --allow-all &
+	LIST_PID=$!
+	sleep 1
+	# ps flattens both to the same thing; only cmdline can tell them apart.
+	assert_eq "quoted denial is recognised as one value and dropped" "" \
+		"$(extract_cli_args copilot "copilot --deny-tool shell(git push) --allow-all" "$QUOTED_PID")"
+	assert_eq "genuine denial list is preserved despite identical ps output" \
+		"--deny-tool a b --allow-all" \
+		"$(extract_cli_args copilot "copilot --deny-tool a b --allow-all" "$LIST_PID")"
+	kill "$QUOTED_PID" "$LIST_PID" 2>/dev/null
+else
+	printf '  [skip] exact argv from /proc (not available on this platform)\n'
+fi
 
 echo "== prompt-only options =="
 # Copilot refuses --attachment on an interactive resume, and the prompt

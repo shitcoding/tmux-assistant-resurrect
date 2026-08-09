@@ -993,6 +993,102 @@ _copilot_variadic_flags() {
 	return 0
 }
 
+# Exact argv, boundaries intact, from /proc/<pid>/cmdline (NUL-separated).
+# `ps` flattens argv and destroys the quoting, which makes a single value
+# containing spaces indistinguishable from several values -- and for Copilot's
+# variadic permission options (`--deny-tool 'shell(git push)'` vs `--deny-tool a
+# b`) guessing wrong silently changes what the agent is allowed to do. Linux and
+# WSL do not have to guess. macOS has no equivalent readable interface, so it
+# falls back to the heuristic below and errs toward dropping.
+#
+# Emits the arguments after the binary (and after a node launcher's script path),
+# one per line. Prints nothing when /proc is unavailable.
+_copilot_exact_argv() {
+	local pid="$1"
+	[ -n "$pid" ] || return 0
+	local cmdline="/proc/${pid}/cmdline"
+	[ -r "$cmdline" ] || return 0
+
+	local tok i=0
+	while IFS= read -r tok; do
+		i=$((i + 1))
+		# Skip argv[0], and a second token that is the script path of a node
+		# launcher -- mirrors the prefix stripping extract_cli_args does.
+		if [ "$i" -eq 1 ]; then continue; fi
+		if [ "$i" -eq 2 ]; then
+			case "$tok" in
+			*/copilot) continue ;;
+			esac
+		fi
+		printf '%s\n' "$tok"
+	done < <(tr '\0' '\n' <"$cmdline" 2>/dev/null)
+	return 0
+}
+
+# Options that *restrict* the agent: a denial, an exclusion, or a whitelist that
+# implies everything else is off. Losing one of these makes the restored session
+# more powerful than the user asked for, so ambiguity must not preserve a guess
+# and a blanket allow must not survive alongside it.
+#
+# Deliberately excludes the granting options (--allow-*, --add-dir): dropping a
+# grant only ever narrows what the agent can do, which is the safe direction.
+_copilot_is_restriction_flag() {
+	case "$1" in
+	--deny-* | --available-tools | --excluded-tools) return 0 ;;
+	esac
+	return 1
+}
+
+# Rebuild cli_args from exact argv, dropping any value that cannot survive the
+# whitespace-joined `cli_args` field along with the option it belongs to.
+_copilot_args_from_exact_argv() {
+	local pid="$1"
+	local -a argv=() out=()
+	local tok dropped_permission=0
+	while IFS= read -r tok; do
+		argv[${#argv[@]}]="$tok"
+	done < <(_copilot_exact_argv "$pid")
+	[ "${#argv[@]}" -gt 0 ] || return 1
+
+	local i last
+	for ((i = 0; i < ${#argv[@]}; i++)); do
+		tok="${argv[$i]}"
+		case "$tok" in
+		*[[:space:]]*)
+			# Unrepresentable once joined by spaces. Drop it and its option.
+			if [ "${#out[@]}" -gt 0 ]; then
+				last="${out[$((${#out[@]} - 1))]}"
+				case "$last" in
+				-*)
+					_copilot_is_restriction_flag "${last%%=*}" && dropped_permission=1
+					unset "out[$((${#out[@]} - 1))]"
+					out=(${out[@]+"${out[@]}"})
+					;;
+				esac
+			fi
+			;;
+		*) out[${#out[@]}]="$tok" ;;
+		esac
+	done
+	[ "${#out[@]}" -gt 0 ] && printf '%s' "${out[*]}"
+	# These helpers run inside $(), where a variable assignment would be
+	# discarded, so the permission drop is reported through the exit status.
+	[ "$dropped_permission" -eq 1 ] && return 9
+	return 0
+}
+
+# If a permission rule was lost, a blanket allow must not survive: restoring
+# `--allow-all` without the `--deny-tool` that constrained it would hand the
+# resumed agent broader powers than the user granted. Dropping both leaves the
+# session prompting for permission, which is the safe direction and visible.
+_copilot_neutralize_blanket_allow() {
+	local args="$1" flag
+	for flag in --allow-all --allow-all-tools --allow-all-paths --allow-all-urls --yolo; do
+		args=$(_strip_bool_opt "$flag" "$args")
+	done
+	printf '%s' "$args"
+}
+
 # Copilot accepts zero positional arguments, so every bare token in its argv is
 # an option value. `ps` has already lost the quoting, so a value that contained
 # spaces arrives as several bare tokens -- and `cli_args` is a whitespace-joined
@@ -1025,6 +1121,7 @@ _copilot_drop_flattened_values() {
 	local -a out=()
 	local -a run=()
 	local i=0 n=${#words[@]} last_flag="" last_had_eq=0 keep w
+	local dropped_permission=0
 
 	while [ "$i" -lt "$n" ]; do
 		case "${words[$i]}" in
@@ -1059,16 +1156,24 @@ _copilot_drop_flattened_values() {
 		# `--deny-tool=shell(git push)` and Copilot then reads the fragment as a
 		# positional ("too many arguments"). An equals sign already delimited the
 		# value, so anything bare after it is a leak either way.
+		# Without exact argv we cannot tell `--deny-tool 'shell(git push)'` from
+		# `--deny-tool a b`. For a *restricting* option, guessing wrong installs
+		# a rule the user never wrote and quietly widens what the agent may do,
+		# so ambiguity drops even though the option is variadic. Granting
+		# options keep the exemption: mis-splitting one only narrows access.
 		keep=1
 		if [ "$last_had_eq" -eq 1 ]; then
 			keep=0
 		elif [ "${#run[@]}" -gt 1 ]; then
 			keep=0
-			if [ "$last_had_eq" -eq 0 ]; then
+			if ! _copilot_is_restriction_flag "$last_flag"; then
 				case "$variadic" in
 				*" $last_flag "*) keep=1 ;;
 				esac
 			fi
+		fi
+		if [ "$keep" -eq 0 ] && _copilot_is_restriction_flag "$last_flag"; then
+			dropped_permission=1
 		fi
 
 		if [ "$keep" -eq 1 ]; then
@@ -1085,6 +1190,7 @@ _copilot_drop_flattened_values() {
 	done
 
 	[ "${#out[@]}" -gt 0 ] && echo "${out[*]}"
+	[ "$dropped_permission" -eq 1 ] && return 9
 	return 0
 }
 
@@ -1346,7 +1452,8 @@ _warm_session_discovery() {
 # matched by name pattern. This keeps stripping in sync with the installed
 # tool version without manual flag list maintenance.
 extract_cli_args() {
-	local tool="$1" raw_args="$2"
+	local tool="$1" raw_args="$2" pid="${3:-}"
+	local _COPILOT_DROPPED_PERMISSION=0
 
 	# Strip binary name/path: remove first token (which is the binary or /path/to/binary).
 	local args="${raw_args#* }"
@@ -1373,6 +1480,16 @@ extract_cli_args() {
 	# resume fail. Keep flags before the initial prompt, but drop it and
 	# everything after it.
 	if [ "$tool" = "copilot" ]; then
+		# Prefer exact argv where the kernel still has it; the heuristics below
+		# only run when boundaries are genuinely unrecoverable (macOS/BSD).
+		local exact_args="" exact_rc=0
+		exact_args=$(_copilot_args_from_exact_argv "$pid") || exact_rc=$?
+		local have_exact=0
+		if [ "$exact_rc" -ne 1 ]; then
+			have_exact=1
+			args="$exact_args"
+			[ "$exact_rc" -eq 9 ] && _COPILOT_DROPPED_PERMISSION=1
+		fi
 		args=$(echo "$args" | sed -E \
 			-e 's/(^| )--prompt([= ].*)?$//' \
 			-e 's/(^| )-p([= ].*)?$//' \
@@ -1382,7 +1499,11 @@ extract_cli_args() {
 		# option it belongs to: the strippers below consume only one token, which
 		# would leave the tail of a flattened multi-word value stranded as a
 		# positional.
-		args=$(_copilot_drop_flattened_values "$args")
+		if [ "$have_exact" -eq 0 ]; then
+			local flat_rc=0
+			args=$(_copilot_drop_flattened_values "$args") || flat_rc=$?
+			[ "$flat_rc" -eq 9 ] && _COPILOT_DROPPED_PERMISSION=1
+		fi
 		# Restore always resumes interactively, and Copilot refuses --attachment
 		# there ("only supported in non-interactive prompt mode"). The prompt
 		# truncation above misses it whenever it was written *before* the prompt,
@@ -1396,6 +1517,9 @@ extract_cli_args() {
 		args=$(_strip_long_opt '--worktree' "$args")
 		args=$(_strip_short_opt '-w' "$args")
 		args=$(_strip_bool_opt '--cloud' "$args")
+		if [ "$_COPILOT_DROPPED_PERMISSION" -eq 1 ]; then
+			args=$(_copilot_neutralize_blanket_allow "$args")
+		fi
 	fi
 
 	# Strip tool-specific session/resume flags.
@@ -1508,7 +1632,7 @@ resolve_pane_candidates() {
 
 			if [ -n "$session_id" ]; then
 				local cli_args model="" env_json="null" state_file=""
-				cli_args=$(extract_cli_args "$cand_tool" "$cand_args")
+				cli_args=$(extract_cli_args "$cand_tool" "$cand_args" "$cand_pid")
 				model="$cached_model"
 				env_json="$cached_env"
 
@@ -2007,7 +2131,7 @@ emit_session() {
 	if [ -n "$session_id" ]; then
 		# Extract CLI args (flags without binary name and session/resume args)
 		local cli_args
-		cli_args=$(extract_cli_args "$tool" "$cargs")
+		cli_args=$(extract_cli_args "$tool" "$cargs" "$cpid")
 
 		# Read enriched fields from state file (if available)
 		local state_file="" model="" env_json="null"
