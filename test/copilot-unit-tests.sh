@@ -123,6 +123,9 @@ SID_SWITCH_OLD="77777777-8888-4999-8aaa-bbbbbbbbbbbb"
 SID_SWITCH_NEW="88888888-9999-4aaa-8bbb-cccccccccccc"
 make_lock "$SID_SWITCH_OLD" 424242
 touch -t 202601010000.00 "$COPILOT_STATE/$SID_SWITCH_OLD/inuse.424242.lock"
+# Distinct ctime: the tie-break reads ctime, and a filesystem with coarse
+# timestamps can otherwise give both locks the same one under load.
+sleep 1
 make_lock "$SID_SWITCH_NEW" 424242
 # Give both locks the same whole-second mtime. Their high-resolution ctime
 # still records creation order and must break the tie.
@@ -245,31 +248,25 @@ assert_eq "missing state root resolves nothing, quietly" "" \
 # A tmux hook does not inherit the interactive shell's environment, so a
 # COPILOT_HOME exported from a profile is invisible to the save hook. On
 # Linux/WSL it is read back from the Copilot process's own environment.
-if [ -r "/proc/$$/environ" ]; then
-	PROC_ROOT="$SANDBOX/proc-home"
-	SID_PROCENV="66666666-7777-4888-8999-aaaaaaaaaaaa"
-	mkdir -p "$PROC_ROOT/session-state/$SID_PROCENV"
-	# A live child that carries COPILOT_HOME in its environment, as a Copilot
-	# launched from a shell that exported it would.
-	# Long-lived and explicitly killed afterwards: a short sleep made this
-	# depend on the suite reaching the assertion before it expired, which it
-	# did not under load in CI.
-	env COPILOT_HOME="$PROC_ROOT" sleep 300 &
-	ENV_PID=$!
-	disown "$ENV_PID" 2>/dev/null || true
-	printf '%s\n' "$ENV_PID" >"$PROC_ROOT/session-state/$SID_PROCENV/inuse.$ENV_PID.lock"
-	: >"$PROC_ROOT/session-state/$SID_PROCENV/session.db"
-	assert_eq "COPILOT_HOME is read from the Copilot process environment" \
-		"$SID_PROCENV" "$(COPILOT_HOME= get_copilot_session "$ENV_PID" "copilot" 0)"
-	assert_eq "--config-dir still outranks the process environment" \
-		"$CFG_ROOT/session-state" \
-		"$(copilot_session_state_dir "copilot --config-dir $CFG_ROOT" "$ENV_PID")"
-	# kill without wait: bash re-raises the signal to itself when waiting on a
-	# job that a signal terminated.
-	kill "$ENV_PID" 2>/dev/null
-else
-	printf '  [skip] COPILOT_HOME from process env (no /proc on this platform)\n'
-fi
+# Driven through a fake /proc so it is deterministic and platform-independent:
+# an earlier version kept a real background process alive and raced the suite.
+PROC_ROOT="$SANDBOX/proc-home"
+FAKE_PROC="$SANDBOX/fake-proc"
+SID_PROCENV="66666666-7777-4888-8999-aaaaaaaaaaaa"
+mkdir -p "$PROC_ROOT/session-state/$SID_PROCENV" "$FAKE_PROC/4242"
+printf '%s\n' 4242 >"$PROC_ROOT/session-state/$SID_PROCENV/inuse.4242.lock"
+: >"$PROC_ROOT/session-state/$SID_PROCENV/session.db"
+printf 'PATH=/usr/bin\0COPILOT_HOME=%s\0SHELL=/bin/bash\0' "$PROC_ROOT" \
+	>"$FAKE_PROC/4242/environ"
+assert_eq "COPILOT_HOME is read from the Copilot process environment" \
+	"$SID_PROCENV" \
+	"$(COPILOT_PROC_ROOT="$FAKE_PROC" COPILOT_HOME= get_copilot_session 4242 "copilot" 0)"
+assert_eq "--config-dir still outranks the process environment" \
+	"$CFG_ROOT/session-state" \
+	"$(COPILOT_PROC_ROOT="$FAKE_PROC" copilot_session_state_dir "copilot --config-dir $CFG_ROOT" 4242)"
+assert_eq "process environment without COPILOT_HOME falls through" \
+	"$HOME/.copilot/session-state" \
+	"$(COPILOT_PROC_ROOT="$SANDBOX/absent-proc" COPILOT_HOME= copilot_session_state_dir "copilot" 4242)"
 
 echo "== unresolved candidate is non-fatal under set -e =="
 UNRESOLVED_PARTS="$SANDBOX/unresolved-parts"
@@ -387,12 +384,20 @@ assert_eq "a denial we can reproduce is preserved" \
 # ps destroys, so a quoted value and a genuine list are distinguishable.
 if [ -r "/proc/$$/cmdline" ]; then
 	echo "== exact argv (/proc/<pid>/cmdline) =="
-	bash -c 'sleep 30; :' copilot --deny-tool "shell(git push)" --allow-all &
+	# Mirror the real launcher shape: argv[0] is the interpreter and argv[1] is
+	# a script path ending in /copilot, exactly as the npm loader appears.
+	mkdir -p "$SANDBOX/launcher"
+	printf '#!/usr/bin/env bash\nsleep 30\n' >"$SANDBOX/launcher/copilot"
+	chmod +x "$SANDBOX/launcher/copilot"
+	# stdout is redirected: the harness captures this suite in a command
+	# substitution, which would otherwise wait on a background job holding the
+	# pipe open.
+	bash "$SANDBOX/launcher/copilot" --deny-tool "shell(git push)" --allow-all >/dev/null 2>&1 &
 	QUOTED_PID=$!
-	bash -c 'sleep 30; :' copilot --deny-tool a b --allow-all &
+	bash "$SANDBOX/launcher/copilot" --deny-tool a b --allow-all >/dev/null 2>&1 &
 	LIST_PID=$!
 	sleep 1
-	# ps flattens both to the same thing; only cmdline can tell them apart.
+	# ps flattens both to the same string; only cmdline tells them apart.
 	assert_eq "quoted denial is recognised as one value and dropped" "" \
 		"$(extract_cli_args copilot "copilot --deny-tool shell(git push) --allow-all" "$QUOTED_PID")"
 	assert_eq "genuine denial list is preserved despite identical ps output" \

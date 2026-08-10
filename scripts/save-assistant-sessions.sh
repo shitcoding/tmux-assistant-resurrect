@@ -174,7 +174,9 @@ copilot_session_state_dir() {
 
 _copilot_home_from_process() {
 	local pid="$1"
-	local environ_file="/proc/${pid}/environ"
+	# COPILOT_PROC_ROOT is a test seam so the hermetic suite can exercise this
+	# without a live process; production always reads the real /proc.
+	local environ_file="${COPILOT_PROC_ROOT:-/proc}/${pid}/environ"
 	# Open first: the process may exit between detection and inspection.
 	{ exec 3<"$environ_file"; } 2>/dev/null || return 0
 	local entry
