@@ -111,6 +111,202 @@ get_claude_session() {
 	fi
 }
 
+# --- GitHub Copilot CLI ---
+#
+# A live Copilot session marks its own state directory with an
+# `inuse.<pid>.lock` file (whose content is the same PID):
+#
+#   $COPILOT_HOME/session-state/<uuid>/inuse.<native-pid>.lock
+#
+# That is a PID -> session-ID mapping resolvable with one glob: no /proc, no
+# lsof, no platform branch, and it works on native Windows too. The lock is
+# written at TUI startup, before the first prompt. Copilot can leave the prior
+# session's lock behind after an in-process `/resume`, so when one PID has
+# multiple valid locks the newest lock is authoritative.
+#
+# Authenticated sessions may also open a per-session `session.db`, but that is
+# not available in the pre-auth contract and mapping it to a PID needs
+# platform-specific process inspection. The lock is the portable primary
+# contract. test/copilot-contract-test.sh pins it against the real binary.
+
+# COPILOT_HOME replaces the whole ~/.copilot path (same convention as GROK_HOME).
+# The deprecated `--config-dir <path>` does the same thing per process and is
+# still honored by 1.0.78 -- a session launched with it writes its lock there and
+# nothing at all under ~/.copilot -- so it wins when present in the candidate's
+# argv. Callers that have no argv handy may omit it.
+copilot_session_state_dir() {
+	local args="${1:-}"
+	local pid="${2:-}"
+	local root=""
+	local tail=""
+	case " $args " in
+	*" --config-dir="*) tail="${args##*--config-dir=}" ;;
+	*" --config-dir "*) tail="${args##*--config-dir }" ;;
+	esac
+	if [ -n "$tail" ]; then
+		# `ps` has flattened the quoting, so a root containing spaces arrives as
+		# several tokens. Prefer the longest prefix that is actually a directory
+		# holding a session-state/, then fall back to the first token.
+		local candidate="$tail"
+		root="${tail%% *}"
+		while [ -n "$candidate" ]; do
+			if [ -d "$candidate/session-state" ]; then
+				root="$candidate"
+				break
+			fi
+			case "$candidate" in
+			*" "*) candidate="${candidate% *}" ;;
+			*) break ;;
+			esac
+		done
+	fi
+	# A tmux hook does not inherit the interactive shell's environment, so a
+	# COPILOT_HOME exported from a shell profile is invisible here and the
+	# session would be silently skipped. Read it from the Copilot process itself
+	# where the kernel allows it (Linux/WSL). macOS cannot read another
+	# process's environment unprivileged -- documented, same as capture-env.
+	if [ -z "$root" ] && [ -n "$pid" ]; then
+		root=$(_copilot_home_from_process "$pid")
+	fi
+	[ -n "$root" ] || root="${COPILOT_HOME:-$HOME/.copilot}"
+	echo "$root/session-state"
+}
+
+_copilot_home_from_process() {
+	local pid="$1"
+	# COPILOT_PROC_ROOT is a test seam so the hermetic suite can exercise this
+	# without a live process; production always reads the real /proc.
+	local environ_file="${COPILOT_PROC_ROOT:-/proc}/${pid}/environ"
+	# Open first: the process may exit between detection and inspection.
+	{ exec 3<"$environ_file"; } 2>/dev/null || return 0
+	local entry
+	while IFS= read -r -d '' entry; do
+		case "$entry" in
+		COPILOT_HOME=?*)
+			printf '%s' "${entry#COPILOT_HOME=}"
+			break
+			;;
+		esac
+	done <&3
+	exec 3<&-
+	return 0
+}
+
+# 8-4-4-4-12 hex. Glob-only so it costs no fork: the character class rejects
+# anything but hex digits and dashes, and the `?` runs pin the dash positions.
+_copilot_is_uuid() {
+	[ "${#1}" -eq 36 ] || return 1
+	case "$1" in
+	*[!0-9a-fA-F-]*) return 1 ;;
+	????????-????-????-????-????????????) return 0 ;;
+	esac
+	return 1
+}
+
+# Portable file mtime in epoch seconds: GNU stat, then BSD stat.
+_file_mtime_epoch() {
+	stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# Portable high-resolution recency key: GNU stat first, then BSD stat.
+# mtime orders normal session switches; ctime breaks ties when two lock mtimes
+# land in the same second or are made equal by a filesystem/tooling quirk.
+_file_recency_key() {
+	LC_ALL=C stat -c '%y|%z' "$1" 2>/dev/null ||
+		LC_ALL=C stat -f '%Fm|%Fc' "$1" 2>/dev/null
+}
+
+# A SIGKILLed Copilot leaves its lock behind. If that PID is later recycled by a
+# new Copilot, the stale lock would map the new process onto the dead session.
+# The lock is written at session start, so one older than the process claiming
+# it is stale. Advisory: when either timestamp is unavailable, accept the lock
+# rather than lose a real session.
+_copilot_lock_is_live() {
+	local lock="$1" pid="$2"
+	local lock_mtime proc_start
+	lock_mtime=$(_file_mtime_epoch "$lock")
+	[ -n "$lock_mtime" ] || return 0
+	proc_start=$(get_process_start_epoch "$pid")
+	[ -n "$proc_start" ] || return 0
+	# Slack: the macOS start time is derived from second-granular elapsed time.
+	[ "$lock_mtime" -ge "$((proc_start - 5))" ]
+}
+
+get_copilot_session_from_lock() {
+	local child_pid="$1"
+	local args="${2:-}"
+	local state_dir="${3:-}"
+	local lock sid recorded lock_key
+	local newest_sid="" newest_key="" fallback_sid=""
+	[ -n "$state_dir" ] || state_dir=$(copilot_session_state_dir "$args" "$child_pid")
+	[ -d "$state_dir" ] || return 0
+
+	for lock in "$state_dir"/*/"inuse.${child_pid}.lock"; do
+		[ -f "$lock" ] || continue
+		sid="${lock%/*}"
+		sid="${sid##*/}"
+		_copilot_is_uuid "$sid" || continue
+		# Resumability gate. The lock appears at TUI startup, but Copilot only
+		# writes session.db (and events.jsonl) once the session has real
+		# content, and only such a session can be resumed -- `--resume=<uuid>`
+		# on a still-empty one exits with "No session, task, or name matched".
+		# Saving it would replay a command that errors in the user's pane, so
+		# treat "no session.db yet" as "nothing to save yet".
+		[ -f "${lock%/*}/session.db" ] || continue
+		# The lock records its owner; a mismatch means we misread the layout.
+		recorded=""
+		IFS= read -r recorded <"$lock" 2>/dev/null || true
+		[ -z "$recorded" ] || [ "$recorded" = "$child_pid" ] || continue
+		_copilot_lock_is_live "$lock" "$child_pid" || continue
+		[ -n "$fallback_sid" ] || fallback_sid="$sid"
+		lock_key=$(_file_recency_key "$lock")
+		[ -n "$lock_key" ] || continue
+		if [ -z "$newest_key" ] || [[ "$lock_key" > "$newest_key" ]]; then
+			newest_key="$lock_key"
+			newest_sid="$sid"
+		fi
+	done
+	[ -n "$newest_sid" ] && echo "$newest_sid" || echo "$fallback_sid"
+	return 0
+}
+
+get_copilot_session() {
+	local child_pid="$1"
+	local args="$2"
+	local allow_args_fallback="${3:-1}"
+	local state_dir="${4:-}"
+	local sid=""
+	[ -n "$state_dir" ] || state_dir=$(copilot_session_state_dir "$args" "$child_pid")
+
+	# Primary: PID-specific, platform-independent, and current after /resume.
+	sid=$(get_copilot_session_from_lock "$child_pid" "$args" "$state_dir")
+	if [ -n "$sid" ]; then
+		echo "$sid"
+		return 0
+	fi
+
+	# Fallback: explicit session selector in argv. Covers the startup window
+	# before the lock exists and setups where the state root is unreadable.
+	# Deferred to resolver pass 2 so a stale npm-loader argv cannot beat a live
+	# lock held by the native child.
+	[ "$allow_args_fallback" = "1" ] || return 0
+	local uuid='\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)'
+	local flag
+	for flag in '--session-id' '--resume' '-r'; do
+		sid=$(echo "$args" | sed -n "s/.*$flag[= ] *$uuid.*/\1/p")
+		if [ -n "$sid" ]; then
+			# Same resumability gate as the lock path. `copilot --session-id
+			# <uuid>` on a blank TUI puts a UUID in argv long before the session
+			# can be resumed, so without this the fallback happily saves one
+			# that restore can only fail on.
+			[ -f "$state_dir/$sid/session.db" ] || continue
+			echo "$sid"
+			return 0
+		fi
+	done
+	return 0
+}
+
 get_opencode_session() {
 	local child_pid="$1"
 	local args="$2"
@@ -774,6 +970,231 @@ merge_process_env() {
 
 # --- CLI args extraction helpers ---
 
+# Copilot's variadic options -- the ones whose --help spelling ends in `...`,
+# e.g. `--allow-tool[=tools...]`. They legitimately occupy several argv tokens.
+SESSION_EXTRA_WARM_copilot=_copilot_variadic_flags
+SESSION_VARIADIC_FALLBACK_copilot="--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars"
+
+_copilot_variadic_flags() {
+	local cached="${_COPILOT_VARIADIC_FLAGS:-}"
+	if [ -n "$cached" ]; then
+		[ "$cached" = "-" ] || echo "$cached"
+		return 0
+	fi
+
+	local help_out result=""
+	help_out=$(_tool_help copilot)
+	if [ -n "$help_out" ]; then
+		result=$(echo "$help_out" |
+			grep -E '^[[:space:]]+(-[a-zA-Z],[[:space:]]+)?--[a-z][-a-z]*\[=[^]]*\.\.\.\]' |
+			grep -oE -- '--[a-z][-a-z]*' | sort -u | tr '\n' ' ')
+		result="${result% }"
+	fi
+	[ -n "$result" ] || result="$SESSION_VARIADIC_FALLBACK_copilot"
+
+	printf -v _COPILOT_VARIADIC_FLAGS '%s' "${result:--}"
+	[ -n "$result" ] && echo "$result"
+	return 0
+}
+
+# Exact argv, boundaries intact, from /proc/<pid>/cmdline (NUL-separated).
+# `ps` flattens argv and destroys the quoting, which makes a single value
+# containing spaces indistinguishable from several values -- and for Copilot's
+# variadic permission options (`--deny-tool 'shell(git push)'` vs `--deny-tool a
+# b`) guessing wrong silently changes what the agent is allowed to do. Linux and
+# WSL do not have to guess. macOS has no equivalent readable interface, so it
+# falls back to the heuristic below and errs toward dropping.
+#
+# Emits the arguments after the binary (and after a node launcher's script path),
+# one per line. Prints nothing when /proc is unavailable.
+_copilot_exact_argv() {
+	local pid="$1"
+	[ -n "$pid" ] || return 0
+	local cmdline="/proc/${pid}/cmdline"
+	[ -r "$cmdline" ] || return 0
+
+	local tok i=0
+	while IFS= read -r tok; do
+		i=$((i + 1))
+		# Skip argv[0], and a second token that is the script path of a node
+		# launcher -- mirrors the prefix stripping extract_cli_args does.
+		if [ "$i" -eq 1 ]; then continue; fi
+		if [ "$i" -eq 2 ]; then
+			case "$tok" in
+			*/copilot) continue ;;
+			esac
+		fi
+		printf '%s\n' "$tok"
+	done < <(tr '\0' '\n' <"$cmdline" 2>/dev/null)
+	return 0
+}
+
+# Options that *restrict* the agent: a denial, an exclusion, or a whitelist that
+# implies everything else is off. Losing one of these makes the restored session
+# more powerful than the user asked for, so ambiguity must not preserve a guess
+# and no other replay flag can safely survive alongside it.
+#
+# Deliberately excludes the granting options (--allow-*, --add-dir): dropping a
+# grant only ever narrows what the agent can do, which is the safe direction.
+_copilot_is_restriction_flag() {
+	case "$1" in
+	--deny-* | --available-tools | --excluded-tools) return 0 ;;
+	esac
+	return 1
+}
+
+# Rebuild cli_args from exact argv, dropping any value that cannot survive the
+# whitespace-joined `cli_args` field along with the option it belongs to.
+_copilot_args_from_exact_argv() {
+	local pid="$1"
+	local -a argv=() out=()
+	local tok dropped_permission=0
+	while IFS= read -r tok; do
+		argv[${#argv[@]}]="$tok"
+	done < <(_copilot_exact_argv "$pid")
+	[ "${#argv[@]}" -gt 0 ] || return 1
+
+	local i last
+	for ((i = 0; i < ${#argv[@]}; i++)); do
+		tok="${argv[$i]}"
+		case "$tok" in
+		*[[:space:]]*)
+			# Unrepresentable once joined by spaces. An equals-form option is
+			# self-contained, so drop that token itself; a separate value drops
+			# the preceding option. In both forms, report a lost restriction.
+			case "$tok" in
+			-*=*)
+				_copilot_is_restriction_flag "${tok%%=*}" && dropped_permission=1
+				;;
+			*)
+				if [ "${#out[@]}" -gt 0 ]; then
+					last="${out[$((${#out[@]} - 1))]}"
+					case "$last" in
+					-*)
+						_copilot_is_restriction_flag "${last%%=*}" && dropped_permission=1
+						unset "out[$((${#out[@]} - 1))]"
+						out=(${out[@]+"${out[@]}"})
+						;;
+					esac
+				fi
+				;;
+			esac
+			;;
+		*) out[${#out[@]}]="$tok" ;;
+		esac
+	done
+	[ "${#out[@]}" -gt 0 ] && printf '%s' "${out[*]}"
+	# These helpers run inside $(), where a variable assignment would be
+	# discarded, so the permission drop is reported through the exit status.
+	[ "$dropped_permission" -eq 1 ] && return 9
+	return 0
+}
+
+# Copilot accepts zero positional arguments, so every bare token in its argv is
+# an option value. `ps` has already lost the quoting, so a value that contained
+# spaces arrives as several bare tokens -- and `cli_args` is a whitespace-joined
+# string that cannot express it again. Restore would replay the extra words as
+# positionals and Copilot exits with "too many arguments" before it can resume.
+#
+# Drop those options instead: a session that resumes with one flag missing beats
+# a command line Copilot rejects outright. Variadic options are exempt because
+# their several tokens round-trip correctly. Discovering the *variadic* set
+# (rather than the single-valued one) is the fail-safe direction: if --help is
+# unavailable we drop slightly too much rather than emit something invalid.
+_copilot_drop_flattened_values() {
+	local args="$1"
+	local variadic
+	variadic=" $(_copilot_variadic_flags) "
+
+	# Word-split with pathname expansion off: argv is data, and a legitimate
+	# quoted value such as `--allow-tool '*'` must not be expanded against the
+	# save hook's working directory and persisted as a list of filenames.
+	local reglob=""
+	case "$-" in
+	*f*) ;;
+	*) reglob=1 ;;
+	esac
+	set -f
+	# shellcheck disable=SC2206  # deliberate word-split of a flattened argv
+	local -a words=($args)
+	[ -n "$reglob" ] && set +f
+
+	local -a out=()
+	local -a run=()
+	local i=0 n=${#words[@]} last_flag="" last_had_eq=0 keep w
+	local dropped_permission=0
+
+	while [ "$i" -lt "$n" ]; do
+		case "${words[$i]}" in
+		-*)
+			out[${#out[@]}]="${words[$i]}"
+			last_flag="${words[$i]%%=*}"
+			# `--flag=value` carries its own boundary, so anything bare that
+			# follows can only be the rest of a value whose quoting was lost.
+			last_had_eq=0
+			case "${words[$i]}" in
+			*=*) last_had_eq=1 ;;
+			esac
+			i=$((i + 1))
+			continue
+			;;
+		esac
+
+		# Collect the whole run of consecutive bare tokens.
+		run=()
+		while [ "$i" -lt "$n" ]; do
+			case "${words[$i]}" in
+			-*) break ;;
+			esac
+			run[${#run[@]}]="${words[$i]}"
+			i=$((i + 1))
+		done
+
+		# One bare token after a space-form option is its value, and unambiguous.
+		#
+		# The variadic exemption applies only to the space form: `--deny-tool a b`
+		# really is two values, but `--deny-tool='shell(git push)'` reaches ps as
+		# `--deny-tool=shell(git push)` and Copilot then reads the fragment as a
+		# positional ("too many arguments"). An equals sign already delimited the
+		# value, so anything bare after it is a leak either way.
+		# Without exact argv we cannot tell `--deny-tool 'shell(git push)'` from
+		# `--deny-tool a b`. For a *restricting* option, guessing wrong installs
+		# a rule the user never wrote and quietly widens what the agent may do,
+		# so ambiguity drops even though the option is variadic. Granting
+		# options keep the exemption: mis-splitting one only narrows access.
+		keep=1
+		if [ "$last_had_eq" -eq 1 ]; then
+			keep=0
+		elif [ "${#run[@]}" -gt 1 ]; then
+			keep=0
+			if ! _copilot_is_restriction_flag "$last_flag"; then
+				case "$variadic" in
+				*" $last_flag "*) keep=1 ;;
+				esac
+			fi
+		fi
+		if [ "$keep" -eq 0 ] && _copilot_is_restriction_flag "$last_flag"; then
+			dropped_permission=1
+		fi
+
+		if [ "$keep" -eq 1 ]; then
+			for w in "${run[@]}"; do
+				out[${#out[@]}]="$w"
+			done
+		elif [ -n "$last_flag" ] && [ "${#out[@]}" -gt 0 ]; then
+			# Drop the option the unreconstructable value belonged to.
+			unset "out[$((${#out[@]} - 1))]"
+			out=(${out[@]+"${out[@]}"})
+		fi
+		last_had_eq=0
+		last_flag=""
+	done
+
+	[ "${#out[@]}" -gt 0 ] && echo "${out[*]}"
+	[ "$dropped_permission" -eq 1 ] && return 9
+	return 0
+}
+
 # Strip a long option: --flag, --flag=val, or --flag val.
 # Value (if space-separated) must not start with "-" to avoid consuming next flag.
 _strip_long_opt() {
@@ -830,6 +1251,38 @@ _strip_subcmds() {
 	return 0
 }
 
+# Run `<tool> --help`, neutralizing any side effects the tool performs on
+# startup. The save hook fires every few minutes, so a probe that phones home is
+# not acceptable: Copilot's native binary runs its auto-updater unless told not
+# to. Per-tool overrides live in HELP_PROBE_ENV_<tool> (word-split on purpose).
+HELP_PROBE_ENV_copilot="COPILOT_AUTO_UPDATE=false"
+
+# Cached per tool in _TOOL_HELP_<tool>: several discovery passes read the same
+# help text, and the callers run in a $() subshell per pane.
+_tool_help() {
+	local tool="$1"
+	local cache_var="_TOOL_HELP_${tool}"
+	local cached="${!cache_var:-}"
+	if [ -n "$cached" ]; then
+		[ "$cached" = "-" ] || printf '%s\n' "$cached"
+		return 0
+	fi
+
+	local probe_env_var="HELP_PROBE_ENV_${tool}"
+	local probe_env="${!probe_env_var:-}"
+	local out=""
+	if [ -n "$probe_env" ]; then
+		# shellcheck disable=SC2086  # deliberate split into env KEY=VAL args
+		out=$(env $probe_env "$tool" --help 2>/dev/null) || out=""
+	else
+		out=$("$tool" --help 2>/dev/null) || out=""
+	fi
+
+	printf -v "$cache_var" '%s' "${out:--}"
+	[ -n "$out" ] && printf '%s\n' "$out"
+	return 0
+}
+
 # Discover session-identity flags from a tool's --help output.
 # Matches long option names against a keyword pattern and emits lines of
 # "long [short]" pairs (e.g. "--resume -r" or "--fork-session").
@@ -846,7 +1299,7 @@ _discover_session_flags() {
 	local help_out result=""
 	local fallback_var="SESSION_FLAGS_FALLBACK_${tool}"
 	local fallback="${!fallback_var:-}"
-	help_out=$("$tool" --help 2>/dev/null) || true
+	help_out=$(_tool_help "$tool") || true
 	if [ -n "$help_out" ]; then
 		local line long short
 		while IFS= read -r line; do
@@ -888,7 +1341,7 @@ _discover_session_subcmds() {
 	# cannot resolve the binary), assume every candidate is supported so known
 	# session subcommands are still stripped — matches prior behavior.
 	local help_out subcmd result=""
-	help_out=$("$tool" --help 2>/dev/null) || true
+	help_out=$(_tool_help "$tool") || true
 	for subcmd in $(echo "$subcmd_pattern" | tr '|' ' '); do
 		if [ -z "$help_out" ] || echo "$help_out" | grep -qw "$subcmd"; then
 			result="${result}${subcmd}
@@ -906,6 +1359,7 @@ _discover_session_subcmds() {
 # (--resume always means resume), so new flags like --resume-from are
 # auto-discovered without script changes.
 SESSION_FLAG_PATTERN_claude='^--(resume|continue|session-id|fork-session|from-pr)$'
+SESSION_FLAG_PATTERN_copilot='^--(connect|continue|interactive|name|prompt|resume|session-id)$'
 SESSION_FLAG_PATTERN_opencode='^--session$'
 SESSION_FLAG_PATTERN_pi='^--(session|resume|continue|fork)$'
 SESSION_FLAG_PATTERN_omp='^--(session|resume|continue|fork)$'
@@ -921,6 +1375,16 @@ SESSION_SUBCMD_FLAGS_codex='--last --all --include-non-interactive'
 SESSION_FLAGS_FALLBACK_claude="--continue -c
 --fork-session
 --from-pr
+--resume -r
+--session-id"
+# --name is included deliberately: `copilot --name x --resume=<id>` is rejected
+# outright ("cannot be used with"), so a named session must lose its name to be
+# resumable at all.
+SESSION_FLAGS_FALLBACK_copilot="--connect
+--continue
+--interactive -i
+--name -n
+--prompt -p
 --resume -r
 --session-id"
 SESSION_FLAGS_FALLBACK_opencode="--session -s"
@@ -948,13 +1412,18 @@ SESSION_FLAGS_FALLBACK_grok="--continue -c
 _warm_session_discovery() {
 	local matches="$1"
 	[ -n "$matches" ] || return 0
-	local tool flag_pat sub_pat
+	local tool flag_pat sub_pat extra_warm
 	while IFS= read -r tool; do
 		# Skip blanks and names that are not valid shell identifier suffixes:
 		# the indirect expansions below would otherwise abort under set -e.
 		case "$tool" in
 		'' | *[!A-Za-z0-9_]*) continue ;;
 		esac
+		# Populate the help cache in *this* shell. The discovery helpers below
+		# read it through $(), where their own cache write would be discarded --
+		# so without this direct call `<tool> --help` re-execs for every pane.
+		_tool_help "$tool" >/dev/null
+
 		flag_pat="SESSION_FLAG_PATTERN_${tool}"
 		sub_pat="SESSION_SUBCMD_PATTERN_${tool}"
 		if [ -n "${!flag_pat:-}" ]; then
@@ -962,6 +1431,11 @@ _warm_session_discovery() {
 		fi
 		if [ -n "${!sub_pat:-}" ]; then
 			_discover_session_subcmds "$tool" "${!sub_pat}" >/dev/null
+		fi
+		# Per-tool extras that also parse --help and cache into a shell var.
+		extra_warm="SESSION_EXTRA_WARM_${tool}"
+		if [ -n "${!extra_warm:-}" ]; then
+			"${!extra_warm}" >/dev/null
 		fi
 	done < <(printf '%s\n' "$matches" | cut -f2 | sort -u)
 	return 0
@@ -979,7 +1453,8 @@ _warm_session_discovery() {
 # matched by name pattern. This keeps stripping in sync with the installed
 # tool version without manual flag list maintenance.
 extract_cli_args() {
-	local tool="$1" raw_args="$2"
+	local tool="$1" raw_args="$2" pid="${3:-}"
+	local _COPILOT_DROPPED_PERMISSION=0
 
 	# Strip binary name/path: remove first token (which is the binary or /path/to/binary).
 	local args="${raw_args#* }"
@@ -999,6 +1474,58 @@ extract_cli_args() {
 		args="${args# }"
 		;;
 	esac
+
+	# `ps` flattens argv and loses the quoting boundary around a multi-word
+	# Copilot --prompt/-p and --interactive/-i values. Token-wise stripping
+	# could therefore replay trailing prompt words as positional args and make
+	# resume fail. Keep flags before the initial prompt, but drop it and
+	# everything after it.
+	if [ "$tool" = "copilot" ]; then
+		# Prefer exact argv where the kernel still has it; the heuristics below
+		# only run when boundaries are genuinely unrecoverable (macOS/BSD).
+		local exact_args="" exact_rc=0
+		exact_args=$(_copilot_args_from_exact_argv "$pid") || exact_rc=$?
+		local have_exact=0
+		if [ "$exact_rc" -ne 1 ]; then
+			have_exact=1
+			args="$exact_args"
+			[ "$exact_rc" -eq 9 ] && _COPILOT_DROPPED_PERMISSION=1
+		fi
+		args=$(echo "$args" | sed -E \
+			-e 's/(^| )--prompt([= ].*)?$//' \
+			-e 's/(^| )-p([= ].*)?$//' \
+			-e 's/(^| )--interactive([= ].*)?$//' \
+			-e 's/(^| )-i([= ].*)?$//')
+		# Before the session-flag pass, while each value is still adjacent to the
+		# option it belongs to: the strippers below consume only one token, which
+		# would leave the tail of a flattened multi-word value stranded as a
+		# positional.
+		if [ "$have_exact" -eq 0 ]; then
+			local flat_rc=0
+			args=$(_copilot_drop_flattened_values "$args") || flat_rc=$?
+			[ "$flat_rc" -eq 9 ] && _COPILOT_DROPPED_PERMISSION=1
+		fi
+		# Restore always resumes interactively, and Copilot refuses --attachment
+		# there ("only supported in non-interactive prompt mode"). The prompt
+		# truncation above misses it whenever it was written *before* the prompt,
+		# so drop it explicitly wherever it sat. Verified against 1.0.78; the
+		# other non-interactive-flavored flags (--silent, --share, --share-gist,
+		# --enable-memory) resume without complaint and are left alone.
+		args=$(_strip_long_opt '--attachment' "$args")
+		# Copilot hides --worktree/-w and --cloud from --help, so the discovery
+		# pattern can never learn them, yet both are refused alongside --resume
+		# ("cannot be used with"). Strip them explicitly. Verified on 1.0.78.
+		args=$(_strip_long_opt '--worktree' "$args")
+		args=$(_strip_short_opt '-w' "$args")
+		args=$(_strip_bool_opt '--cloud' "$args")
+		if [ "$_COPILOT_DROPPED_PERMISSION" -eq 1 ]; then
+			# Once a restriction is lost, no remaining flag set is provably
+			# equivalent: granular grants, MCP enablement, path allowances, and
+			# future permission flags can all interact with it. Replay no flags
+			# and let bare resume return to Copilot's prompting defaults.
+			args=""
+		fi
+	fi
 
 	# Strip tool-specific session/resume flags.
 	local pattern_var="SESSION_FLAG_PATTERN_${tool}"
@@ -1045,9 +1572,9 @@ extract_cli_args() {
 # Resolve all detected assistant candidates for one pane and emit at most one
 # session entry (first resolvable candidate in BFS order).
 #
-# Preserves legacy OpenCode behavior:
-#   pass 1: PID-specific only (no DB fallback)
-#   pass 2: OpenCode-only with DB fallback enabled
+# Defers ambiguous or potentially stale fallbacks:
+#   pass 1: PID-specific native state only
+#   pass 2: OpenCode DB fallback and Copilot launcher-argv fallback
 resolve_pane_candidates() {
 	local pane_target="$1"
 	local pane_cwd="$2"
@@ -1061,15 +1588,19 @@ resolve_pane_candidates() {
 	local resolved=0 first_tool="" first_pid=""
 	for pass in 1 2; do
 		[ "$resolved" -eq 1 ] && break
-		local allow_opencode_db=0
-		[ "$pass" -eq 2 ] && allow_opencode_db=1
+		local allow_deferred_fallback=0
+		[ "$pass" -eq 2 ] && allow_deferred_fallback=1
 		while IFS="$us" read -r cand_tool cand_pid cand_args; do
 			[ -z "$cand_tool" ] && continue
 			[ -z "$first_tool" ] && first_tool="$cand_tool" && first_pid="$cand_pid"
 
-			# Pass 2 is only for OpenCode DB fallback.
-			if [ "$pass" -eq 2 ] && [ "$cand_tool" != "opencode" ]; then
-				continue
+			# Pass 2 is only for fallbacks that can misidentify a live session:
+			# OpenCode's cwd-scoped DB and Copilot's possibly stale loader argv.
+			if [ "$pass" -eq 2 ]; then
+				case "$cand_tool" in
+				opencode | copilot) ;;
+				*) continue ;;
+				esac
 			fi
 
 			local cached="" cached_sid="" cached_model="" cached_env="null"
@@ -1086,28 +1617,35 @@ resolve_pane_candidates() {
 				[ -z "$cached_env" ] && cached_env="null"
 			fi
 
-			local session_id=""
+			local session_id="" copilot_state_dir=""
+			if [ "$cand_tool" = "copilot" ]; then
+				copilot_state_dir=$(copilot_session_state_dir "$cand_args" "$cand_pid")
+			fi
 			case "$cand_tool" in
 			claude)
 				session_id="$cached_sid"
 				# Keep legacy fallback behavior when cache misses (state file + --resume).
-				[ -z "$session_id" ] && session_id=$(get_claude_session "$cand_pid" "$cand_args")
+				[ -z "$session_id" ] && session_id=$(get_claude_session "$cand_pid" "$cand_args" || true)
 				;;
+			copilot) session_id=$(get_copilot_session "$cand_pid" "$cand_args" "$allow_deferred_fallback" "$copilot_state_dir" || true) ;;
 			opencode)
 				session_id="$cached_sid"
-				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_opencode_db")
+				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_deferred_fallback" || true)
 				;;
-			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
-			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
-			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty") ;;
-			grok) session_id=$(get_grok_session "$cand_pid" "$cand_args") ;;
+			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd" || true) ;;
+			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd" || true) ;;
+			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty" || true) ;;
+			grok) session_id=$(get_grok_session "$cand_pid" "$cand_args" || true) ;;
 			esac
 
 			if [ -n "$session_id" ]; then
-				local cli_args model="" env_json="null" state_file=""
-				cli_args=$(extract_cli_args "$cand_tool" "$cand_args")
+				local cli_args model="" env_json="null" state_file="" copilot_home=""
+				cli_args=$(extract_cli_args "$cand_tool" "$cand_args" "$cand_pid")
 				model="$cached_model"
 				env_json="$cached_env"
+				if [ "$cand_tool" = "copilot" ]; then
+					copilot_home="${copilot_state_dir%/session-state}"
+				fi
 
 				# If cache wasn't available, fall back to direct state-file enrichment.
 				case "$cand_tool" in
@@ -1130,8 +1668,8 @@ resolve_pane_candidates() {
 				fi
 
 				# Write TSV for batch JSON conversion (replaces per-entry jq -n).
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" >>"$parts_file"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" >>"$parts_file"
 
 				case "$cand_tool" in
 				codex) register_codex_session_id "$session_id" ;;
@@ -1361,6 +1899,7 @@ main() {
 			# - opencode excludes "opencode run " subprocesses
 			# - omp excludes hidden "__omp_worker_" subprocesses
 			if      (line ~ /(^claude( |$)|\/claude( |$))/)                                      proc_tool[pid] = "claude"
+			else if (line ~ /(^copilot( |$)|\/copilot( |$))/)                                    proc_tool[pid] = "copilot"
 			else if (line ~ /(^opencode( |$)|\/opencode( |$))/ && line !~ /opencode run /)       proc_tool[pid] = "opencode"
 			else if (line ~ /(^codex( |$)|\/codex( |$))/)                                        proc_tool[pid] = "codex"
 			else if (line ~ /(^pi( |$)|\/pi( |$))/)                                              proc_tool[pid] = "pi"
@@ -1498,7 +2037,7 @@ main() {
 		if jq -Rs --arg ts "$SAVE_TS" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
-			 env:(.[7] // "null" | try fromjson catch null)})
+			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // "")})
 			| {timestamp: $ts, sessions: .}
 		' "$PARTS_FILE" >"$OUTPUT_TMP"; then
 			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
@@ -1589,20 +2128,27 @@ emit_session() {
 	local target="$1" tool="$2" cpid="$3" cargs="$4" cwd="$5"
 	local allow_opencode_db="${6:-1}"
 	local log_missing="${7:-1}"
-	local session_id=""
+	local session_id="" copilot_state_dir=""
 	case "$tool" in
-	claude) session_id=$(get_claude_session "$cpid" "$cargs") ;;
-	opencode) session_id=$(get_opencode_session "$cpid" "$cargs" "$cwd" "$allow_opencode_db") ;;
-	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd") ;;
-	pi) session_id=$(get_pi_session "$cpid" "$cargs" "$cwd") ;;
-	omp) session_id=$(get_omp_session "$cpid" "$cargs" "$cwd" "") ;;
-	grok) session_id=$(get_grok_session "$cpid" "$cargs") ;;
+	claude) session_id=$(get_claude_session "$cpid" "$cargs" || true) ;;
+	copilot)
+		copilot_state_dir=$(copilot_session_state_dir "$cargs" "$cpid")
+		session_id=$(get_copilot_session "$cpid" "$cargs" 1 "$copilot_state_dir" || true)
+		;;
+	opencode) session_id=$(get_opencode_session "$cpid" "$cargs" "$cwd" "$allow_opencode_db" || true) ;;
+	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd" || true) ;;
+	pi) session_id=$(get_pi_session "$cpid" "$cargs" "$cwd" || true) ;;
+	omp) session_id=$(get_omp_session "$cpid" "$cargs" "$cwd" "" || true) ;;
+	grok) session_id=$(get_grok_session "$cpid" "$cargs" || true) ;;
 	esac
 
 	if [ -n "$session_id" ]; then
 		# Extract CLI args (flags without binary name and session/resume args)
-		local cli_args
-		cli_args=$(extract_cli_args "$tool" "$cargs")
+		local cli_args copilot_home=""
+		cli_args=$(extract_cli_args "$tool" "$cargs" "$cpid")
+		if [ "$tool" = "copilot" ]; then
+			copilot_home="${copilot_state_dir%/session-state}"
+		fi
 
 		# Read enriched fields from state file (if available)
 		local state_file="" model="" env_json="null"
@@ -1630,8 +2176,9 @@ emit_session() {
 			--arg pid "$cpid" \
 			--arg model "$model" \
 			--arg cli_args "$cli_args" \
+			--arg copilot_home "$copilot_home" \
 			--argjson env "${env_json:-null}" \
-			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env}' >>"$PARTS_FILE"
+			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env, copilot_home: $copilot_home}' >>"$PARTS_FILE"
 		case "$tool" in
 		codex) register_codex_session_id "$session_id" ;;
 		pi) register_pi_session_id "$session_id" ;;

@@ -9,19 +9,22 @@
 
 # --- detect_tool ---
 # Match binary name with optional path prefix, standalone or with arguments.
-# Handles: /path/to/claude, claude, claude --resume ..., opencode -s ...,
-#          codex resume ..., pi --session ..., omp --resume ..., grok --resume ..., etc.
+# Handles: /path/to/claude, claude, claude --resume ..., copilot --resume ...,
+#          opencode -s ..., codex resume ..., pi --session ..., omp --resume ...,
+#          grok --resume ..., etc.
 # Excludes: opencode run ... (LSP subprocesses), omp __omp_worker_* subprocesses
 #
 # Limitation: patterns match any command line containing /claude, /opencode,
-# /codex, /pi, /omp, or /grok as a path component. An unrelated binary with the same name
-# (e.g., a LaTeX tool named "codex") would be falsely detected. In practice this is rare
-# inside tmux panes, but worth noting. Future: could verify identity via
-# --version or known subcommands if false positives become an issue.
+# /copilot, /codex, /pi, /omp, or /grok as a path component. An unrelated
+# binary with the same name (e.g., a LaTeX tool named "codex") would be falsely
+# detected. In practice this is rare inside tmux panes, but worth noting.
+# Future: could verify identity via --version or known subcommands if false
+# positives become an issue.
 detect_tool() {
 	local args="$1"
 	case "$args" in
 	claude | claude\ * | */claude | */claude\ *) echo "claude" ;;
+	copilot | copilot\ * | */copilot | */copilot\ *) echo "copilot" ;;
 	opencode | opencode\ * | */opencode | */opencode\ *)
 		# Exclude LSP/language server subprocesses
 		case "$args" in
@@ -101,6 +104,23 @@ posix_quote() {
 	# Replace each ' with '"'"'
 	val="${val//\'/\'\"\'\"\'}"
 	printf "'%s'" "$val"
+}
+
+# Quote one value for the shell running in a restored pane. csh/tcsh perform
+# history expansion inside single quotes and use different embedded-quote
+# rules, so escape `!` and use their `'\''` sequence for a literal quote.
+# Other supported shells accept posix_quote().
+shell_quote() {
+	local shell_name="$1" val="$2"
+	case "$shell_name" in
+	csh | tcsh)
+		local quote_escape="'\\''"
+		val="${val//!/\\!}"
+		val="${val//\'/$quote_escape}"
+		printf "'%s'" "$val"
+		;;
+	*) posix_quote "$val" ;;
+	esac
 }
 
 # --- resurrect_data_dir ---

@@ -62,6 +62,7 @@ while read -r entry; do
 	cli_args=$(echo "$entry" | jq -r '.cli_args // empty')
 	model=$(echo "$entry" | jq -r '.model // empty')
 	env_json=$(echo "$entry" | jq -c '.env // {}')
+	copilot_home=$(echo "$entry" | jq -r '.copilot_home // empty')
 
 	# Check if the target pane's session exists
 	tmux_session="${pane%%:*}"
@@ -183,6 +184,20 @@ while read -r entry; do
 			resume_cmd="command claude${safe_cli_args}${safe_model_arg} --resume ${safe_sid}"
 		else
 			resume_cmd="command claude --resume ${safe_sid}"
+		fi
+		;;
+	copilot)
+		copilot_cmd="command copilot"
+		if [ -n "$copilot_home" ]; then
+			# `VAR=value command ...` is not valid csh/tcsh syntax. `env`
+			# preserves aliases/functions bypass while working in every shell
+			# accepted by the restore whitelist.
+			copilot_cmd="env COPILOT_HOME=$(shell_quote "$pane_cmd" "$copilot_home") copilot"
+		fi
+		if [ -n "$safe_cli_args" ]; then
+			resume_cmd="${copilot_cmd}${safe_cli_args} --resume=${safe_sid}"
+		else
+			resume_cmd="${copilot_cmd} --resume=${safe_sid}"
 		fi
 		;;
 	opencode)

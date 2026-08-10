@@ -3,7 +3,8 @@
 ## Project overview
 
 tmux-assistant-resurrect persists AI coding assistant sessions (Claude Code,
-OpenCode, Codex CLI, Pi, Oh My Pi, Grok) across tmux restarts. It hooks into
+GitHub Copilot CLI, OpenCode, Codex CLI, Pi, Oh My Pi, Grok) across tmux
+restarts. It hooks into
 tmux-resurrect to save session IDs and restore them automatically.
 
 ## Architecture
@@ -20,8 +21,9 @@ tmux-resurrect to save session IDs and restore them automatically.
 
 ## Design constraints
 
-- **No wrapper scripts**: Do not create wrapper functions/aliases around `claude`,
-  `opencode`, `codex`, or `pi`. Use native hook/plugin systems instead.
+- **No wrapper scripts**: Do not create wrapper functions/aliases around
+  `claude`, `copilot`, `opencode`, `codex`, or `pi`. Use native runtime state or
+  hook/plugin systems instead.
 - **Restore hook is the sole launcher**: Assistants must NOT be listed in
   `@resurrect-processes`. The post-restore hook handles all resuming with correct
   session IDs. Adding them to `@resurrect-processes` causes double-launch.
@@ -71,7 +73,7 @@ process args as a reliable fallback.
 - The `env` object in state files captures `TMUX_PANE` and `SHELL` by default,
   plus user-configured vars via `@assistant-resurrect-capture-env` tmux option
   (space-separated list, set in tmux.conf)
-- For assistants **without** a hook/plugin (Codex, Pi, Oh My Pi, Grok) there is
+- For assistants **without** a hook/plugin (Copilot, Codex, Pi, Oh My Pi, Grok) there is
   no state file to read `env` from, so `save-assistant-sessions.sh` captures the
   configured vars directly from the live process: `read_process_env()` reads
   `/proc/<pid>/environ` (Linux/WSL only; returns `null` where `/proc` is absent,
@@ -82,6 +84,66 @@ process args as a reliable fallback.
   cannot read another process's env unprivileged, so hookless tools capture no
   env there — document the shell-profile / `tmux set-environment` workaround
   instead.
+- Copilot exposes a PID-specific active-session signal: the live session writes
+  `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` (content = the same PID).
+  Resolve it with a single glob — no `/proc`, no `lsof`, no platform branch, and
+  it works on native Windows too. `COPILOT_HOME` replaces the whole `~/.copilot`
+  path, same convention as `GROK_HOME`. An in-process `/resume` can leave more
+  than one valid lock for the same PID, so the newest valid lock is authoritative.
+- The lock alone is not enough: it appears at TUI startup, but Copilot writes
+  `<session-state>/<uuid>/session.db` only once the conversation has content,
+  and only such a session is resumable (`--resume` on an empty one exits with
+  "No session, task, or name matched"). The save hook gates on `session.db` so
+  restore never replays a command that errors in the pane. This costs no process
+  inspection: the lock already identified the directory, so the gate is a plain
+  file test. Do not confuse it with `session-store.db`, which sits at the root of
+  `COPILOT_HOME`, is shared by every session, and cannot identify one.
+- Testing that gate unauthenticated only reaches the negative half: a container
+  session never gains content, so `session.db` never appears. The contract test
+  asserts that half; `run-tests.sh` touches the file to stand in for "the user
+  typed something". The positive half needs a real login and is verified by
+  `test/copilot-e2e-authenticated.sh`.
+- Session lookup helpers may legitimately find no ID. Every `get_<tool>_session`
+  command substitution in the resolver and compatibility emitter must be
+  explicitly non-fatal (`|| true` inside the substitution), because a failed
+  bare command-substitution assignment triggers `set -e` in supported Bash
+  versions.
+- Copilot accepts **zero** positional arguments, which makes flattened argv
+  fatal rather than merely lossy: `--add-dir "/tmp/My Project"` reaches `ps` as
+  three tokens, and replaying the tail makes Copilot exit with "too many
+  arguments". `_copilot_drop_flattened_values()` drops any option whose value
+  arrived split, exempting variadic options (`--allow-tool[=tools...]`), whose
+  several tokens round-trip correctly. It must run *before* the session-flag
+  strippers, which consume only one token and would strand the rest. Two
+  non-obvious cases: after an **equals-form** option (`--name=my feature`) even a
+  single trailing bare token is a lost fragment, because the `=` already bounded
+  the value — and that beats the variadic exemption, since
+  `--deny-tool='shell(git push)'` flattens the same way; and the word-split runs
+  under `set -f`, since argv is data and `--allow-tool '*'` must not be expanded
+  against the hook's cwd. If a restriction cannot be reproduced exactly, all
+  Copilot replay flags are dropped and restore uses a bare resume; keeping any
+  remaining grant or MCP-enablement flag could silently widen permissions.
+- `--attachment` is stripped unconditionally for Copilot: restore always resumes
+  interactively and Copilot refuses it there ("only supported in non-interactive
+  prompt mode"). The `--prompt`/`--interactive` truncation only reaches flags
+  written *after* the prompt, so position-independent stripping is required.
+  Verified against 1.0.78 — `--silent`, `--share`, `--share-gist` and
+  `--enable-memory` resume without complaint and are deliberately left alone.
+- Two Copilot options are **hidden from `--help`** yet refused alongside
+  `--resume`: `--worktree`/`-w` and `--cloud`. Flag discovery can never learn
+  them, so they are stripped from a static list. Re-check that list when
+  Copilot's experimental surface changes.
+- The deprecated `--config-dir <path>` relocates the whole state root per
+  process (verified on 1.0.78: the lock lands there and nothing under
+  `~/.copilot`), so `copilot_session_state_dir()` takes the candidate's argv and
+  prefers it over `COPILOT_HOME`. The resolved root is saved as `copilot_home`
+  and restored through `COPILOT_HOME`, including paths whose quoting `ps`
+  flattened and process-only values read from `/proc`.
+- Discovery caches live in shell variables and every caller runs inside a `$()`
+  subshell, so a cache written there is discarded. `_warm_session_discovery()`
+  must therefore call `_tool_help` **directly** in the parent shell, and any new
+  helper that parses `--help` needs a `SESSION_EXTRA_WARM_<tool>` entry.
+  Otherwise `<tool> --help` re-execs once per pane on every save.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per run)
 - Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
@@ -94,16 +156,20 @@ process args as a reliable fallback.
   on hook entries that lack a `.command` field (e.g., URL-type hooks), and
   `.hooks` is null-coalesced before mapping to handle entries with missing/null
   hooks arrays
-- Use `posix_quote()` from `lib-detect.sh` for any values sent to tmux panes
-  via `send-keys` (safe for bash, zsh, fish, and other POSIX-ish shells)
+- Use `posix_quote()` from `lib-detect.sh` for values sent to POSIX-ish/fish
+  panes. When the pane shell is known and csh/tcsh is supported, use
+  `shell_quote()` so history expansion and embedded quotes remain literal.
 - Hook command paths use single quotes (`bash '${CURRENT_DIR}/hooks/...'`);
   this breaks if the install path contains a single quote (unlikely with TPM)
 - The sidecar JSON (`assistant-sessions.json`) entries include enriched fields:
   `model` (from state file or `--model` in args), `cli_args` (from `ps` args
-  with binary name and session/resume args stripped), `env` (from state file).
-  All are optional for backward compatibility.
+  with binary name and session/resume args stripped), `env` (from state file),
+  and `copilot_home` for Copilot's resolved state root. All are optional for
+  backward compatibility.
 - `extract_cli_args()` in `save-assistant-sessions.sh` strips per-tool session
-  args: Claude `--resume[= ]<id>`, OpenCode `--session[= ]<id>` and `-s <id>`,
+  args: Claude `--resume[= ]<id>`, Copilot session selectors (including
+  `--name`, which Copilot refuses to combine with `--resume`) and initial-prompt
+  `--prompt`/`--interactive` plus trailing argv, OpenCode `--session[= ]<id>` and `-s <id>`,
   Codex `resume <id>`, Pi `--session[= ]<id>`, Grok `--resume`/`-r`/`--session-id`/
   `--continue`. Returns normalized whitespace-trimmed string. (Grok's restore
   ignores the result — see `restore-assistant-sessions.sh` — but the field is
@@ -120,6 +186,7 @@ changes after an upgrade, check the relevant source to confirm.
 | Assumption | Why it matters | Where to verify |
 |-----------|---------------|----------------|
 | **Claude sets `process.title = 'claude'`** | Node.js sets the process title, but on macOS arm64 (v2.1.44) `ps -eo args=` still shows full args (e.g., `claude --dangerously-skip-permissions`). The save script's `extract_cli_args()` relies on this. If a future version hides args, `cli_args` will be empty and restore falls back to bare `<binary> <resume_arg>`. | Run `ps -eo args=` on a running Claude process; Claude Code source: search for `process.title` |
+| **Copilot writes `<session-state>/<uuid>/inuse.<pid>.lock`** | Primary PID-to-session mapping for bare launches and in-process `/resume`; avoids same-cwd ambiguity and stale npm-loader argv. Undocumented upstream, hence the contract test | `test/copilot-contract-test.sh` asserts it against the real binary; manually, `ls ~/.copilot/session-state/*/inuse.*.lock` while Copilot runs |
 | **Claude hook spawns intermediate `sh -c`** | `$PPID` in the hook is NOT Claude's PID; hooks walk the process tree via `find_claude_pid()` (max 5 levels) | Run `ps -eo pid=,ppid=,args=` while a hook is executing |
 | **OpenCode plugins run in-process** | `process.pid` in the plugin IS the opencode binary's PID; state file is keyed by this PID | OpenCode source: search for `await import(` in the plugin loader (approx. `packages/opencode/src/plugin/index.ts` -- path may move) |
 | **OpenCode Go binary overwrites process title** | `-s <id>` is NOT visible in `ps`; plugin state file or SQLite DB are the reliable sources | Run `ps -eo args=` on a running `opencode -s <id>` process |
@@ -148,8 +215,30 @@ These are hard-won lessons. Do not "simplify" them away.
 ## Testing
 
 Tests run in Docker with real CLI binaries (`@anthropic-ai/claude-code`,
-`opencode-ai`, `@openai/codex`, `@earendil-works/pi-coding-agent`). No mocks,
-no API keys needed.
+`@github/copilot`, `opencode-ai`, `@openai/codex`,
+`@earendil-works/pi-coding-agent`). No API keys are needed.
+
+Copilot is covered at three layers, because a hermetic test that fabricates the
+artifact it then looks for cannot notice upstream changing the layout:
+
+| Layer | File | Catches |
+|-------|------|---------|
+| Contract | `test/copilot-contract-test.sh` | upstream changing the on-disk contract we depend on |
+| End-to-end | `test/run-tests.sh` Test 2/3, real binary | save/restore wiring against reality |
+| Hermetic | `test/copilot-unit-tests.sh` | lock integrity, stale locks, argv fallback, `extract_cli_args` |
+| Authenticated | `test/copilot-e2e-authenticated.sh` | whether a real conversation actually comes back |
+
+**Run the authenticated test after touching Copilot session discovery**
+(`GH_TOKEN=$(gh auth token) just test-copilot-e2e`). It is the only layer that
+can tell a resumable session from an unresumable one: unauthenticated Copilot
+still creates a session directory and lock, so a lookup returning a UUID that
+`--resume` rejects looks exactly like a correct one. That blind spot already
+shipped one bug. It cannot run in CI — fork pull requests cannot read secrets.
+
+The contract and end-to-end layers need **no authentication**: Copilot creates
+the session directory and its lock before the auth check runs. Launch it in the
+integration test with *no* session selector, so the UUID exists only in the lock
+and a regressed lookup cannot be masked by the argv fallback.
 
 ```bash
 # Run the full test suite in Docker
@@ -172,8 +261,8 @@ cat ~/.local/share/tmux/resurrect/assistant-restore.log
   `wait_for_death`) instead of fixed `sleep` -- fast on fast machines,
   tolerant on slow CI.
 - `kill_pane_children()` does tree-walk cleanup instead of inline kill patterns.
-- npm packages are pinned to major versions: `claude-code@^2`, `codex@^0`,
-  `opencode-ai@^1`, `pi-coding-agent@^0`.
+- npm packages are pinned to major versions: `claude-code@^2`,
+  `@github/copilot@^1`, `codex@^0`, `opencode-ai@^1`, `pi-coding-agent@^0`.
 
 ## Adding a new assistant
 
