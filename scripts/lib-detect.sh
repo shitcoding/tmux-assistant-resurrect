@@ -106,6 +106,23 @@ posix_quote() {
 	printf "'%s'" "$val"
 }
 
+# Quote one value for the shell running in a restored pane. csh/tcsh perform
+# history expansion inside single quotes and use different embedded-quote
+# rules, so escape `!` and use their `'\''` sequence for a literal quote.
+# Other supported shells accept posix_quote().
+shell_quote() {
+	local shell_name="$1" val="$2"
+	case "$shell_name" in
+	csh | tcsh)
+		local quote_escape="'\\''"
+		val="${val//!/\\!}"
+		val="${val//\'/$quote_escape}"
+		printf "'%s'" "$val"
+		;;
+	*) posix_quote "$val" ;;
+	esac
+}
+
 # --- resurrect_data_dir ---
 # Print the directory tmux-resurrect saves into, resolved the SAME way resurrect
 # resolves it itself (scripts/helpers.sh:resurrect_dir). Our sidecar files

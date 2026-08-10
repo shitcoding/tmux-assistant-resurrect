@@ -120,7 +120,9 @@ process args as a reliable fallback.
   the value — and that beats the variadic exemption, since
   `--deny-tool='shell(git push)'` flattens the same way; and the word-split runs
   under `set -f`, since argv is data and `--allow-tool '*'` must not be expanded
-  against the hook's cwd.
+  against the hook's cwd. If a restriction cannot be reproduced exactly, all
+  Copilot replay flags are dropped and restore uses a bare resume; keeping any
+  remaining grant or MCP-enablement flag could silently widen permissions.
 - `--attachment` is stripped unconditionally for Copilot: restore always resumes
   interactively and Copilot refuses it there ("only supported in non-interactive
   prompt mode"). The `--prompt`/`--interactive` truncation only reaches flags
@@ -134,7 +136,9 @@ process args as a reliable fallback.
 - The deprecated `--config-dir <path>` relocates the whole state root per
   process (verified on 1.0.78: the lock lands there and nothing under
   `~/.copilot`), so `copilot_session_state_dir()` takes the candidate's argv and
-  prefers it over `COPILOT_HOME`.
+  prefers it over `COPILOT_HOME`. The resolved root is saved as `copilot_home`
+  and restored through `COPILOT_HOME`, including paths whose quoting `ps`
+  flattened and process-only values read from `/proc`.
 - Discovery caches live in shell variables and every caller runs inside a `$()`
   subshell, so a cache written there is discarded. `_warm_session_discovery()`
   must therefore call `_tool_help` **directly** in the parent shell, and any new
@@ -152,14 +156,16 @@ process args as a reliable fallback.
   on hook entries that lack a `.command` field (e.g., URL-type hooks), and
   `.hooks` is null-coalesced before mapping to handle entries with missing/null
   hooks arrays
-- Use `posix_quote()` from `lib-detect.sh` for any values sent to tmux panes
-  via `send-keys` (safe for bash, zsh, fish, and other POSIX-ish shells)
+- Use `posix_quote()` from `lib-detect.sh` for values sent to POSIX-ish/fish
+  panes. When the pane shell is known and csh/tcsh is supported, use
+  `shell_quote()` so history expansion and embedded quotes remain literal.
 - Hook command paths use single quotes (`bash '${CURRENT_DIR}/hooks/...'`);
   this breaks if the install path contains a single quote (unlikely with TPM)
 - The sidecar JSON (`assistant-sessions.json`) entries include enriched fields:
   `model` (from state file or `--model` in args), `cli_args` (from `ps` args
-  with binary name and session/resume args stripped), `env` (from state file).
-  All are optional for backward compatibility.
+  with binary name and session/resume args stripped), `env` (from state file),
+  and `copilot_home` for Copilot's resolved state root. All are optional for
+  backward compatibility.
 - `extract_cli_args()` in `save-assistant-sessions.sh` strips per-tool session
   args: Claude `--resume[= ]<id>`, Copilot session selectors (including
   `--name`, which Copilot refuses to combine with `--resume`) and initial-prompt

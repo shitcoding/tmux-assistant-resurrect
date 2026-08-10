@@ -565,8 +565,10 @@ one wins.
 (Not to be confused with `session-store.db`, which lives at the root of
 `~/.copilot`, is shared by every session, and cannot identify one.)
 `COPILOT_HOME` replaces the whole `~/.copilot` path, and the save hook honors
-it — but a tmux hook does not inherit your shell profile, so if you set it, set
-it for tmux too (`tmux set-environment -g COPILOT_HOME ...`).
+it. On Linux/WSL the hook can read a process-only value from `/proc`; on macOS,
+set it for tmux too (`tmux set-environment -g COPILOT_HOME ...`) or launch with
+`--config-dir`. The resolved root is saved and replayed through `COPILOT_HOME`,
+including paths containing spaces.
 
 Neither the lock file nor the `session.db` gate is part of Copilot's documented
 interface, so `test/copilot-contract-test.sh` asserts both against the real
@@ -581,7 +583,9 @@ operational flags such as `--allow-all` and `--autopilot`, and strips
 session-selection flags. Because process inspection loses the quoting boundary
 of multi-word `--prompt` and `--interactive` values, either initial-prompt flag
 and all following argv are dropped rather than risk replaying prompt text into
-the resumed session.
+the resumed session. If a restricting permission flag cannot be reconstructed
+exactly, all replay flags are dropped and restore uses a bare resume rather than
+risk silently widening the resumed agent's permissions.
 
 ### Pi
 
@@ -602,6 +606,8 @@ matching binary names. Then extracts session IDs using tool-specific methods
   session/resume args stripped (e.g., `--dangerously-skip-permissions --model opus`)
 - **Model** (`model`): from state file (preferred) or `--model` in args (fallback)
 - **Environment** (`env`): from state file (captured by hooks/plugins)
+- **Copilot state root** (`copilot_home`): the resolved `COPILOT_HOME` or
+  `--config-dir` root, replayed automatically so restore finds the same UUID
 
 Writes everything to `assistant-sessions.json` in tmux-resurrect's save
 directory (see **Save location** above).

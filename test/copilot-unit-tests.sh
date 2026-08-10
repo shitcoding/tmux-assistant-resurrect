@@ -268,6 +268,54 @@ assert_eq "process environment without COPILOT_HOME falls through" \
 	"$HOME/.copilot/session-state" \
 	"$(COPILOT_PROC_ROOT="$SANDBOX/absent-proc" COPILOT_HOME= copilot_session_state_dir "copilot" 4242)"
 
+# The save sidecar must retain the resolved state root. Discovery alone is not
+# enough: restore needs the same root to find the UUID again.
+ROOT_PARTS="$SANDBOX/root-parts"
+ROOT_CACHE="$SANDBOX/root-cache"
+: >"$ROOT_PARTS"
+: >"$ROOT_CACHE"
+root_candidates=$(printf 'copilot\0371008\037copilot --config-dir %s\n' "$CFG_SPACED")
+resolve_pane_candidates \
+	"test:1.2" "/tmp" "/dev/ttys002" "$root_candidates" $'\037' 0 \
+	"$ROOT_CACHE" "$ROOT_PARTS"
+assert_eq "resolved Copilot home is persisted for restore" "$CFG_SPACED" \
+	"$(awk -F '\t' 'NR == 1 { print $9 }' "$ROOT_PARTS")"
+
+# A process-only COPILOT_HOME must be read once and reused. If Copilot exits
+# after discovery, a second /proc read would fall back to the hook's default
+# root and pair the correct UUID with the wrong home.
+RACE_ROOT="$SANDBOX/race-home"
+RACE_SID="bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+RACE_CALLS="$SANDBOX/race-home-calls"
+RACE_PARTS="$SANDBOX/race-parts"
+RACE_CACHE="$SANDBOX/race-cache"
+mkdir -p "$RACE_ROOT/session-state/$RACE_SID"
+printf '%s\n' 4243 >"$RACE_ROOT/session-state/$RACE_SID/inuse.4243.lock"
+: >"$RACE_ROOT/session-state/$RACE_SID/session.db"
+printf '0\n' >"$RACE_CALLS"
+: >"$RACE_PARTS"
+: >"$RACE_CACHE"
+original_copilot_home_fn=$(declare -f _copilot_home_from_process)
+_copilot_home_from_process() {
+	local calls
+	calls=$(cat "$RACE_CALLS")
+	calls=$((calls + 1))
+	printf '%s\n' "$calls" >"$RACE_CALLS"
+	[ "$calls" -eq 1 ] && printf '%s' "$RACE_ROOT"
+}
+race_candidates=$(printf 'copilot\0374243\037copilot\n')
+resolve_pane_candidates \
+	"test:1.3" "/tmp" "/dev/ttys003" "$race_candidates" $'\037' 0 \
+	"$RACE_CACHE" "$RACE_PARTS"
+eval "$original_copilot_home_fn"
+assert_eq "process-only Copilot home is resolved once" "1" "$(cat "$RACE_CALLS")"
+assert_eq "process exit cannot replace the saved Copilot home" "$RACE_ROOT" \
+	"$(awk -F '\t' 'NR == 1 { print $9 }' "$RACE_PARTS")"
+assert_eq "tcsh state-root quoting escapes history expansion" "'/tmp/a\\!b'" \
+	"$(shell_quote tcsh '/tmp/a!b')"
+assert_eq "tcsh state-root quoting preserves embedded quotes" \
+	"'/tmp/a'\\''b\\!c'" "$(shell_quote tcsh "/tmp/a'b!c")"
+
 echo "== unresolved candidate is non-fatal under set -e =="
 UNRESOLVED_PARTS="$SANDBOX/unresolved-parts"
 UNRESOLVED_CACHE="$SANDBOX/unresolved-cache"
@@ -363,14 +411,18 @@ echo "== permission safety =="
 # A restricting option whose value we cannot reproduce must not be guessed at:
 # `--deny-tool 'shell(git push)'` and `--deny-tool a b` are identical after ps
 # flattens them, and preserving the wrong one quietly widens what the agent may
-# do. Dropping the denial alone would do the same, so the blanket allow goes too
-# and the restored session falls back to prompting.
+# do. Dropping the denial alone would do the same, so every replay flag goes too
+# and the restored session falls back to Copilot's prompting defaults.
 assert_eq "ambiguous denial drops, taking the blanket allow with it" "" \
 	"$(extract_cli_args copilot "copilot --deny-tool shell write --allow-all")"
 assert_eq "equals-form denial likewise" "" \
 	"$(extract_cli_args copilot "copilot --deny-tool=shell(git push) --allow-all")"
-assert_eq "other blanket allows are neutralized too" "--autopilot" \
+assert_eq "permission loss drops every replay flag" "" \
 	"$(extract_cli_args copilot "copilot --deny-tool a b --yolo --allow-all-tools --autopilot")"
+assert_eq "dropped denial also removes granular grants" "" \
+	"$(extract_cli_args copilot "copilot --allow-tool=shell(git:*) --deny-tool=shell(git push) --allow-all")"
+assert_eq "dash-prefixed value fragments are not replayed as options" "" \
+	"$(extract_cli_args copilot "copilot --deny-tool=shell(git push --force) --allow-all")"
 # Granting options keep the variadic exemption: mis-splitting one only ever
 # narrows access, so there is no escalation to guard against.
 assert_eq "granting variadic keeps its values and the blanket allow" \
@@ -396,6 +448,8 @@ if [ -r "/proc/$$/cmdline" ]; then
 	QUOTED_PID=$!
 	bash "$SANDBOX/launcher/copilot" --deny-tool a b --allow-all >/dev/null 2>&1 &
 	LIST_PID=$!
+	bash "$SANDBOX/launcher/copilot" "--deny-tool=shell(git push)" --allow-all >/dev/null 2>&1 &
+	EQUALS_PID=$!
 	sleep 1
 	# ps flattens both to the same string; only cmdline tells them apart.
 	assert_eq "quoted denial is recognised as one value and dropped" "" \
@@ -403,7 +457,9 @@ if [ -r "/proc/$$/cmdline" ]; then
 	assert_eq "genuine denial list is preserved despite identical ps output" \
 		"--deny-tool a b --allow-all" \
 		"$(extract_cli_args copilot "copilot --deny-tool a b --allow-all" "$LIST_PID")"
-	kill "$QUOTED_PID" "$LIST_PID" 2>/dev/null
+	assert_eq "equals-form exact denial drop is reported as a permission loss" "" \
+		"$(extract_cli_args copilot "copilot --deny-tool=shell(git push) --allow-all" "$EQUALS_PID")"
+	kill "$QUOTED_PID" "$LIST_PID" "$EQUALS_PID" 2>/dev/null
 else
 	printf '  [skip] exact argv from /proc (not available on this platform)\n'
 fi

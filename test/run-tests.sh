@@ -495,6 +495,8 @@ assert_eq "Copilot session ID extracted from the live inuse lock" "$copilot_sid"
 copilot_detected_args=$(jq -r '.sessions[] | select(.tool == "copilot") | .cli_args' "$SAVED")
 assert_eq "Copilot operational flags captured from native process" \
 	"--no-auto-update --allow-all --autopilot" "$copilot_detected_args"
+copilot_detected_home=$(jq -r '.sessions[] | select(.tool == "copilot") | .copilot_home // empty' "$SAVED")
+assert_eq "Copilot state root persisted for restore" "$HOME/.copilot" "$copilot_detected_home"
 
 # Verify OpenCode was detected with correct session ID (from plugin state file)
 opencode_sid=$(jq -r '[.sessions[] | select(.tool == "opencode" and .session_id != "")] | first | .session_id' "$SAVED")
@@ -629,7 +631,7 @@ assert_contains "Restore log mentions omp" "$restore_log_content" "restoring omp
 assert_contains "Restore sent claude --resume" "$restore_log_content" "ses_claude_test_123"
 assert_contains "Restore sent copilot --resume" "$restore_log_content" "--resume='$copilot_sid'"
 assert_contains "Restore preserves Copilot operational flags" "$restore_log_content" \
-	"command copilot '--no-auto-update' '--allow-all' '--autopilot'"
+	"copilot '--no-auto-update' '--allow-all' '--autopilot'"
 assert_contains "Restore sent opencode -s" "$restore_log_content" "ses_opencode_test_456"
 assert_contains "Restore sent codex resume" "$restore_log_content" "ses_codex_test_789"
 assert_contains "Restore sent pi --session" "$restore_log_content" "$pi_sid"
@@ -638,7 +640,8 @@ assert_contains "Restore sent omp --resume" "$omp_restore_line" "--resume"
 
 # Verify restore uses 'command' prefix to bypass shell aliases
 assert_contains "Restore uses 'command claude' prefix" "$restore_log_content" "command claude"
-assert_contains "Restore uses 'command copilot' prefix" "$restore_log_content" "command copilot"
+assert_contains "Restore uses env to bypass Copilot aliases" "$restore_log_content" \
+	"env COPILOT_HOME='$HOME/.copilot' copilot"
 assert_contains "Restore uses 'command opencode' prefix" "$restore_log_content" "command opencode"
 assert_contains "Restore uses 'command codex' prefix" "$restore_log_content" "command codex"
 assert_contains "Restore uses 'command pi' prefix" "$restore_log_content" "command pi"
@@ -3466,6 +3469,46 @@ assert_contains "Restore includes --dangerously-skip-permissions" "$restore_enri
 assert_contains "Restore includes --model" "$restore_enrich_log" "'--model' 'claude-opus-4-6'"
 
 kill_pane_children test-restore-enrich true
+
+# --- Test 10a: restore Copilot with its saved state root ---
+
+echo ""
+echo "=== Test 10a: restore Copilot with saved state root ==="
+echo ""
+
+tmux new-session -d -s test-restore-copilot-home -c /tmp 2>/dev/null || true
+sleep 0.5
+
+copilot_restore_home="/tmp/copilot restore home.$$"
+mkdir -p "$copilot_restore_home"
+cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<RECOPEOF
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [
+    {
+      "pane": "test-restore-copilot-home:0.0",
+      "tool": "copilot",
+      "session_id": "550e8400-e29b-41d4-a716-446655440000",
+      "cwd": "/tmp",
+      "pid": "99999",
+      "cli_args": "--allow-all",
+      "copilot_home": "$copilot_restore_home",
+      "env": {}
+    }
+  ]
+}
+RECOPEOF
+
+>"$RESTORE_LOG"
+just restore 2>&1
+sleep 5
+
+restore_copilot_home_log=$(cat "$RESTORE_LOG")
+assert_contains "Restore pins Copilot to the saved state root" "$restore_copilot_home_log" \
+	"env COPILOT_HOME='$copilot_restore_home' copilot"
+
+kill_pane_children test-restore-copilot-home true
+rm -rf "$copilot_restore_home"
 
 # --- Test 10b: restore with env vars ---
 

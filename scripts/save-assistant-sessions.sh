@@ -235,9 +235,10 @@ _copilot_lock_is_live() {
 get_copilot_session_from_lock() {
 	local child_pid="$1"
 	local args="${2:-}"
-	local state_dir lock sid recorded lock_key
+	local state_dir="${3:-}"
+	local lock sid recorded lock_key
 	local newest_sid="" newest_key="" fallback_sid=""
-	state_dir=$(copilot_session_state_dir "$args" "$child_pid")
+	[ -n "$state_dir" ] || state_dir=$(copilot_session_state_dir "$args" "$child_pid")
 	[ -d "$state_dir" ] || return 0
 
 	for lock in "$state_dir"/*/"inuse.${child_pid}.lock"; do
@@ -273,10 +274,12 @@ get_copilot_session() {
 	local child_pid="$1"
 	local args="$2"
 	local allow_args_fallback="${3:-1}"
+	local state_dir="${4:-}"
 	local sid=""
+	[ -n "$state_dir" ] || state_dir=$(copilot_session_state_dir "$args" "$child_pid")
 
 	# Primary: PID-specific, platform-independent, and current after /resume.
-	sid=$(get_copilot_session_from_lock "$child_pid" "$args")
+	sid=$(get_copilot_session_from_lock "$child_pid" "$args" "$state_dir")
 	if [ -n "$sid" ]; then
 		echo "$sid"
 		return 0
@@ -288,8 +291,7 @@ get_copilot_session() {
 	# lock held by the native child.
 	[ "$allow_args_fallback" = "1" ] || return 0
 	local uuid='\([0-9a-fA-F]\{8\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{4\}-[0-9a-fA-F]\{12\}\)'
-	local flag state_dir
-	state_dir=$(copilot_session_state_dir "$args" "$child_pid")
+	local flag
 	for flag in '--session-id' '--resume' '-r'; do
 		sid=$(echo "$args" | sed -n "s/.*$flag[= ] *$uuid.*/\1/p")
 		if [ -n "$sid" ]; then
@@ -1030,7 +1032,7 @@ _copilot_exact_argv() {
 # Options that *restrict* the agent: a denial, an exclusion, or a whitelist that
 # implies everything else is off. Losing one of these makes the restored session
 # more powerful than the user asked for, so ambiguity must not preserve a guess
-# and a blanket allow must not survive alongside it.
+# and no other replay flag can safely survive alongside it.
 #
 # Deliberately excludes the granting options (--allow-*, --add-dir): dropping a
 # grant only ever narrows what the agent can do, which is the safe direction.
@@ -1057,17 +1059,26 @@ _copilot_args_from_exact_argv() {
 		tok="${argv[$i]}"
 		case "$tok" in
 		*[[:space:]]*)
-			# Unrepresentable once joined by spaces. Drop it and its option.
-			if [ "${#out[@]}" -gt 0 ]; then
-				last="${out[$((${#out[@]} - 1))]}"
-				case "$last" in
-				-*)
-					_copilot_is_restriction_flag "${last%%=*}" && dropped_permission=1
-					unset "out[$((${#out[@]} - 1))]"
-					out=(${out[@]+"${out[@]}"})
-					;;
-				esac
-			fi
+			# Unrepresentable once joined by spaces. An equals-form option is
+			# self-contained, so drop that token itself; a separate value drops
+			# the preceding option. In both forms, report a lost restriction.
+			case "$tok" in
+			-*=*)
+				_copilot_is_restriction_flag "${tok%%=*}" && dropped_permission=1
+				;;
+			*)
+				if [ "${#out[@]}" -gt 0 ]; then
+					last="${out[$((${#out[@]} - 1))]}"
+					case "$last" in
+					-*)
+						_copilot_is_restriction_flag "${last%%=*}" && dropped_permission=1
+						unset "out[$((${#out[@]} - 1))]"
+						out=(${out[@]+"${out[@]}"})
+						;;
+					esac
+				fi
+				;;
+			esac
 			;;
 		*) out[${#out[@]}]="$tok" ;;
 		esac
@@ -1077,18 +1088,6 @@ _copilot_args_from_exact_argv() {
 	# discarded, so the permission drop is reported through the exit status.
 	[ "$dropped_permission" -eq 1 ] && return 9
 	return 0
-}
-
-# If a permission rule was lost, a blanket allow must not survive: restoring
-# `--allow-all` without the `--deny-tool` that constrained it would hand the
-# resumed agent broader powers than the user granted. Dropping both leaves the
-# session prompting for permission, which is the safe direction and visible.
-_copilot_neutralize_blanket_allow() {
-	local args="$1" flag
-	for flag in --allow-all --allow-all-tools --allow-all-paths --allow-all-urls --yolo; do
-		args=$(_strip_bool_opt "$flag" "$args")
-	done
-	printf '%s' "$args"
 }
 
 # Copilot accepts zero positional arguments, so every bare token in its argv is
@@ -1520,7 +1519,11 @@ extract_cli_args() {
 		args=$(_strip_short_opt '-w' "$args")
 		args=$(_strip_bool_opt '--cloud' "$args")
 		if [ "$_COPILOT_DROPPED_PERMISSION" -eq 1 ]; then
-			args=$(_copilot_neutralize_blanket_allow "$args")
+			# Once a restriction is lost, no remaining flag set is provably
+			# equivalent: granular grants, MCP enablement, path allowances, and
+			# future permission flags can all interact with it. Replay no flags
+			# and let bare resume return to Copilot's prompting defaults.
+			args=""
 		fi
 	fi
 
@@ -1614,14 +1617,17 @@ resolve_pane_candidates() {
 				[ -z "$cached_env" ] && cached_env="null"
 			fi
 
-			local session_id=""
+			local session_id="" copilot_state_dir=""
+			if [ "$cand_tool" = "copilot" ]; then
+				copilot_state_dir=$(copilot_session_state_dir "$cand_args" "$cand_pid")
+			fi
 			case "$cand_tool" in
 			claude)
 				session_id="$cached_sid"
 				# Keep legacy fallback behavior when cache misses (state file + --resume).
 				[ -z "$session_id" ] && session_id=$(get_claude_session "$cand_pid" "$cand_args" || true)
 				;;
-			copilot) session_id=$(get_copilot_session "$cand_pid" "$cand_args" "$allow_deferred_fallback" || true) ;;
+			copilot) session_id=$(get_copilot_session "$cand_pid" "$cand_args" "$allow_deferred_fallback" "$copilot_state_dir" || true) ;;
 			opencode)
 				session_id="$cached_sid"
 				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_deferred_fallback" || true)
@@ -1633,10 +1639,13 @@ resolve_pane_candidates() {
 			esac
 
 			if [ -n "$session_id" ]; then
-				local cli_args model="" env_json="null" state_file=""
+				local cli_args model="" env_json="null" state_file="" copilot_home=""
 				cli_args=$(extract_cli_args "$cand_tool" "$cand_args" "$cand_pid")
 				model="$cached_model"
 				env_json="$cached_env"
+				if [ "$cand_tool" = "copilot" ]; then
+					copilot_home="${copilot_state_dir%/session-state}"
+				fi
 
 				# If cache wasn't available, fall back to direct state-file enrichment.
 				case "$cand_tool" in
@@ -1659,8 +1668,8 @@ resolve_pane_candidates() {
 				fi
 
 				# Write TSV for batch JSON conversion (replaces per-entry jq -n).
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" >>"$parts_file"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" >>"$parts_file"
 
 				case "$cand_tool" in
 				codex) register_codex_session_id "$session_id" ;;
@@ -2028,7 +2037,7 @@ main() {
 		if jq -Rs --arg ts "$SAVE_TS" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
-			 env:(.[7] // "null" | try fromjson catch null)})
+			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // "")})
 			| {timestamp: $ts, sessions: .}
 		' "$PARTS_FILE" >"$OUTPUT_TMP"; then
 			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
@@ -2119,10 +2128,13 @@ emit_session() {
 	local target="$1" tool="$2" cpid="$3" cargs="$4" cwd="$5"
 	local allow_opencode_db="${6:-1}"
 	local log_missing="${7:-1}"
-	local session_id=""
+	local session_id="" copilot_state_dir=""
 	case "$tool" in
 	claude) session_id=$(get_claude_session "$cpid" "$cargs" || true) ;;
-	copilot) session_id=$(get_copilot_session "$cpid" "$cargs" || true) ;;
+	copilot)
+		copilot_state_dir=$(copilot_session_state_dir "$cargs" "$cpid")
+		session_id=$(get_copilot_session "$cpid" "$cargs" 1 "$copilot_state_dir" || true)
+		;;
 	opencode) session_id=$(get_opencode_session "$cpid" "$cargs" "$cwd" "$allow_opencode_db" || true) ;;
 	codex) session_id=$(get_codex_session "$cpid" "$cargs" "$cwd" || true) ;;
 	pi) session_id=$(get_pi_session "$cpid" "$cargs" "$cwd" || true) ;;
@@ -2132,8 +2144,11 @@ emit_session() {
 
 	if [ -n "$session_id" ]; then
 		# Extract CLI args (flags without binary name and session/resume args)
-		local cli_args
+		local cli_args copilot_home=""
 		cli_args=$(extract_cli_args "$tool" "$cargs" "$cpid")
+		if [ "$tool" = "copilot" ]; then
+			copilot_home="${copilot_state_dir%/session-state}"
+		fi
 
 		# Read enriched fields from state file (if available)
 		local state_file="" model="" env_json="null"
@@ -2161,8 +2176,9 @@ emit_session() {
 			--arg pid "$cpid" \
 			--arg model "$model" \
 			--arg cli_args "$cli_args" \
+			--arg copilot_home "$copilot_home" \
 			--argjson env "${env_json:-null}" \
-			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env}' >>"$PARTS_FILE"
+			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env, copilot_home: $copilot_home}' >>"$PARTS_FILE"
 		case "$tool" in
 		codex) register_codex_session_id "$session_id" ;;
 		pi) register_pi_session_id "$session_id" ;;
