@@ -13,8 +13,11 @@
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Limitation: hook commands use single-quoted paths (bash '${CURRENT_DIR}/...').
-# If the plugin install path contains a single quote, the quoting breaks.
+# Limitation: hook commands quote the plugin path. Claude Code hooks under
+# $HOME are written as bash "$HOME/..." (double quotes, so $HOME expands at run
+# time and the stored value stays portable); everything else stays single-quoted
+# as bash '${CURRENT_DIR}/...'. A single quote in the install path breaks the
+# latter, and a double quote, backtick or $ breaks the former.
 # This is unlikely in practice (TPM installs to ~/.tmux/plugins/).
 
 # --- tmux settings ---
@@ -39,8 +42,26 @@ tmux set-option -g @continuum-restore 'on'
 
 install_claude_hooks() {
     local settings="$HOME/.claude/settings.json"
-    local track_cmd="bash '${CURRENT_DIR}/hooks/claude-session-track.sh'"
-    local cleanup_cmd="bash '${CURRENT_DIR}/hooks/claude-session-cleanup.sh'"
+    local hooks_dir="${CURRENT_DIR}/hooks"
+    local track_cmd cleanup_cmd
+
+    # settings.json is a file users commonly track in a dotfiles repo, so the
+    # command we persist must not embed a machine-specific absolute path.
+    # Store it relative to $HOME and let the shell expand it when the hook runs;
+    # that keeps the value byte-identical across machines with different
+    # usernames. Requires double quotes, since $HOME does not expand in single
+    # quotes. Installs outside $HOME keep the single-quoted absolute path.
+    case "$hooks_dir" in
+        "$HOME"/*)
+            local rel="\$HOME${hooks_dir#"$HOME"}"
+            track_cmd="bash \"${rel}/claude-session-track.sh\""
+            cleanup_cmd="bash \"${rel}/claude-session-cleanup.sh\""
+            ;;
+        *)
+            track_cmd="bash '${hooks_dir}/claude-session-track.sh'"
+            cleanup_cmd="bash '${hooks_dir}/claude-session-cleanup.sh'"
+            ;;
+    esac
 
     # Ensure file exists
     if [ ! -f "$settings" ]; then

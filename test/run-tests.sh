@@ -5,6 +5,12 @@
 set -euo pipefail
 
 REPO_DIR="$HOME/tmux-assistant-resurrect"
+
+# Paths under $HOME are persisted as a literal "$HOME/..." so that a
+# settings.json tracked in a dotfiles repo stays identical across machines
+# (see install_claude_hooks in tmux-assistant-resurrect.tmux).
+HOOK_TRACK_CMD="bash \"\$HOME${REPO_DIR#"$HOME"}/hooks/claude-session-track.sh\""
+HOOK_CLEANUP_CMD="bash \"\$HOME${REPO_DIR#"$HOME"}/hooks/claude-session-cleanup.sh\""
 JUNIT_FILE="${JUNIT_FILE:-/tmp/test-results/junit.xml}"
 echo "Test harness bash: $BASH_VERSION"
 echo "Scripts under test: $(${TEST_BASH:-bash} --version | head -1)"
@@ -2577,7 +2583,7 @@ assert_eq "Stale: exactly 1 SessionStart hook after reinstall" "1" "$stale_start
 
 # The hook must point at the CURRENT path, not the old one
 stale_start_cmd=$(jq -r '.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track")) | .command' "$HOME/.claude/settings.json")
-expected_track_cmd="bash '${REPO_DIR}/hooks/claude-session-track.sh'"
+expected_track_cmd="$HOOK_TRACK_CMD"
 assert_eq "Stale: SessionStart hook updated to current path" "$expected_track_cmd" "$stale_start_cmd"
 
 # Same for SessionEnd
@@ -2585,7 +2591,7 @@ stale_end_count=$(jq '[.hooks.SessionEnd[]?.hooks[]? | select(.command | contain
 assert_eq "Stale: exactly 1 SessionEnd hook after reinstall" "1" "$stale_end_count"
 
 stale_end_cmd=$(jq -r '.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup")) | .command' "$HOME/.claude/settings.json")
-expected_cleanup_cmd="bash '${REPO_DIR}/hooks/claude-session-cleanup.sh'"
+expected_cleanup_cmd="$HOOK_CLEANUP_CMD"
 assert_eq "Stale: SessionEnd hook updated to current path" "$expected_cleanup_cmd" "$stale_end_cmd"
 
 # Run again — should be idempotent (still exactly 1)
@@ -2678,8 +2684,8 @@ rm -f "$HOME/.claude/settings.json"
 echo '{}' >"$HOME/.claude/settings.json"
 
 # Inject both the CURRENT path and a STALE path for SessionStart and SessionEnd
-current_track="bash '${REPO_DIR}/hooks/claude-session-track.sh'"
-current_cleanup="bash '${REPO_DIR}/hooks/claude-session-cleanup.sh'"
+current_track="$HOOK_TRACK_CMD"
+current_cleanup="$HOOK_CLEANUP_CMD"
 tmp_dual=$(mktemp)
 jq --arg cur_track "$current_track" --arg stale_track "$stale_track" \
    --arg cur_cleanup "$current_cleanup" --arg stale_cleanup "$stale_cleanup" '
@@ -2713,6 +2719,51 @@ assert_eq "Dual: exactly 1 SessionEnd hook after cleanup" "1" "$dual_end_after"
 
 dual_end_cmd=$(jq -r '.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup")) | .command' "$HOME/.claude/settings.json")
 assert_eq "Dual: surviving SessionEnd hook has current path" "$current_cleanup" "$dual_end_cmd"
+
+# --- Test 7i: Hook paths under $HOME are stored portably ---
+#
+# settings.json is commonly tracked in a dotfiles repo. Writing the expanded
+# install path into it produces a diff containing the local username on every
+# machine, so a plugin path under $HOME must be stored as a literal $HOME.
+
+echo ""
+echo "=== Test 7i: Portable \$HOME hook paths ==="
+echo ""
+
+rm -f "$HOME/.claude/settings.json"
+echo '{}' >"$HOME/.claude/settings.json"
+
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
+portable_track=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
+portable_cleanup=$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))][0].command' "$HOME/.claude/settings.json")
+
+assert_contains "Portable: SessionStart hook stores \$HOME literally" "$portable_track" '"$HOME/'
+assert_contains "Portable: SessionEnd hook stores \$HOME literally" "$portable_cleanup" '"$HOME/'
+
+if echo "$portable_track" | grep -qF -- "$HOME/"; then
+	fail "Portable: SessionStart hook must not embed the expanded home path"
+else
+	pass "Portable: SessionStart hook has no expanded home path"
+fi
+
+# The stored value must still resolve once the shell expands it at hook time.
+assert_file_exists "Portable: expanded SessionStart path exists" "$(eval "echo ${portable_track#bash }")"
+assert_file_exists "Portable: expanded SessionEnd path exists" "$(eval "echo ${portable_cleanup#bash }")"
+
+# An absolute-path hook written by an older version must migrate in place.
+tmp_portable=$(mktemp)
+jq --arg cmd "bash '$REPO_DIR/hooks/claude-session-track.sh'" '
+    .hooks.SessionStart = [{"matcher": "", "hooks": [{"type": "command", "command": $cmd}]}]
+' "$HOME/.claude/settings.json" >"$tmp_portable" && mv "$tmp_portable" "$HOME/.claude/settings.json"
+
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
+portable_migrated_count=$(jq '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Portable: absolute-path hook migrates without duplicate" "1" "$portable_migrated_count"
+
+portable_migrated=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
+assert_contains "Portable: migrated hook stores \$HOME literally" "$portable_migrated" '"$HOME/'
 
 # --- Test 8: strip_assistant_pane_contents() ---
 

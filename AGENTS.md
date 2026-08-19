@@ -158,6 +158,11 @@ process args as a reliable fallback.
   on hook entries that lack a `.command` field (e.g., URL-type hooks), and
   `.hooks` is null-coalesced before mapping to handle entries with missing/null
   hooks arrays
+- Hook commands for a plugin installed under `$HOME` are persisted as a literal
+  `bash "$HOME/..."` (double-quoted so the shell expands it at hook time), not as
+  the expanded path. `settings.json` is commonly tracked in a dotfiles repo, and
+  an expanded path embeds the local username, producing a diff on every tmux
+  start. Installs outside `$HOME` keep the single-quoted absolute path
 - Use `posix_quote()` from `lib-detect.sh` for values sent to POSIX-ish/fish
   panes. When the pane shell is known and csh/tcsh is supported, use
   `shell_quote()` so history expansion and embedded quotes remain literal.
