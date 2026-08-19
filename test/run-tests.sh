@@ -2765,6 +2765,67 @@ assert_eq "Portable: absolute-path hook migrates without duplicate" "1" "$portab
 portable_migrated=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
 assert_contains "Portable: migrated hook stores \$HOME literally" "$portable_migrated" '"$HOME/'
 
+# --- Test 7j: Installs outside $HOME keep the absolute path ---
+#
+# Nix store paths and system-wide installs have no portable prefix to
+# substitute, so they must keep the single-quoted absolute path. REPO_DIR is
+# always under $HOME, so every other test exercises only the $HOME branch and
+# this one would otherwise ship untested. Runs against an isolated HOME and a
+# fixture copy of the plugin so the real settings.json is left alone.
+
+echo ""
+echo "=== Test 7j: Installs outside \$HOME keep the absolute path ==="
+echo ""
+
+outside_root="/tmp/tar-outside-home-$$"
+outside_home="$outside_root/home"
+outside_plugin="$outside_root/plugin"
+rm -rf "$outside_root"
+mkdir -p "$outside_home/.claude" "$outside_plugin"
+cp "$REPO_DIR/tmux-assistant-resurrect.tmux" "$outside_plugin/"
+cp -R "$REPO_DIR/hooks" "$outside_plugin/hooks"
+echo '{}' >"$outside_home/.claude/settings.json"
+
+# Guard the fixture itself: if TMPDIR ever lands under the test HOME this test
+# would silently assert the wrong branch.
+case "$outside_plugin" in
+	"$outside_home"/*) fail "Outside HOME: fixture plugin must not live under the test HOME" ;;
+	*) pass "Outside HOME: fixture plugin is outside the test HOME" ;;
+esac
+
+HOME="$outside_home" bash "$outside_plugin/tmux-assistant-resurrect.tmux"
+
+outside_track=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$outside_home/.claude/settings.json")
+outside_cleanup=$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))][0].command' "$outside_home/.claude/settings.json")
+
+assert_eq "Outside HOME: SessionStart keeps single-quoted absolute path" \
+	"bash '$outside_plugin/hooks/claude-session-track.sh'" "$outside_track"
+assert_eq "Outside HOME: SessionEnd keeps single-quoted absolute path" \
+	"bash '$outside_plugin/hooks/claude-session-cleanup.sh'" "$outside_cleanup"
+
+# A path that cannot be expressed relative to $HOME must not get a literal
+# $HOME anyway — single quotes would leave it unexpanded and the hook dead.
+if echo "$outside_track" | grep -qF -- '$HOME'; then
+	fail "Outside HOME: SessionStart hook must not contain a literal \$HOME"
+else
+	pass "Outside HOME: SessionStart hook has no literal \$HOME"
+fi
+
+# Re-running must not treat the absolute form as stale and rewrite it.
+cp "$outside_home/.claude/settings.json" "$outside_root/settings-before.json"
+HOME="$outside_home" bash "$outside_plugin/tmux-assistant-resurrect.tmux"
+if diff -q "$outside_root/settings-before.json" "$outside_home/.claude/settings.json" >/dev/null; then
+	pass "Outside HOME: re-running rewrites nothing"
+else
+	fail "Outside HOME: re-running rewrote settings.json"
+fi
+
+rm -rf "$outside_root"
+
+# The isolated runs above repointed the tmux server's @resurrect-hook-* options
+# at the fixture directory; put them back before the remaining suites run.
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
 # --- Test 8: strip_assistant_pane_contents() ---
 
 suite "strip_pane_contents"
