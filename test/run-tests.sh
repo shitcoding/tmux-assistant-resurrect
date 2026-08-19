@@ -2770,24 +2770,36 @@ assert_contains "Portable: migrated hook stores \$HOME literally" "$portable_mig
 # $, backtick, command substitution or double quote in the install path is
 # literal when Claude's shell runs the hook — a naive bash "$HOME/..." form
 # would execute it instead.
+#
+# run_isolated_install() runs a fixture copy of the entry point against its own
+# HOME and its own tmux socket. Without the socket override the fixture would
+# repoint the real server's @resurrect-hook-* options at a directory these
+# tests then delete, and an abort mid-test would leave it that way.
+run_isolated_install() {
+	local iso_home="$1" iso_entry="$2" iso_sock
+	iso_sock=$(mktemp -d)
+	env -u TMUX HOME="$iso_home" TMUX_TMPDIR="$iso_sock" bash "$iso_entry" 2>/dev/null || true
+	rm -rf "$iso_sock"
+}
+
 pwn_marker="/tmp/tar-hook-quoting-pwned-$$"
-rm -f "$pwn_marker"
+meta_root="/tmp/tar-hook-metachar-$$"
 meta_name="meta-\$(touch $pwn_marker)-\"q\"-\`id\`"
-meta_plugin="$HOME/$meta_name/plugin"
-rm -rf "$HOME/$meta_name"
-mkdir -p "$meta_plugin"
+meta_home="$meta_root/home"
+meta_plugin="$meta_home/$meta_name/plugin"
+rm -rf "$meta_root" "$pwn_marker"
+mkdir -p "$meta_plugin" "$meta_home/.claude"
 cp "$REPO_DIR/tmux-assistant-resurrect.tmux" "$meta_plugin/"
 cp -R "$REPO_DIR/hooks" "$meta_plugin/hooks"
-rm -f "$HOME/.claude/settings.json"
-echo '{}' >"$HOME/.claude/settings.json"
+echo '{}' >"$meta_home/.claude/settings.json"
 
-bash "$meta_plugin/tmux-assistant-resurrect.tmux"
+run_isolated_install "$meta_home" "$meta_plugin/tmux-assistant-resurrect.tmux"
 
-meta_cmd=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
+meta_cmd=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$meta_home/.claude/settings.json")
 assert_contains "Metachar: hook still stores \$HOME literally" "$meta_cmd" "\"\$HOME\""
 
 # Expanding it the way the hook shell will must yield the real file, unchanged.
-meta_expanded=$(eval "echo ${meta_cmd#bash }")
+meta_expanded=$(HOME="$meta_home"; eval "echo ${meta_cmd#bash }")
 assert_eq "Metachar: expanded path is the literal install path" \
 	"$meta_plugin/hooks/claude-session-track.sh" "$meta_expanded"
 assert_file_exists "Metachar: expanded path exists" "$meta_expanded"
@@ -2798,18 +2810,15 @@ else
 	pass "Metachar: command substitution in the install path stayed literal"
 fi
 
-rm -rf "$HOME/$meta_name" "$pwn_marker"
-
-# Put settings.json back on the real REPO_DIR path for the tests below.
-bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+rm -rf "$meta_root" "$pwn_marker"
 
 # --- Test 7j: Installs outside $HOME keep the absolute path ---
 #
 # Nix store paths and system-wide installs have no portable prefix to
 # substitute, so they must keep the single-quoted absolute path. REPO_DIR is
 # always under $HOME, so every other test exercises only the $HOME branch and
-# this one would otherwise ship untested. Runs against an isolated HOME and a
-# fixture copy of the plugin so the real settings.json is left alone.
+# this one would otherwise ship untested. Uses run_isolated_install() so the
+# real settings.json and tmux server are left alone.
 
 echo ""
 echo "=== Test 7j: Installs outside \$HOME keep the absolute path ==="
@@ -2831,7 +2840,7 @@ case "$outside_plugin" in
 	*) pass "Outside HOME: fixture plugin is outside the test HOME" ;;
 esac
 
-HOME="$outside_home" bash "$outside_plugin/tmux-assistant-resurrect.tmux"
+run_isolated_install "$outside_home" "$outside_plugin/tmux-assistant-resurrect.tmux"
 
 outside_track=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$outside_home/.claude/settings.json")
 outside_cleanup=$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))][0].command' "$outside_home/.claude/settings.json")
@@ -2851,7 +2860,7 @@ fi
 
 # Re-running must not treat the absolute form as stale and rewrite it.
 cp "$outside_home/.claude/settings.json" "$outside_root/settings-before.json"
-HOME="$outside_home" bash "$outside_plugin/tmux-assistant-resurrect.tmux"
+run_isolated_install "$outside_home" "$outside_plugin/tmux-assistant-resurrect.tmux"
 if diff -q "$outside_root/settings-before.json" "$outside_home/.claude/settings.json" >/dev/null; then
 	pass "Outside HOME: re-running rewrites nothing"
 else
@@ -2859,10 +2868,6 @@ else
 fi
 
 rm -rf "$outside_root"
-
-# The isolated runs above repointed the tmux server's @resurrect-hook-* options
-# at the fixture directory; put them back before the remaining suites run.
-bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
 
 # --- Test 8: strip_assistant_pane_contents() ---
 
