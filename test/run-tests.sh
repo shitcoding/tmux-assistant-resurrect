@@ -5,6 +5,13 @@
 set -euo pipefail
 
 REPO_DIR="$HOME/tmux-assistant-resurrect"
+
+# Paths under $HOME are persisted as bash "$HOME"'/...' so that a settings.json
+# tracked in a dotfiles repo stays identical across machines. Only $HOME is
+# expandable; the rest stays single-quoted and literal
+# (see install_claude_hooks in tmux-assistant-resurrect.tmux).
+HOOK_TRACK_CMD="bash \"\$HOME\"'${REPO_DIR#"$HOME"}/hooks/claude-session-track.sh'"
+HOOK_CLEANUP_CMD="bash \"\$HOME\"'${REPO_DIR#"$HOME"}/hooks/claude-session-cleanup.sh'"
 JUNIT_FILE="${JUNIT_FILE:-/tmp/test-results/junit.xml}"
 echo "Test harness bash: $BASH_VERSION"
 echo "Scripts under test: $(${TEST_BASH:-bash} --version | head -1)"
@@ -2577,7 +2584,7 @@ assert_eq "Stale: exactly 1 SessionStart hook after reinstall" "1" "$stale_start
 
 # The hook must point at the CURRENT path, not the old one
 stale_start_cmd=$(jq -r '.hooks.SessionStart[]?.hooks[]? | select(.command | contains("claude-session-track")) | .command' "$HOME/.claude/settings.json")
-expected_track_cmd="bash '${REPO_DIR}/hooks/claude-session-track.sh'"
+expected_track_cmd="$HOOK_TRACK_CMD"
 assert_eq "Stale: SessionStart hook updated to current path" "$expected_track_cmd" "$stale_start_cmd"
 
 # Same for SessionEnd
@@ -2585,7 +2592,7 @@ stale_end_count=$(jq '[.hooks.SessionEnd[]?.hooks[]? | select(.command | contain
 assert_eq "Stale: exactly 1 SessionEnd hook after reinstall" "1" "$stale_end_count"
 
 stale_end_cmd=$(jq -r '.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup")) | .command' "$HOME/.claude/settings.json")
-expected_cleanup_cmd="bash '${REPO_DIR}/hooks/claude-session-cleanup.sh'"
+expected_cleanup_cmd="$HOOK_CLEANUP_CMD"
 assert_eq "Stale: SessionEnd hook updated to current path" "$expected_cleanup_cmd" "$stale_end_cmd"
 
 # Run again — should be idempotent (still exactly 1)
@@ -2678,8 +2685,8 @@ rm -f "$HOME/.claude/settings.json"
 echo '{}' >"$HOME/.claude/settings.json"
 
 # Inject both the CURRENT path and a STALE path for SessionStart and SessionEnd
-current_track="bash '${REPO_DIR}/hooks/claude-session-track.sh'"
-current_cleanup="bash '${REPO_DIR}/hooks/claude-session-cleanup.sh'"
+current_track="$HOOK_TRACK_CMD"
+current_cleanup="$HOOK_CLEANUP_CMD"
 tmp_dual=$(mktemp)
 jq --arg cur_track "$current_track" --arg stale_track "$stale_track" \
    --arg cur_cleanup "$current_cleanup" --arg stale_cleanup "$stale_cleanup" '
@@ -2713,6 +2720,154 @@ assert_eq "Dual: exactly 1 SessionEnd hook after cleanup" "1" "$dual_end_after"
 
 dual_end_cmd=$(jq -r '.hooks.SessionEnd[]?.hooks[]? | select(.command | contains("claude-session-cleanup")) | .command' "$HOME/.claude/settings.json")
 assert_eq "Dual: surviving SessionEnd hook has current path" "$current_cleanup" "$dual_end_cmd"
+
+# --- Test 7i: Hook paths under $HOME are stored portably ---
+#
+# settings.json is commonly tracked in a dotfiles repo. Writing the expanded
+# install path into it produces a diff containing the local username on every
+# machine, so a plugin path under $HOME must be stored as a literal $HOME.
+
+echo ""
+echo "=== Test 7i: Portable \$HOME hook paths ==="
+echo ""
+
+rm -f "$HOME/.claude/settings.json"
+echo '{}' >"$HOME/.claude/settings.json"
+
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
+portable_track=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
+portable_cleanup=$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))][0].command' "$HOME/.claude/settings.json")
+
+assert_contains "Portable: SessionStart hook stores \$HOME literally" "$portable_track" "\"\$HOME\""
+assert_contains "Portable: SessionEnd hook stores \$HOME literally" "$portable_cleanup" "\"\$HOME\""
+
+if echo "$portable_track" | grep -qF -- "$HOME/"; then
+	fail "Portable: SessionStart hook must not embed the expanded home path"
+else
+	pass "Portable: SessionStart hook has no expanded home path"
+fi
+
+# The stored value must still resolve once the shell expands it at hook time.
+assert_file_exists "Portable: expanded SessionStart path exists" "$(eval "echo ${portable_track#bash }")"
+assert_file_exists "Portable: expanded SessionEnd path exists" "$(eval "echo ${portable_cleanup#bash }")"
+
+# An absolute-path hook written by an older version must migrate in place.
+tmp_portable=$(mktemp)
+jq --arg cmd "bash '$REPO_DIR/hooks/claude-session-track.sh'" '
+    .hooks.SessionStart = [{"matcher": "", "hooks": [{"type": "command", "command": $cmd}]}]
+' "$HOME/.claude/settings.json" >"$tmp_portable" && mv "$tmp_portable" "$HOME/.claude/settings.json"
+
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
+
+portable_migrated_count=$(jq '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))] | length' "$HOME/.claude/settings.json")
+assert_eq "Portable: absolute-path hook migrates without duplicate" "1" "$portable_migrated_count"
+
+portable_migrated=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
+assert_contains "Portable: migrated hook stores \$HOME literally" "$portable_migrated" "\"\$HOME\""
+
+# Only $HOME may be expandable. Everything after it stays single-quoted, so a
+# $, backtick, command substitution or double quote in the install path is
+# literal when Claude's shell runs the hook — a naive bash "$HOME/..." form
+# would execute it instead.
+#
+# run_isolated_install() runs a fixture copy of the entry point against its own
+# HOME and its own tmux socket. Without the socket override the fixture would
+# repoint the real server's @resurrect-hook-* options at a directory these
+# tests then delete, and an abort mid-test would leave it that way.
+run_isolated_install() {
+	local iso_home="$1" iso_entry="$2" iso_sock
+	iso_sock=$(mktemp -d)
+	env -u TMUX HOME="$iso_home" TMUX_TMPDIR="$iso_sock" bash "$iso_entry" 2>/dev/null || true
+	rm -rf "$iso_sock"
+}
+
+pwn_marker="/tmp/tar-hook-quoting-pwned-$$"
+meta_root="/tmp/tar-hook-metachar-$$"
+meta_name="meta-\$(touch $pwn_marker)-\"q\"-\`id\`"
+meta_home="$meta_root/home"
+meta_plugin="$meta_home/$meta_name/plugin"
+rm -rf "$meta_root" "$pwn_marker"
+mkdir -p "$meta_plugin" "$meta_home/.claude"
+cp "$REPO_DIR/tmux-assistant-resurrect.tmux" "$meta_plugin/"
+cp -R "$REPO_DIR/hooks" "$meta_plugin/hooks"
+echo '{}' >"$meta_home/.claude/settings.json"
+
+run_isolated_install "$meta_home" "$meta_plugin/tmux-assistant-resurrect.tmux"
+
+meta_cmd=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$meta_home/.claude/settings.json")
+assert_contains "Metachar: hook still stores \$HOME literally" "$meta_cmd" "\"\$HOME\""
+
+# Expanding it the way the hook shell will must yield the real file, unchanged.
+meta_expanded=$(HOME="$meta_home"; eval "echo ${meta_cmd#bash }")
+assert_eq "Metachar: expanded path is the literal install path" \
+	"$meta_plugin/hooks/claude-session-track.sh" "$meta_expanded"
+assert_file_exists "Metachar: expanded path exists" "$meta_expanded"
+
+if [ -e "$pwn_marker" ]; then
+	fail "Metachar: command substitution in the install path was executed"
+else
+	pass "Metachar: command substitution in the install path stayed literal"
+fi
+
+rm -rf "$meta_root" "$pwn_marker"
+
+# --- Test 7j: Installs outside $HOME keep the absolute path ---
+#
+# Nix store paths and system-wide installs have no portable prefix to
+# substitute, so they must keep the single-quoted absolute path. REPO_DIR is
+# always under $HOME, so every other test exercises only the $HOME branch and
+# this one would otherwise ship untested. Uses run_isolated_install() so the
+# real settings.json and tmux server are left alone.
+
+echo ""
+echo "=== Test 7j: Installs outside \$HOME keep the absolute path ==="
+echo ""
+
+outside_root="/tmp/tar-outside-home-$$"
+outside_home="$outside_root/home"
+outside_plugin="$outside_root/plugin"
+rm -rf "$outside_root"
+mkdir -p "$outside_home/.claude" "$outside_plugin"
+cp "$REPO_DIR/tmux-assistant-resurrect.tmux" "$outside_plugin/"
+cp -R "$REPO_DIR/hooks" "$outside_plugin/hooks"
+echo '{}' >"$outside_home/.claude/settings.json"
+
+# Guard the fixture itself: if TMPDIR ever lands under the test HOME this test
+# would silently assert the wrong branch.
+case "$outside_plugin" in
+	"$outside_home"/*) fail "Outside HOME: fixture plugin must not live under the test HOME" ;;
+	*) pass "Outside HOME: fixture plugin is outside the test HOME" ;;
+esac
+
+run_isolated_install "$outside_home" "$outside_plugin/tmux-assistant-resurrect.tmux"
+
+outside_track=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$outside_home/.claude/settings.json")
+outside_cleanup=$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))][0].command' "$outside_home/.claude/settings.json")
+
+assert_eq "Outside HOME: SessionStart keeps single-quoted absolute path" \
+	"bash '$outside_plugin/hooks/claude-session-track.sh'" "$outside_track"
+assert_eq "Outside HOME: SessionEnd keeps single-quoted absolute path" \
+	"bash '$outside_plugin/hooks/claude-session-cleanup.sh'" "$outside_cleanup"
+
+# A path that cannot be expressed relative to $HOME must not get a literal
+# $HOME anyway — single quotes would leave it unexpanded and the hook dead.
+if echo "$outside_track" | grep -qF -- '$HOME'; then
+	fail "Outside HOME: SessionStart hook must not contain a literal \$HOME"
+else
+	pass "Outside HOME: SessionStart hook has no literal \$HOME"
+fi
+
+# Re-running must not treat the absolute form as stale and rewrite it.
+cp "$outside_home/.claude/settings.json" "$outside_root/settings-before.json"
+run_isolated_install "$outside_home" "$outside_plugin/tmux-assistant-resurrect.tmux"
+if diff -q "$outside_root/settings-before.json" "$outside_home/.claude/settings.json" >/dev/null; then
+	pass "Outside HOME: re-running rewrites nothing"
+else
+	fail "Outside HOME: re-running rewrote settings.json"
+fi
+
+rm -rf "$outside_root"
 
 # --- Test 8: strip_assistant_pane_contents() ---
 

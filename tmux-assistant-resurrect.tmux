@@ -13,8 +13,10 @@
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Limitation: hook commands use single-quoted paths (bash '${CURRENT_DIR}/...').
-# If the plugin install path contains a single quote, the quoting breaks.
+# Limitation: hook commands single-quote the plugin path, so a single quote in
+# the install path breaks them. Claude Code hooks under $HOME are written as
+# bash "$HOME"'/...' -- only $HOME is left expandable, the rest stays inside
+# single quotes -- so the same single limitation applies to both forms.
 # This is unlikely in practice (TPM installs to ~/.tmux/plugins/).
 
 # --- tmux settings ---
@@ -39,8 +41,28 @@ tmux set-option -g @continuum-restore 'on'
 
 install_claude_hooks() {
     local settings="$HOME/.claude/settings.json"
-    local track_cmd="bash '${CURRENT_DIR}/hooks/claude-session-track.sh'"
-    local cleanup_cmd="bash '${CURRENT_DIR}/hooks/claude-session-cleanup.sh'"
+    local hooks_dir="${CURRENT_DIR}/hooks"
+    local track_cmd cleanup_cmd
+
+    # settings.json is a file users commonly track in a dotfiles repo, so the
+    # command we persist must not embed a machine-specific absolute path.
+    # Store it relative to $HOME and let the shell expand it when the hook runs;
+    # that keeps the value byte-identical across machines with different
+    # usernames. Only $HOME sits in double quotes -- the rest of the path stays
+    # single-quoted and adjacent, so the shell concatenates the two without
+    # interpreting a $, backtick or double quote in the install path.
+    # Installs outside $HOME keep the single-quoted absolute path.
+    case "$hooks_dir" in
+        "$HOME"/*)
+            local rel="${hooks_dir#"$HOME"}"
+            track_cmd="bash \"\$HOME\"'${rel}/claude-session-track.sh'"
+            cleanup_cmd="bash \"\$HOME\"'${rel}/claude-session-cleanup.sh'"
+            ;;
+        *)
+            track_cmd="bash '${hooks_dir}/claude-session-track.sh'"
+            cleanup_cmd="bash '${hooks_dir}/claude-session-cleanup.sh'"
+            ;;
+    esac
 
     # Ensure file exists
     if [ ! -f "$settings" ]; then

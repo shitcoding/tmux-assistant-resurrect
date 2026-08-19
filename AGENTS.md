@@ -158,11 +158,25 @@ process args as a reliable fallback.
   on hook entries that lack a `.command` field (e.g., URL-type hooks), and
   `.hooks` is null-coalesced before mapping to handle entries with missing/null
   hooks arrays
+- Hook commands for a plugin installed under `$HOME` are persisted as
+  `bash "$HOME"'/rest/of/path.sh'`, not as the expanded path. `settings.json` is
+  commonly tracked in a dotfiles repo, and an expanded path embeds `$HOME`, which
+  differs across machines -- different usernames, and `/Users` vs `/home` between
+  macOS and Linux -- so the two-phase matching rewrites it on every tmux start.
+  Only `$HOME` sits in double quotes; the remainder is single-quoted and adjacent,
+  so the shell concatenates them and a `$`, backtick, `$(...)` or `"` in the
+  install path stays literal. A naive `bash "$HOME/..."` would execute it.
+  Installs outside `$HOME` (Nix store, system-wide) have no portable prefix and
+  keep the single-quoted absolute path; both forms therefore share exactly one
+  limitation, a single quote in the install path (unlikely with TPM).
+  Substituting only `$HOME` is deliberate -- it is the one
+  variable guaranteed to be set in the hook's environment (Claude Code resolved
+  `~/.claude/settings.json` through it), and a second candidate prefix such as
+  `$XDG_CONFIG_HOME` would make the stored value depend on which machine ran the
+  install, reintroducing the churn
 - Use `posix_quote()` from `lib-detect.sh` for values sent to POSIX-ish/fish
   panes. When the pane shell is known and csh/tcsh is supported, use
   `shell_quote()` so history expansion and embedded quotes remain literal.
-- Hook command paths use single quotes (`bash '${CURRENT_DIR}/hooks/...'`);
-  this breaks if the install path contains a single quote (unlikely with TPM)
 - The sidecar JSON (`assistant-sessions.json`) entries include enriched fields:
   `model` (from state file or `--model` in args), `cli_args` (from `ps` args
   with binary name and session/resume args stripped), `env` (from state file),
