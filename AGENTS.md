@@ -158,16 +158,18 @@ process args as a reliable fallback.
   on hook entries that lack a `.command` field (e.g., URL-type hooks), and
   `.hooks` is null-coalesced before mapping to handle entries with missing/null
   hooks arrays
-- Hook commands for a plugin installed under `$HOME` are persisted as a literal
-  `bash "$HOME/..."` (double-quoted so the shell expands it at hook time), not as
-  the expanded path. `settings.json` is commonly tracked in a dotfiles repo, and
-  an expanded path embeds `$HOME`, which differs across machines -- different
-  usernames, and `/Users` vs `/home` between macOS and Linux -- so the two-phase
-  matching rewrites it on every tmux start. Installs outside `$HOME` (Nix store,
-  system-wide) have no portable prefix and keep the single-quoted absolute path.
-  Both forms break on exotic install paths: a single quote breaks the absolute
-  form, and a double quote, backtick, `\` or `$` breaks the `$HOME` form
-  (unlikely with TPM). Substituting only `$HOME` is deliberate -- it is the one
+- Hook commands for a plugin installed under `$HOME` are persisted as
+  `bash "$HOME"'/rest/of/path.sh'`, not as the expanded path. `settings.json` is
+  commonly tracked in a dotfiles repo, and an expanded path embeds `$HOME`, which
+  differs across machines -- different usernames, and `/Users` vs `/home` between
+  macOS and Linux -- so the two-phase matching rewrites it on every tmux start.
+  Only `$HOME` sits in double quotes; the remainder is single-quoted and adjacent,
+  so the shell concatenates them and a `$`, backtick, `$(...)` or `"` in the
+  install path stays literal. A naive `bash "$HOME/..."` would execute it.
+  Installs outside `$HOME` (Nix store, system-wide) have no portable prefix and
+  keep the single-quoted absolute path; both forms therefore share exactly one
+  limitation, a single quote in the install path (unlikely with TPM).
+  Substituting only `$HOME` is deliberate -- it is the one
   variable guaranteed to be set in the hook's environment (Claude Code resolved
   `~/.claude/settings.json` through it), and a second candidate prefix such as
   `$XDG_CONFIG_HOME` would make the stored value depend on which machine ran the

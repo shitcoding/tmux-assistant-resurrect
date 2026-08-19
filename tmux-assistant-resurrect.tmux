@@ -13,11 +13,10 @@
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Limitation: hook commands quote the plugin path. Claude Code hooks under
-# $HOME are written as bash "$HOME/..." (double quotes, so $HOME expands at run
-# time and the stored value stays portable); everything else stays single-quoted
-# as bash '${CURRENT_DIR}/...'. A single quote in the install path breaks the
-# latter, and a double quote, backtick or $ breaks the former.
+# Limitation: hook commands single-quote the plugin path, so a single quote in
+# the install path breaks them. Claude Code hooks under $HOME are written as
+# bash "$HOME"'/...' -- only $HOME is left expandable, the rest stays inside
+# single quotes -- so the same single limitation applies to both forms.
 # This is unlikely in practice (TPM installs to ~/.tmux/plugins/).
 
 # --- tmux settings ---
@@ -49,13 +48,15 @@ install_claude_hooks() {
     # command we persist must not embed a machine-specific absolute path.
     # Store it relative to $HOME and let the shell expand it when the hook runs;
     # that keeps the value byte-identical across machines with different
-    # usernames. Requires double quotes, since $HOME does not expand in single
-    # quotes. Installs outside $HOME keep the single-quoted absolute path.
+    # usernames. Only $HOME sits in double quotes -- the rest of the path stays
+    # single-quoted and adjacent, so the shell concatenates the two without
+    # interpreting a $, backtick or double quote in the install path.
+    # Installs outside $HOME keep the single-quoted absolute path.
     case "$hooks_dir" in
         "$HOME"/*)
-            local rel="\$HOME${hooks_dir#"$HOME"}"
-            track_cmd="bash \"${rel}/claude-session-track.sh\""
-            cleanup_cmd="bash \"${rel}/claude-session-cleanup.sh\""
+            local rel="${hooks_dir#"$HOME"}"
+            track_cmd="bash \"\$HOME\"'${rel}/claude-session-track.sh'"
+            cleanup_cmd="bash \"\$HOME\"'${rel}/claude-session-cleanup.sh'"
             ;;
         *)
             track_cmd="bash '${hooks_dir}/claude-session-track.sh'"

@@ -6,11 +6,12 @@ set -euo pipefail
 
 REPO_DIR="$HOME/tmux-assistant-resurrect"
 
-# Paths under $HOME are persisted as a literal "$HOME/..." so that a
-# settings.json tracked in a dotfiles repo stays identical across machines
+# Paths under $HOME are persisted as bash "$HOME"'/...' so that a settings.json
+# tracked in a dotfiles repo stays identical across machines. Only $HOME is
+# expandable; the rest stays single-quoted and literal
 # (see install_claude_hooks in tmux-assistant-resurrect.tmux).
-HOOK_TRACK_CMD="bash \"\$HOME${REPO_DIR#"$HOME"}/hooks/claude-session-track.sh\""
-HOOK_CLEANUP_CMD="bash \"\$HOME${REPO_DIR#"$HOME"}/hooks/claude-session-cleanup.sh\""
+HOOK_TRACK_CMD="bash \"\$HOME\"'${REPO_DIR#"$HOME"}/hooks/claude-session-track.sh'"
+HOOK_CLEANUP_CMD="bash \"\$HOME\"'${REPO_DIR#"$HOME"}/hooks/claude-session-cleanup.sh'"
 JUNIT_FILE="${JUNIT_FILE:-/tmp/test-results/junit.xml}"
 echo "Test harness bash: $BASH_VERSION"
 echo "Scripts under test: $(${TEST_BASH:-bash} --version | head -1)"
@@ -2738,8 +2739,8 @@ bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
 portable_track=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
 portable_cleanup=$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))][0].command' "$HOME/.claude/settings.json")
 
-assert_contains "Portable: SessionStart hook stores \$HOME literally" "$portable_track" '"$HOME/'
-assert_contains "Portable: SessionEnd hook stores \$HOME literally" "$portable_cleanup" '"$HOME/'
+assert_contains "Portable: SessionStart hook stores \$HOME literally" "$portable_track" "\"\$HOME\""
+assert_contains "Portable: SessionEnd hook stores \$HOME literally" "$portable_cleanup" "\"\$HOME\""
 
 if echo "$portable_track" | grep -qF -- "$HOME/"; then
 	fail "Portable: SessionStart hook must not embed the expanded home path"
@@ -2763,7 +2764,44 @@ portable_migrated_count=$(jq '[.hooks.SessionStart[]?.hooks[]? | select((.comman
 assert_eq "Portable: absolute-path hook migrates without duplicate" "1" "$portable_migrated_count"
 
 portable_migrated=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
-assert_contains "Portable: migrated hook stores \$HOME literally" "$portable_migrated" '"$HOME/'
+assert_contains "Portable: migrated hook stores \$HOME literally" "$portable_migrated" "\"\$HOME\""
+
+# Only $HOME may be expandable. Everything after it stays single-quoted, so a
+# $, backtick, command substitution or double quote in the install path is
+# literal when Claude's shell runs the hook — a naive bash "$HOME/..." form
+# would execute it instead.
+pwn_marker="/tmp/tar-hook-quoting-pwned-$$"
+rm -f "$pwn_marker"
+meta_name="meta-\$(touch $pwn_marker)-\"q\"-\`id\`"
+meta_plugin="$HOME/$meta_name/plugin"
+rm -rf "$HOME/$meta_name"
+mkdir -p "$meta_plugin"
+cp "$REPO_DIR/tmux-assistant-resurrect.tmux" "$meta_plugin/"
+cp -R "$REPO_DIR/hooks" "$meta_plugin/hooks"
+rm -f "$HOME/.claude/settings.json"
+echo '{}' >"$HOME/.claude/settings.json"
+
+bash "$meta_plugin/tmux-assistant-resurrect.tmux"
+
+meta_cmd=$(jq -r '[.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))][0].command' "$HOME/.claude/settings.json")
+assert_contains "Metachar: hook still stores \$HOME literally" "$meta_cmd" "\"\$HOME\""
+
+# Expanding it the way the hook shell will must yield the real file, unchanged.
+meta_expanded=$(eval "echo ${meta_cmd#bash }")
+assert_eq "Metachar: expanded path is the literal install path" \
+	"$meta_plugin/hooks/claude-session-track.sh" "$meta_expanded"
+assert_file_exists "Metachar: expanded path exists" "$meta_expanded"
+
+if [ -e "$pwn_marker" ]; then
+	fail "Metachar: command substitution in the install path was executed"
+else
+	pass "Metachar: command substitution in the install path stayed literal"
+fi
+
+rm -rf "$HOME/$meta_name" "$pwn_marker"
+
+# Put settings.json back on the real REPO_DIR path for the tests below.
+bash "$REPO_DIR/tmux-assistant-resurrect.tmux"
 
 # --- Test 7j: Installs outside $HOME keep the absolute path ---
 #
