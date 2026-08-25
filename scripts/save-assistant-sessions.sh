@@ -1584,6 +1584,11 @@ resolve_pane_candidates() {
 	local has_assoc_cache="$6"
 	local state_cache_file="$7"
 	local parts_file="$8"
+	# The parts pane_target is composed from. Saved separately so restore never
+	# has to parse a target whose session name may itself contain ':' or '.'.
+	local pane_session="${9:-}"
+	local pane_window="${10:-}"
+	local pane_pane_index="${11:-}"
 
 	local resolved=0 first_tool="" first_pid=""
 	for pass in 1 2; do
@@ -1668,8 +1673,10 @@ resolve_pane_candidates() {
 				fi
 
 				# Write TSV for batch JSON conversion (replaces per-entry jq -n).
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" >>"$parts_file"
+				# New columns are appended so the existing indices stay put.
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" \
+					"$pane_session" "$pane_window" "$pane_pane_index" >>"$parts_file"
 
 				case "$cand_tool" in
 				codex) register_codex_session_id "$session_id" ;;
@@ -1860,25 +1867,81 @@ main() {
 		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE"
 		return 1
 	fi
-	tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_path}|#{pane_tty}" >"$PANE_FILE"
+	# Two tagged records per pane, both ending in the one field that may itself
+	# contain the '|' delimiter (the session name / the pane path). Everything
+	# before it is '|'-free — a pane id, a pid, numeric indices, a /dev/... tty —
+	# so awk can peel those off the front by position and take the rest verbatim.
+	# Emitting the two free-form fields on separate records is what keeps them
+	# from shifting each other.
+	#
+	# A control-character delimiter would be simpler but is not portable: tmux
+	# < 3.7 rewrites those in -F output, and differently per version (3.4 emits
+	# the octal escape, 3.5 the hex escape, 3.6 an underscore).
+	#
+	# The records join on #{pane_id}, not #{pane_pid}: it is '%' plus digits (so
+	# still delimiter-free), and tmux never reuses one within a server, whereas
+	# the kernel can hand a dead pane's pid to a new one between the two calls
+	# and silently pair one pane's metadata with another's cwd.
+	#
+	# The calls are a moment apart either way. A pane that dies in between has a
+	# P record but no C record, so it saves with an empty cwd; one created in
+	# between has a C record but no P record, so it is not saved at all. Both are
+	# bounded and self-correcting on the next save — restore skips the `cd` in
+	# the first case, and the pane had no assistant to save in the second.
+	{
+		tmux list-panes -a -F "P|#{pane_id}|#{pane_pid}|#{window_index}|#{pane_index}|#{pane_tty}|#{session_name}"
+		tmux list-panes -a -F "C|#{pane_id}|#{pane_current_path}"
+	} >"$PANE_FILE"
 
 	# --- Single awk pass: detect assistant tools across ALL pane process trees ---
 	# Replaces ~200 separate echo|awk pipe invocations with one pass.
 	# Reads pane list + ps snapshot, builds process tree in memory,
 	# BFS-walks descendants for each pane PID, detects tools.
-	# Output (tab-delimited): target\ttool\ttool_pid\ttool_args\tcwd\tpane_tty
+	# Output (tab-delimited):
+	#   target\ttool\ttool_pid\ttool_args\tcwd\tpane_tty\tsession\twindow\tindex
+	# The session/window/index columns are appended rather than inserted so that
+	# `cut -f2` in _warm_session_discovery() still selects the tool.
 	# NOTE: emit all candidates per pane (pane PID + descendants) in BFS order.
 	# The shell pass below preserves legacy two-pass OpenCode behavior:
 	# 1) PID-specific only, then 2) DB fallback.
 	local MATCHES
 	MATCHES=$(awk '
+		# Peel one delimiter-free field off the front of rec (a global),
+		# leaving the remainder in rec. Returns "" once rec has no delimiter
+		# left. NOTE: this program is single-quoted in the shell -- no
+		# apostrophes anywhere inside it.
+		function peel(   i, field) {
+			i = index(rec, "|")
+			if (i == 0) return ""
+			field = substr(rec, 1, i - 1)
+			rec = substr(rec, i + 1)
+			return field
+		}
 		NR == FNR {
-			# First file: pane data (pipe-delimited)
-			split($0, p, "|")
-			pane_target[p[2]] = p[1]
-			pane_cwd[p[2]] = p[3]
-			pane_tty[p[2]] = p[4]
-			pane_list[++pane_count] = p[2]
+			# First file: pane data, two record types keyed by pane id (see the
+			# -F strings above):
+			#   P|pane_id|pane_pid|window_index|pane_index|pane_tty|session_name
+			#   C|pane_id|pane_current_path
+			# Both end in a field that may contain the delimiter itself, so
+			# peel the fixed-shape fields and keep the rest of the line verbatim.
+			rec = $0
+			tag = peel()
+			key = peel()
+			if (tag == "" || key == "") next
+			if (tag == "C") { pane_cwd[key] = rec; next }
+			if (tag != "P") next
+			pid = peel()
+			win = peel()
+			idx = peel()
+			tty = peel()
+			if (pid == "" || tty == "") next
+			pane_pid[key] = pid
+			pane_session[key] = rec
+			pane_window[key] = win
+			pane_index[key] = idx
+			pane_target[key] = rec ":" win "." idx
+			pane_tty[key] = tty
+			pane_list[++pane_count] = key
 			next
 		}
 		{
@@ -1908,14 +1971,19 @@ main() {
 		}
 		END {
 			for (i = 1; i <= pane_count; i++) {
-				root = pane_list[i]+0
-				target = pane_target[pane_list[i]]
-				cwd = pane_cwd[pane_list[i]]
-				tty = pane_tty[pane_list[i]]
+				# pane_list holds pane ids; the BFS below roots at the pid.
+				key = pane_list[i]
+				root = pane_pid[key]+0
+				target = pane_target[key]
+				cwd = pane_cwd[key]
+				tty = pane_tty[key]
+				sess = pane_session[key]
+				win = pane_window[key]
+				idx = pane_index[key]
 
 				# Check pane PID itself (handles exec-replaced shells)
 				if (root in proc_tool && proc_tool[root] != "") {
-					printf "%s\t%s\t%d\t%s\t%s\t%s\n", target, proc_tool[root], root, proc_args[root], cwd, tty
+					printf "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", target, proc_tool[root], root, proc_args[root], cwd, tty, sess, win, idx
 				}
 
 				# BFS through descendant processes
@@ -1932,7 +2000,7 @@ main() {
 				while (qs <= qe) {
 					cur = queue[qs++]+0
 					if (cur in proc_tool && proc_tool[cur] != "") {
-						printf "%s\t%s\t%d\t%s\t%s\t%s\n", target, proc_tool[cur], cur, proc_args[cur], cwd, tty
+						printf "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", target, proc_tool[cur], cur, proc_args[cur], cwd, tty, sess, win, idx
 					}
 					if (cur in child_list) {
 						nc = split(child_list[cur], kids, SUBSEP)
@@ -2004,18 +2072,22 @@ main() {
 	# Process only matched panes (those with a detected tool)
 	if [ -n "$MATCHES" ]; then
 		local current_target="" current_cwd="" current_tty="" pane_candidates=""
-		while IFS=$'\t' read -r target tool cpid cargs cwd tty; do
+		local current_sess="" current_win="" current_idx=""
+		while IFS=$'\t' read -r target tool cpid cargs cwd tty sess win idx; do
 			[ -z "$target" ] && continue
 
 			# If pane changed, process the previous pane's candidate list.
 			if [ -n "$current_target" ] && [ "$target" != "$current_target" ]; then
-				resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
+				resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx"
 				pane_candidates=""
 			fi
 
 			current_target="$target"
 			current_cwd="$cwd"
 			current_tty="$tty"
+			current_sess="$sess"
+			current_win="$win"
+			current_idx="$idx"
 			# Candidate tuples are US-delimited; a literal \x1f inside process args
 			# would break parsing, but this is practically unlikely for CLI argv.
 			pane_candidates="${pane_candidates}${tool}${US}${cpid}${US}${cargs}"$'\n'
@@ -2023,7 +2095,7 @@ main() {
 
 		# Process final pane candidate list.
 		if [ -n "$current_target" ] && [ -n "$pane_candidates" ]; then
-			resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE"
+			resolve_pane_candidates "$current_target" "$current_cwd" "$current_tty" "$pane_candidates" "$US" "$HAS_ASSOC_CACHE" "$STATE_CACHE_FILE" "$PARTS_FILE" "$current_sess" "$current_win" "$current_idx"
 		fi
 	fi
 
@@ -2037,7 +2109,8 @@ main() {
 		if jq -Rs --arg ts "$SAVE_TS" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
-			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // "")})
+			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // ""),
+			 session_name:(.[9] // ""), window_index:(.[10] // ""), pane_index:(.[11] // "")})
 			| {timestamp: $ts, sessions: .}
 		' "$PARTS_FILE" >"$OUTPUT_TMP"; then
 			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
@@ -2168,6 +2241,11 @@ emit_session() {
 			model=$(echo "$cargs" | sed -n 's/.*--model[= ] *\([^ ]*\).*/\1/p')
 		fi
 
+		# This shim only receives the composed target, so recover the parts from
+		# it. Splitting from the right is exact — see split_pane_target().
+		PANE_TARGET_SESSION="" PANE_TARGET_WINDOW="" PANE_TARGET_INDEX=""
+		split_pane_target "$target" || true
+
 		jq -n \
 			--arg pane "$target" \
 			--arg tool "$tool" \
@@ -2177,8 +2255,11 @@ emit_session() {
 			--arg model "$model" \
 			--arg cli_args "$cli_args" \
 			--arg copilot_home "$copilot_home" \
+			--arg session_name "$PANE_TARGET_SESSION" \
+			--arg window_index "$PANE_TARGET_WINDOW" \
+			--arg pane_index "$PANE_TARGET_INDEX" \
 			--argjson env "${env_json:-null}" \
-			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env, copilot_home: $copilot_home}' >>"$PARTS_FILE"
+			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env, copilot_home: $copilot_home, session_name: $session_name, window_index: $window_index, pane_index: $pane_index}' >>"$PARTS_FILE"
 		case "$tool" in
 		codex) register_codex_session_id "$session_id" ;;
 		pi) register_pi_session_id "$session_id" ;;

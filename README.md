@@ -74,7 +74,7 @@ version-resilient session ID extraction even when the plugin hasn't fired.
 
 ## Prerequisites
 
-- [tmux](https://github.com/tmux/tmux) (tested with 3.x)
+- [tmux](https://github.com/tmux/tmux) (tested with 3.4 through 3.7)
 - [TPM](https://github.com/tmux-plugins/tpm) (Tmux Plugin Manager)
 - [jq](https://jqlang.github.io/jq/) (used by save/restore scripts)
 - At least one of: Claude Code, GitHub Copilot CLI, OpenCode, Codex CLI, Pi,
@@ -271,6 +271,9 @@ Example output:
   "sessions": [
     {
       "pane": "my-project:0.0",
+      "session_name": "my-project",
+      "window_index": "0",
+      "pane_index": "0",
       "tool": "claude",
       "session_id": "01abc...",
       "cwd": "/home/user/src/my-project",
@@ -281,6 +284,9 @@ Example output:
     },
     {
       "pane": "other-project:0.0",
+      "session_name": "other-project",
+      "window_index": "0",
+      "pane_index": "0",
       "tool": "opencode",
       "session_id": "ses_xyz...",
       "cwd": "/home/user/src/other-project",
@@ -292,6 +298,14 @@ Example output:
   ]
 }
 ```
+
+`session_name`, `window_index` and `pane_index` are the pane's address as three
+separate values; `pane` is the same address joined into tmux's usual
+`session:window.pane` display form. The joined form is kept because
+tmux-resurrect's `pane_contents.tar.gz` names its members after it, but it is
+not a usable tmux target — session names may contain `:` and `.`, which the
+target grammar reserves. Restore matches the three parts against
+`tmux list-panes` and works from the pane id it gets back.
 
 #### 4. Kill tmux (simulate a reboot)
 
@@ -671,8 +685,19 @@ fields are missing (old-format JSON), falls back to bare resume commands.
 - **Process inspection on macOS**: Uses `ps -eo pid=,ppid=` instead of `pgrep -P`
   due to reliability issues with `pgrep` on macOS.
 - **Pane matching after restore**: tmux-resurrect preserves pane indices, so the
-  restore hook targets the same `session:window.pane` addresses. If you manually
-  rearrange panes between save and restore, the mapping may be wrong.
+  restore hook looks for the same session name, window index and pane index. It
+  matches those three values literally against `tmux list-panes` output rather
+  than handing tmux the `session:window.pane` string, because tmux's target
+  grammar reserves `:` and `.` and also prefix-matches session names — a pane in
+  a session called `v1.2` or `https://host/repo` would otherwise be skipped or
+  resolved against a different session. The pane id that lookup returns is what
+  every subsequent tmux command targets. If you manually rearrange panes between
+  save and restore, the mapping may be wrong.
+- **Session names containing a newline or tab**: not supported. tmux itself
+  rejects both, so they cannot occur. Every other character — including `:`,
+  `.` and `|` — round-trips. Note that tmux before 3.7 silently rewrote `:` and
+  `.` in session names to `_`, so names that survive on 3.7 change shape on
+  older versions; the sidecar records whatever tmux reports.
 
 ## License
 

@@ -385,6 +385,15 @@ test:
 test-grok:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/test/grok-unit-tests.sh"
 
+# Run hermetic saved-pane target resolution tests (no Docker / no tmux needed)
+test-targets:
+    @"${TEST_BASH:-bash}" "{{repo_dir}}/test/target-resolution-unit-tests.sh"
+
+# Assert tmux's session-name and target-grammar behaviour against a real tmux.
+# Runs on its own socket; skips without tmux or below tmux 3.7.
+test-tmux-contract:
+    @"${TEST_BASH:-bash}" "{{repo_dir}}/test/tmux-target-contract-test.sh"
+
 # Run hermetic Copilot session-discovery tests (no binary or login required)
 test-copilot:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/test/copilot-unit-tests.sh"

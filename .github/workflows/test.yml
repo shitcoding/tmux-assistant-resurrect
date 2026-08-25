@@ -79,6 +79,14 @@ jobs:
         run: |
           bash test/copilot-unit-tests.sh
           bash test/grok-unit-tests.sh
+          bash test/target-resolution-unit-tests.sh
+
+      # The only tmux >= 3.7 in CI. Below 3.7 tmux rewrites ':' and '.' in
+      # session names to '_', so the Docker suites (tmux 3.4) cannot reach the
+      # target-grammar cases from issue #66 at all — they skip with a notice.
+      # This is where that behaviour is actually exercised against a real tmux.
+      - name: tmux target contract (real tmux)
+        run: bash test/tmux-target-contract-test.sh
 
       # Real binary, no authentication: Copilot writes the session directory and
       # its lock before the auth check, which is what this pins.
@@ -103,6 +111,7 @@ jobs:
         run: |
           bash test/copilot-unit-tests.sh
           bash test/grok-unit-tests.sh
+          bash test/target-resolution-unit-tests.sh
 
   benchmark:
     runs-on: ubuntu-latest

@@ -7,7 +7,8 @@
 
 set -euo pipefail
 
-# Source shared detection library (detect_tool, pane_has_assistant, posix_quote)
+# Source shared library (detect_tool, pane_has_assistant, posix_quote,
+# split_pane_target, resolve_tmux_pane_id)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-detect.sh
 source "$SCRIPT_DIR/lib-detect.sh"
@@ -64,16 +65,33 @@ while read -r entry; do
 	env_json=$(echo "$entry" | jq -c '.env // {}')
 	copilot_home=$(echo "$entry" | jq -r '.copilot_home // empty')
 
-	# Check if the target pane's session exists
-	tmux_session="${pane%%:*}"
-	if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
-		log "session '$tmux_session' does not exist, skipping pane $pane"
-		continue
+	# Resolve the saved pane to a live tmux pane id (%N), which every tmux
+	# command below then targets. The saved "session:window.pane" string is a
+	# display label, NOT a usable tmux target: session names may contain ':'
+	# and '.' (tmux 3.7+ keeps them; 3.4-3.6 rewrote them to '_'), and both are
+	# reserved by the target grammar. See resolve_tmux_pane_id() in
+	# lib-detect.sh for why neither `-t name` nor `-t =name` can be trusted.
+	#
+	# Prefer the saved components; fall back to splitting the label for
+	# sidecars written before those fields existed (the file is a cache
+	# regenerated on every save, so the only path that hits this is
+	# save -> upgrade -> restore).
+	tmux_session=$(echo "$entry" | jq -r '.session_name // empty')
+	window_index=$(echo "$entry" | jq -r '.window_index // empty')
+	pane_index=$(echo "$entry" | jq -r '.pane_index // empty')
+	if [ -z "$tmux_session" ] || [ -z "$window_index" ] || [ -z "$pane_index" ]; then
+		if ! split_pane_target "$pane"; then
+			log "malformed pane target '$pane', skipping"
+			continue
+		fi
+		tmux_session="$PANE_TARGET_SESSION"
+		window_index="$PANE_TARGET_WINDOW"
+		pane_index="$PANE_TARGET_INDEX"
 	fi
 
-	# Check if the specific pane exists
-	if ! tmux list-panes -t "$pane" >/dev/null 2>&1; then
-		log "pane $pane does not exist, skipping"
+	pane_id=$(resolve_tmux_pane_id "$tmux_session" "$window_index" "$pane_index" || true)
+	if [ -z "$pane_id" ]; then
+		log "pane $pane does not exist (session '$tmux_session', window $window_index, pane $pane_index), skipping"
 		continue
 	fi
 
@@ -93,8 +111,11 @@ while read -r entry; do
 	# if the user never attaches a client. In normal boot flows where a
 	# kitty/wezterm/etc auto-attaches via `tmux new-session -A`, the wait
 	# resolves in < 200ms.
+	#
+	# `list-clients` takes a session target, and the session name cannot be one
+	# (see above) — but a pane id resolves to its own session, so target that.
 	client_wait=0
-	while [ "$(tmux list-clients -t "$tmux_session" 2>/dev/null | wc -l)" -eq 0 ] && [ $client_wait -lt 50 ]; do
+	while [ "$(tmux list-clients -t "$pane_id" 2>/dev/null | wc -l)" -eq 0 ] && [ $client_wait -lt 50 ]; do
 		sleep 0.1
 		client_wait=$((client_wait + 1))
 	done
@@ -107,7 +128,7 @@ while read -r entry; do
 	# etc.). If something else is running (e.g., the user manually started vim,
 	# or @resurrect-processes restored a non-assistant program), injecting
 	# send-keys would feed commands into the wrong program.
-	pane_cmd=$(tmux display-message -t "$pane" -p '#{pane_current_command}' 2>/dev/null || true)
+	pane_cmd=$(tmux display-message -t "$pane_id" -p '#{pane_current_command}' 2>/dev/null || true)
 	# Strip leading '-' from login shells (e.g., -bash -> bash, -zsh -> zsh)
 	pane_cmd="${pane_cmd#-}"
 	case "$pane_cmd" in
@@ -123,7 +144,7 @@ while read -r entry; do
 	# Uses the same full tree walk + detect_tool() as the save script to
 	# catch exec-replaced shells, wrappers (npx, env, direnv), and deep
 	# process chains.
-	pane_shell_pid=$(tmux display-message -t "$pane" -p '#{pane_pid}' 2>/dev/null || true)
+	pane_shell_pid=$(tmux display-message -t "$pane_id" -p '#{pane_pid}' 2>/dev/null || true)
 	if [ -n "$pane_shell_pid" ]; then
 		existing=$(pane_has_assistant "$pane_shell_pid" || true)
 		if [ -n "$existing" ]; then
@@ -255,17 +276,17 @@ while read -r entry; do
 	# clearing, TUI tools like Claude show stale output above the new instance.
 	# Uses tmux clear-history to wipe scrollback, then sends 'clear' to reset
 	# the visible area.
-	tmux send-keys -t "$pane" "clear" Enter
-	tmux clear-history -t "$pane"
+	tmux send-keys -t "$pane_id" "clear" Enter
+	tmux clear-history -t "$pane_id"
 	sleep 0.3
 
 	# Build the full command: cd to cwd (if it exists) then resume.
 	# Use POSIX single-quote escaping (safe for bash, zsh, sh, dash, fish).
 	if [ -n "$cwd" ] && [ "$cwd" != "null" ]; then
 		safe_cwd=$(posix_quote "$cwd")
-		tmux send-keys -t "$pane" "cd ${safe_cwd} 2>/dev/null; ${resume_cmd}" Enter
+		tmux send-keys -t "$pane_id" "cd ${safe_cwd} 2>/dev/null; ${resume_cmd}" Enter
 	else
-		tmux send-keys -t "$pane" "${resume_cmd}" Enter
+		tmux send-keys -t "$pane_id" "${resume_cmd}" Enter
 	fi
 
 	restored=$((restored + 1))
