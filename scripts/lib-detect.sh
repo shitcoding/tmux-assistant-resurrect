@@ -5,6 +5,9 @@
 # Provides:
 #   detect_tool <args>           — returns tool name or empty string
 #   pane_has_assistant <pane_pid> [ps_snapshot] — returns 0 + prints PID if found
+#   split_pane_target <target>   — splits "session:window.pane" into its parts
+#   match_pane_id <s> <w> <p>    — filters a pane table on stdin to one pane id
+#   resolve_tmux_pane_id <s> <w> <p> — prints the live %N for a saved pane
 #   resurrect_data_dir           — prints tmux-resurrect's save directory
 
 # --- detect_tool ---
@@ -90,6 +93,80 @@ pane_has_assistant() {
 	fi
 
 	return 1
+}
+
+# --- split_pane_target ---
+# Split a saved "session:window.pane" target into its parts, setting
+# PANE_TARGET_SESSION, PANE_TARGET_WINDOW and PANE_TARGET_INDEX.
+# Returns 1 (leaving the variables untouched) if the target is not that shape.
+#
+# Splitting from the RIGHT is exact: the window and pane parts are always
+# indices, so the LAST ':' and the LAST '.' are the real separators. Splitting
+# from the left is not exact — tmux allows both characters in a session name, so
+# "${target%%:*}" turns "https://host/x:0.0" into "https".
+# shellcheck disable=SC2034  # PANE_TARGET_* are out-parameters, read by callers
+split_pane_target() {
+	local target="$1" win_pane
+	case "$target" in
+	*:*.*) ;;
+	*) return 1 ;;
+	esac
+	win_pane="${target##*:}"
+	PANE_TARGET_SESSION="${target%:*}"
+	PANE_TARGET_WINDOW="${win_pane%.*}"
+	PANE_TARGET_INDEX="${win_pane##*.}"
+}
+
+# --- match_pane_id ---
+# Read a "#{pane_id}|#{window_index}|#{pane_index}|#{session_name}" table on
+# stdin and print the pane id whose fields equal <session> <window> <index>.
+# Prints nothing when there is no match. Split out from resolve_tmux_pane_id()
+# so the matching can be tested without a tmux server.
+#
+# The session name is last because it is the only field that may contain the '|'
+# delimiter: awk peels the fixed-shape fields off the front and takes the
+# remainder verbatim. A control-character delimiter would avoid the problem but
+# is not portable — tmux < 3.7 rewrites those in -F output, differently per
+# version (see AGENTS.md "Pipe delimiter in tmux format output").
+#
+# The values are passed through the environment rather than `awk -v`, which
+# expands backslash escapes and would corrupt a name containing a backslash.
+match_pane_id() {
+	TAR_SESSION="$1" TAR_WINDOW="$2" TAR_INDEX="$3" awk '
+		BEGIN { s = ENVIRON["TAR_SESSION"]; w = ENVIRON["TAR_WINDOW"]; p = ENVIRON["TAR_INDEX"] }
+		{
+			rec = $0
+			i = index(rec, "|"); if (i == 0) next
+			id  = substr(rec, 1, i - 1); rec = substr(rec, i + 1)
+			i = index(rec, "|"); if (i == 0) next
+			win = substr(rec, 1, i - 1); rec = substr(rec, i + 1)
+			i = index(rec, "|"); if (i == 0) next
+			idx = substr(rec, 1, i - 1); rec = substr(rec, i + 1)
+			if (found == "" && rec == s && win == w && idx == p) { found = id }
+		}
+		END { if (found != "") print found }
+	'
+}
+
+# --- resolve_tmux_pane_id ---
+# Print the live pane id (%N) of the pane identified by <session> <window>
+# <index>, or nothing if no such pane exists on this server.
+#
+# Why not just hand tmux the "session:window.pane" string? Because tmux's target
+# grammar reserves ':' and '.' but session names may contain them, and tmux also
+# prefix-matches session names. A session named "v1.2" makes
+# `has-session -t v1.2` fail with "can't find pane: 2"; a session named
+# "https://host/x" makes it succeed against a *different* session. `-t '=name'`
+# does not help either — the grammar splits before the exact match is applied.
+# Comparing the parts literally against list-panes output sidesteps the grammar
+# entirely, and the %N it yields is accepted verbatim by every tmux command.
+#
+# Pane ids are only unique within one tmux server lifetime — the exact boundary
+# this plugin operates across — so they are resolved here at restore time and
+# never persisted.
+resolve_tmux_pane_id() {
+	tmux list-panes -a -F '#{pane_id}|#{window_index}|#{pane_index}|#{session_name}' 2>/dev/null |
+		match_pane_id "$1" "$2" "$3"
 }
 
 # --- posix_quote ---

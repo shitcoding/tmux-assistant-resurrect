@@ -258,6 +258,44 @@ else
 	fail "Copilot upstream contract suite"
 fi
 
+# --- Saved-pane target resolution (issue #66) ---
+#
+# Run here as well as on the macOS/Windows CI jobs because this is the only
+# place the suites meet bash 3.2 (the TEST_BASH matrix leg). The hermetic one
+# fabricates its pane table, so it covers ':' and '.' names that this image's
+# tmux 3.4 would rewrite; the contract one needs tmux >= 3.7 and says so before
+# skipping, so it is a no-op here until the base image moves.
+
+suite "target_resolution"
+echo ""
+echo "=== Saved-pane target resolution ==="
+echo ""
+
+target_unit_output=""
+if target_unit_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/target-resolution-unit-tests.sh" 2>&1); then
+	echo "$target_unit_output"
+	pass "Target resolution unit suite"
+else
+	echo "$target_unit_output"
+	fail "Target resolution unit suite"
+fi
+
+target_contract_output=""
+if target_contract_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/tmux-target-contract-test.sh" 2>&1); then
+	echo "$target_contract_output"
+	# Distinguish "asserted" from "declined to assert" — on this image's tmux
+	# 3.4 the suite exits 0 without running, and a bare PASS would read as
+	# coverage that is not there.
+	if echo "$target_contract_output" | grep -q '^SKIP:'; then
+		pass "tmux target contract suite (skipped, see notice above)"
+	else
+		pass "tmux target contract suite"
+	fi
+else
+	echo "$target_contract_output"
+	fail "tmux target contract suite"
+fi
+
 # --- Test 1: Installation ---
 
 suite "install"
@@ -4062,6 +4100,201 @@ assert_contains "Bracket model: model name quoted" "$bracket_log" "'claude-opus-
 assert_contains "Bracket model: uses command claude" "$bracket_log" "command claude"
 
 kill_pane_children test-restore-bracket true
+
+# --- Test 10g: session names holding tmux target separators (issue #66) ---
+#
+# Two characters are load-bearing here. ':' and '.' are the tmux target
+# grammar's own separators, so a saved "session:window.pane" label cannot be
+# handed back to tmux as a target once the name contains them — the pane is
+# either skipped or resolved against a different, prefix-matching session. '|'
+# is this plugin's field delimiter in `tmux list-panes -F` output, so a name
+# containing it used to shift every later column: the pane was saved with a
+# truncated label, a process id where its cwd belonged, and another pane's
+# session id, which restore then replayed into it.
+#
+# tmux < 3.7 silently rewrote ':' and '.' in session names to '_', and this
+# image ships 3.4, so those cases are guarded by asking tmux what name it
+# actually created rather than by parsing a version string — a test that just
+# asked for "v1.2" here would get "v1_2" and pass without testing anything.
+# '|' was never rewritten and reproduces on every version, which makes it the
+# version-portable regression test. The parsing itself is covered on all
+# platforms by test/target-resolution-unit-tests.sh.
+
+suite "hostile_session_names"
+echo ""
+echo "=== Test 10g: session names containing ':', '.' or '|' (issue #66) ==="
+echo ""
+
+SAVED="$HOME/.tmux/resurrect/assistant-sessions.json"
+
+# --- 10g-1: save keeps the parts of a '|' name separate ---
+
+PIPE_SESSION='tar|pipe'
+PIPE_CWD="/tmp/pipe-name-cwd"
+mkdir -p "$PIPE_CWD"
+tmux new-session -d -s "$PIPE_SESSION" -c "$PIPE_CWD"
+tmux send-keys -t "$PIPE_SESSION" "claude --resume ses_pipe_name" Enter
+pipe_shell_pid=$(tmux display-message -t "$PIPE_SESSION" -p '#{pane_pid}')
+wait_for_child "$pipe_shell_pid" "claude" 10 >/dev/null || echo "WARN: claude child not found for pipe-name test"
+pipe_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$pipe_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
+mkdir -p "$TEST_STATE_DIR"
+cat >"$TEST_STATE_DIR/claude-${pipe_child_pid}.json" <<PIPEEOF
+{
+  "session_id": "ses_pipe_name",
+  "tool": "claude",
+  "ppid": $pipe_child_pid,
+  "timestamp": "2026-01-01T00:00:00Z"
+}
+PIPEEOF
+
+rm -f "$SAVED"
+just save 2>&1
+
+pipe_entry=$(jq -c --arg s "$PIPE_SESSION" '.sessions[] | select(.session_name == $s)' "$SAVED")
+if [ -n "$pipe_entry" ]; then
+	pass "Pipe name: sidecar entry carries the session name intact"
+else
+	fail "Pipe name: no sidecar entry with session_name '$PIPE_SESSION'"
+fi
+assert_eq "Pipe name: pane label composed from the parts" "$PIPE_SESSION:0.0" "$(echo "$pipe_entry" | jq -r '.pane // empty')"
+assert_eq "Pipe name: window_index saved separately" "0" "$(echo "$pipe_entry" | jq -r '.window_index // empty')"
+assert_eq "Pipe name: pane_index saved separately" "0" "$(echo "$pipe_entry" | jq -r '.pane_index // empty')"
+# The delimiter used to shift every later column — cwd came out as a process id.
+assert_eq "Pipe name: cwd not shifted by the delimiter" "$PIPE_CWD" "$(echo "$pipe_entry" | jq -r '.cwd // empty')"
+# And the shift could pull a neighbouring pane's id into this entry.
+assert_eq "Pipe name: session id is this pane's own" "ses_pipe_name" "$(echo "$pipe_entry" | jq -r '.session_id // empty')"
+
+rm -f "$TEST_STATE_DIR/claude-${pipe_child_pid}.json"
+# Free the pane for the restore tests below, but keep the session.
+kill_pane_children "$PIPE_SESSION"
+sleep 1
+
+# --- 10g-2: restore resolves a '|' name from the saved parts ---
+
+cat >"$SAVED" <<RPIPEEOF
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [
+    {
+      "pane": "$PIPE_SESSION:0.0",
+      "session_name": "$PIPE_SESSION",
+      "window_index": "0",
+      "pane_index": "0",
+      "tool": "claude",
+      "session_id": "ses_pipe_restore",
+      "cwd": "/tmp",
+      "pid": "99999"
+    }
+  ]
+}
+RPIPEEOF
+
+>"$RESTORE_LOG"
+just restore 2>&1
+sleep 5
+
+pipe_restore_log=$(cat "$RESTORE_LOG")
+assert_contains "Pipe name: restore targets the right pane" "$pipe_restore_log" "restoring claude in $PIPE_SESSION:0.0"
+assert_contains "Pipe name: restore replays the saved session id" "$pipe_restore_log" "ses_pipe_restore"
+if echo "$pipe_restore_log" | grep -qF "does not exist"; then
+	fail "Pipe name: restore reported the pane as missing"
+else
+	pass "Pipe name: restore did not report the pane as missing"
+fi
+
+kill_pane_children "$PIPE_SESSION"
+sleep 1
+
+# --- 10g-3: a sidecar written before the parts existed still restores ---
+#
+# The sidecar is a cache rewritten on every save, so the only way to reach this
+# path is save -> upgrade -> restore. Restore falls back to splitting the label,
+# which is exact from the right because window and pane are always indices.
+
+cat >"$SAVED" <<RLEGACYEOF
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [
+    {
+      "pane": "$PIPE_SESSION:0.0",
+      "tool": "claude",
+      "session_id": "ses_pipe_legacy",
+      "cwd": "/tmp",
+      "pid": "99999"
+    }
+  ]
+}
+RLEGACYEOF
+
+>"$RESTORE_LOG"
+just restore 2>&1
+sleep 5
+
+pipe_legacy_log=$(cat "$RESTORE_LOG")
+assert_contains "Legacy sidecar: label split back into a live pane" "$pipe_legacy_log" "restoring claude in $PIPE_SESSION:0.0"
+assert_contains "Legacy sidecar: session id replayed" "$pipe_legacy_log" "ses_pipe_legacy"
+
+kill_pane_children "$PIPE_SESSION" true
+rm -rf "$PIPE_CWD"
+
+# --- 10g-4: ':' and '.' in a session name (tmux >= 3.7 only) ---
+
+DOTTED_WANTED='v1.2:x'
+# Ask new-session for the pane id as well as the name it settled on. With ':'
+# and '.' in the name no tmux command can address this session by name -- the
+# cleanup ones included -- so the id has to come from the one call that is
+# guaranteed to report it, not from the function under test. That also gives the
+# resolution assertion below an independently known answer to compare against.
+dotted_created=$(tmux new-session -d -P -F '#{pane_id} #{session_name}' -s "$DOTTED_WANTED" -c /tmp)
+dotted_created_id="${dotted_created%% *}"
+dotted_actual="${dotted_created#* }"
+
+if [ "$dotted_actual" != "$DOTTED_WANTED" ]; then
+	# tmux 3.4-3.6: the name was sanitised to "v1_2_x", so the bug is not
+	# reachable on this version. Announce it rather than passing silently.
+	echo "  SKIP: tmux rewrote '$DOTTED_WANTED' to '$dotted_actual' (needs tmux >= 3.7)"
+	if [ -n "$dotted_created_id" ]; then
+		tmux kill-session -t "$dotted_created_id" 2>/dev/null || true
+	fi
+else
+	assert_eq "Dotted name: resolved to the pane tmux actually created" "$dotted_created_id" \
+		"$(resolve_tmux_pane_id "$DOTTED_WANTED" 0 0)"
+
+	cat >"$SAVED" <<RDOTEOF
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [
+    {
+      "pane": "$DOTTED_WANTED:0.0",
+      "session_name": "$DOTTED_WANTED",
+      "window_index": "0",
+      "pane_index": "0",
+      "tool": "claude",
+      "session_id": "ses_dotted_restore",
+      "cwd": "/tmp",
+      "pid": "99999"
+    }
+  ]
+}
+RDOTEOF
+
+	>"$RESTORE_LOG"
+	just restore 2>&1
+	sleep 5
+
+	dotted_log=$(cat "$RESTORE_LOG")
+	assert_contains "Dotted name: restore targets the right pane" "$dotted_log" "restoring claude in $DOTTED_WANTED:0.0"
+	assert_contains "Dotted name: restore replays the saved session id" "$dotted_log" "ses_dotted_restore"
+	if echo "$dotted_log" | grep -qF "does not exist"; then
+		fail "Dotted name: restore reported the pane as missing"
+	else
+		pass "Dotted name: restore did not report the pane as missing"
+	fi
+
+	kill_pane_children "$dotted_created_id"
+	sleep 0.3
+	tmux kill-session -t "$dotted_created_id" 2>/dev/null || true
+fi
 
 # --- Regression guard: no pre-fork heredoc/here-string pipes (issue #48) ---
 # The save hook must never feed a program to python3/jq through a shell heredoc

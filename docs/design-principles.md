@@ -23,6 +23,26 @@ latency per pane.
 - Format and write JSON output
 - Send commands to tmux panes via `tmux send-keys`
 
+## Addressing a pane
+
+A pane's saved address is stored as three separate values -- session name,
+window index, pane index -- and joined into the familiar `session:window.pane`
+form only as a display label and as the key tmux-resurrect's pane-content
+archive is named after. The joined form is never given back to tmux as a target.
+
+tmux's target grammar reserves `:` and `.`, and session names may contain both
+(tmux 3.7 keeps them; earlier versions rewrote them to `_`). tmux also
+prefix-matches session names, so a malformed target does not reliably fail --
+it can silently resolve to a different session. `-t '=name'` is not a way out
+either, because the grammar splits the string before the exact-match flag
+applies.
+
+So restore matches the three parts literally against `tmux list-panes -a -F`
+output and works from the pane id (`%N`) it gets back, which every tmux command
+accepts verbatim. Pane ids are allocated per tmux server lifetime -- exactly
+the boundary a restore crosses -- so they are resolved at restore time and
+never written to disk.
+
 ## Session ID extraction
 
 Session IDs are extracted through tool-native mechanisms -- infrastructure
@@ -97,8 +117,12 @@ To add support for a new tool:
 - Copilot's active session is resolved with a plain glob over its own state
   directory — deliberately no `lsof` and no `/proc`, so it behaves identically
   on every platform and costs no fork.
-- tmux 3.4 converts tab characters to underscores in `-F` format output. The
-  save script uses pipe `|` as the delimiter instead.
+- tmux before 3.7 converts tab characters to underscores in `-F` format output,
+  and escapes other control characters differently in each version, so none of
+  them is a portable delimiter. The save script uses pipe `|` instead. A `|` can
+  legitimately appear in a session name or a path, so each `-F` string ends with
+  its one free-form field; the fixed-shape fields ahead of it are peeled off by
+  position and the remainder is taken verbatim.
 
 ## Windows considerations
 
