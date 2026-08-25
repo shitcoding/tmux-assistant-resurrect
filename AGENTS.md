@@ -72,7 +72,18 @@ process args as a reliable fallback.
 ## Key conventions
 
 - All scripts use `set -euo pipefail`
-- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default: `$XDG_RUNTIME_DIR` or `$TMPDIR` + `/tmux-assistant-resurrect`)
+- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default:
+  `$HOME/.local/state/tmux-assistant-resurrect`), resolved *only* through
+  `assistant_state_dir()` in `scripts/lib-detect.sh`. Never inline the path or
+  add an environment variable to it: the hooks and the save script resolve it in
+  different process environments, so anything they can disagree about silently
+  loses session IDs (issue #65). `hooks/opencode-session-track.js` carries the
+  one unavoidable second implementation; `test/state-dir-unit-tests.sh` pins the
+  two together. The pre-#65 locations are enumerated by
+  `legacy_assistant_state_dirs()` as a *set*, not re-derived from the old
+  expression: that expression is the thing that resolved differently on either
+  side, so evaluating it once in the save script would migrate only the users who
+  were never broken.
 - State files contain the full tool-provided context (merged from hook stdin /
   plugin events) plus plugin metadata (`tool`, `ppid`/`pid`, `timestamp`, `env`).
   The Claude hook merges Claude's entire SessionStart JSON; the OpenCode plugin

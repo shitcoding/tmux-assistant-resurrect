@@ -8,12 +8,19 @@
 
 import { writeFileSync, mkdirSync, unlinkSync } from "fs";
 import { execSync } from "child_process";
-import { tmpdir } from "os";
+import { homedir } from "os";
 
 export const SessionTracker = async ({ client, directory }) => {
+  // Must resolve to exactly what assistant_state_dir() in scripts/lib-detect.sh
+  // produces: this plugin runs inside opencode, the save hook runs as a child of
+  // the tmux server, and the two never share an environment. Anything the two
+  // sides can disagree about silently loses the session ID (issue #65) — which is
+  // why this is $HOME and not XDG_RUNTIME_DIR/tmpdir(). Prefer process.env.HOME
+  // over homedir() so the two implementations agree byte for byte; homedir() is
+  // only the fallback for the (never, under tmux) case where HOME is unset.
   const stateDir =
     process.env.TMUX_ASSISTANT_RESURRECT_DIR ||
-    `${process.env.XDG_RUNTIME_DIR || tmpdir()}/tmux-assistant-resurrect`;
+    `${process.env.HOME || homedir()}/.local/state/tmux-assistant-resurrect`;
   // OpenCode loads plugins in-process via `await import()` (no child process),
   // so process.pid is the opencode binary's PID — matching what the save script
   // finds via `ps` tree walk.
