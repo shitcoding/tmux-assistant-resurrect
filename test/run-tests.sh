@@ -2126,19 +2126,10 @@ echo ""
 # Source detect_tool from the shared library
 source "$REPO_DIR/scripts/lib-detect.sh"
 
-# Keep this in sync with the awk detector in save-assistant-sessions.sh.
+# Exercise the same awk detector loaded by save-assistant-sessions.sh.
 awk_detect_tool_save() {
 	local line="$1"
-	echo "$line" | awk '
-		{
-			if      ($0 ~ /(^claude( |$)|\/claude( |$))/)                                    print "claude"
-			else if ($0 ~ /(^copilot( |$)|\/copilot( |$))/)                                  print "copilot"
-			else if ($0 ~ /(^opencode( |$)|\/opencode( |$))/ && $0 !~ /opencode run /)      print "opencode"
-			else if ($0 ~ /(^codex( |$)|\/codex( |$))/)                                      print "codex"
-			else if ($0 ~ /(^pi( |$)|\/pi( |$))/)                                            print "pi"
-			else if ($0 ~ /(^omp( |$)|\/omp( |$))/ && $0 !~ /__omp_worker_/)              print "omp"
-		}
-	'
+	printf '%s\n' "$line" | awk -v classify_only=1 -f "$REPO_DIR/scripts/lib-detect.awk"
 }
 
 # Bare names (no path) — how native binaries appear on Linux
@@ -2148,6 +2139,7 @@ assert_eq "detect bare 'opencode'" "opencode" "$(detect_tool "opencode")"
 assert_eq "detect bare 'codex'" "codex" "$(detect_tool "codex")"
 assert_eq "detect bare 'pi'" "pi" "$(detect_tool "pi")"
 assert_eq "detect bare 'omp'" "omp" "$(detect_tool "omp")"
+assert_eq "detect bare 'grok'" "grok" "$(detect_tool "grok")"
 
 # Bare names with arguments
 assert_eq "detect 'claude --resume ses_123'" "claude" "$(detect_tool "claude --resume ses_123")"
@@ -2157,6 +2149,7 @@ assert_eq "detect 'opencode -s ses_456'" "opencode" "$(detect_tool "opencode -s 
 assert_eq "detect 'codex resume ses_789'" "codex" "$(detect_tool "codex resume ses_789")"
 assert_eq "detect 'pi --session 019e99-test'" "pi" "$(detect_tool "pi --session 019e99-test")"
 assert_eq "detect 'omp --resume 019e99-test'" "omp" "$(detect_tool "omp --resume 019e99-test")"
+assert_eq "detect 'grok --resume 019e99-test'" "grok" "$(detect_tool "grok --resume 019e99-test")"
 
 # Full paths (how they appear on macOS or via shebang)
 assert_eq "detect '/usr/local/bin/claude'" "claude" "$(detect_tool "/usr/local/bin/claude")"
@@ -2166,6 +2159,8 @@ assert_eq "detect '/opt/homebrew/bin/opencode -s ses_456'" "opencode" "$(detect_
 assert_eq "detect '/bin/bash /usr/local/bin/opencode -s ses_456'" "opencode" "$(detect_tool "/bin/bash /usr/local/bin/opencode -s ses_456")"
 assert_eq "detect '/usr/local/bin/pi --session 019e99-test'" "pi" "$(detect_tool "/usr/local/bin/pi --session 019e99-test")"
 assert_eq "detect '/usr/local/bin/omp --resume 019e99-test'" "omp" "$(detect_tool "/usr/local/bin/omp --resume 019e99-test")"
+assert_eq "detect '/usr/local/bin/grok --resume 019e99-test'" "grok" \
+	"$(detect_tool "/usr/local/bin/grok --resume 019e99-test")"
 
 # LSP subprocess exclusion
 assert_eq "exclude 'opencode run pyright'" "" "$(detect_tool "opencode run pyright-langserver.js")"
@@ -2195,6 +2190,9 @@ parity_cases=(
 	"/usr/local/bin/pi --session 019e99-test|pi"
 	"omp --resume 019e99-test|omp"
 	"/usr/local/bin/omp --resume 019e99-test|omp"
+	"grok|grok"
+	"grok --resume 019e99-test|grok"
+	"/usr/local/bin/grok --resume 019e99-test|grok"
 	"opencode run pyright-langserver.js|"
 	"/usr/bin/opencode run pyright-langserver.js|"
 	"python3 -c 'import time; time.sleep(300)' --profile codex|"
