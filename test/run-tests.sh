@@ -3094,6 +3094,30 @@ assert_eq "Claude no extra flags" "" \
 assert_eq "Claude bare binary" "" \
 	"$(extract_cli_args "claude" "claude")"
 
+# Positionals are initial prompts (or OpenCode's cwd-equivalent project path),
+# so they must never be replayed on a resume. Separate option values remain.
+assert_eq "Claude drops inline prompt and keeps option values" "--dangerously-skip-permissions --model sonnet" \
+	"$(extract_cli_args "claude" "claude --dangerously-skip-permissions --model sonnet Fix the login bug")"
+assert_eq "Claude resume remains unchanged" "--dangerously-skip-permissions --model sonnet" \
+	"$(extract_cli_args "claude" "claude --dangerously-skip-permissions --model sonnet --resume ses_abc123")"
+assert_eq "Copilot drops stray positional and keeps flags" "--model=gpt-5.6-sol --allow-all" \
+	"$(extract_cli_args "copilot" "copilot --model=gpt-5.6-sol --allow-all accidental")"
+assert_eq "OpenCode drops project positional and keeps option values" "--model anthropic/claude-sonnet-4" \
+	"$(extract_cli_args "opencode" "opencode --model anthropic/claude-sonnet-4 /tmp/project")"
+assert_eq "Codex drops inline prompt and keeps option values" "--model o3" \
+	"$(extract_cli_args "codex" "codex --model o3 Fix the login bug")"
+assert_eq "Pi drops inline prompt and keeps option values" "--model sonnet" \
+	"$(extract_cli_args "pi" "pi --model sonnet Fix the login bug")"
+assert_eq "OMP drops inline prompt and keeps option values" "--model opus" \
+	"$(extract_cli_args "omp" "omp --model opus Fix the login bug")"
+assert_eq "Grok drops inline prompt and keeps option values" "--model grok-4" \
+	"$(extract_cli_args "grok" "grok --model grok-4 Fix the login bug")"
+
+# The exact dash-prefix rule retains flag-looking prompt words. Once a real
+# positional starts, however, the following bare word cannot become its value.
+assert_eq "Claude retains flag-looking prompt word only" "--dangerously-skip-permissions --model" \
+	"$(extract_cli_args "claude" "claude --dangerously-skip-permissions Fix the --model flag")"
+
 # OpenCode: strip -s <id>
 assert_eq "OpenCode strip -s" "--verbose" \
 	"$(extract_cli_args "opencode" "opencode --verbose -s ses_abc")"
