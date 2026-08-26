@@ -138,6 +138,23 @@ perms_of() {
 	esac
 }
 
+# Does this filesystem honour POSIX modes at all? Git Bash emulates permissions over
+# Windows ACLs: `chmod` is largely a no-op and `stat` still answers with a
+# plausible-looking octal that has nothing to do with what was asked for — so
+# perms_of() returns "755", not "?", and a mode assertion fails for a reason that is
+# not a bug. Probe once with a control directory whose mode we set two different ways
+# and check both come back, rather than trusting the answer per-case.
+modes_are_real() {
+	local d="$SANDBOX/.modeprobe"
+	rm -rf "$d" 2>/dev/null
+	(umask 077 && mkdir -p "$d") 2>/dev/null || return 1
+	[ "$(perms_of "$d")" = "700" ] || return 1
+	chmod 755 "$d" 2>/dev/null || return 1
+	[ "$(perms_of "$d")" = "755" ] || return 1
+	return 0
+}
+if modes_are_real; then MODES_REAL=1; else MODES_REAL=0; fi
+
 # --- harness self-check ---
 #
 # Everything below asserts on the behaviour of a *child* shell, so if that child is
@@ -227,11 +244,11 @@ assert_eq "creates the full \$HOME/.local/state path" "yes" \
 #    land. Parents keep the umask default: 0755 is the XDG convention for ~/.local
 #    and ~/.local/state, and clamping them to 0700 would be a side effect on paths
 #    that are not ours.
-esd_mode=$(perms_of "$esd_new")
-esd_parent_mode=$(perms_of "$SANDBOX/esd-home/.local/state")
-if [ "$esd_mode" = "?" ]; then
-	skip "new state dir is private to the owner" "cannot read modes here"
+if [ "$MODES_REAL" = 0 ]; then
+	skip "new state dir is private to the owner" "this filesystem does not honour POSIX modes"
 else
+	esd_mode=$(perms_of "$esd_new")
+	esd_parent_mode=$(perms_of "$SANDBOX/esd-home/.local/state")
 	assert_eq "new state dir is private to the owner" "700" "$esd_mode"
 	# Whatever the runner's umask is, the parent must not have been forced to 0700
 	# by a umask that leaked out of the leaf's creation.
@@ -435,10 +452,12 @@ if command -v node >/dev/null 2>&1; then
 
 	# Exercise the real thing rather than a paraphrase: run the plugin's own parent
 	# expression and its create-only guard against a sandbox HOME, then check the
-	# modes that come out. Skipped on Git Bash with the path assertions above, for
-	# the same reason — emulated modes there mean nothing.
-	if [ "$win_paths" = 1 ]; then
-		skip "plugin creates a private leaf without clamping parents" "emulated modes under Git Bash"
+	# modes that come out. Two independent reasons to sit this out: native node on
+	# Git Bash spells paths differently (as above), and a filesystem that does not
+	# honour modes would answer with a number that means nothing.
+	if [ "$win_paths" = 1 ] || [ "$MODES_REAL" = 0 ]; then
+		skip "plugin creates a private leaf without clamping parents" \
+			"native node path notation, or a filesystem that does not honour modes"
 	else
 		# Extracting by pattern means a refactor could quietly yield nothing, and an
 		# empty snippet creates no directory — which would land in the "cannot read
