@@ -241,3 +241,154 @@ resurrect_data_dir() {
 	host=$(hostname 2>/dev/null || true)
 	echo "$dir" | sed "s,\$HOME,$HOME,g; s,\$HOSTNAME,$host,g; s,~,$HOME,g"
 }
+
+# Directory holding the per-process assistant state files (claude-<pid>.json,
+# opencode-<pid>.json).
+#
+# Resolution order:
+#   1. $TMUX_ASSISTANT_RESURRECT_DIR — explicit override (tests / unusual setups)
+#   2. $HOME/.local/state/tmux-assistant-resurrect
+#
+# Why this is a plain $HOME literal and not $XDG_STATE_HOME / $XDG_RUNTIME_DIR /
+# $TMPDIR — this path is a *rendezvous point between two processes that never
+# share an environment*: the SessionStart hook writes as a child of the assistant,
+# the save hook reads as a child of the tmux server. Every environment variable in
+# the expression is therefore a chance for the two sides to disagree, and when they
+# do the failure is silent — the save hook finds no state file and falls back to
+# scraping --resume out of argv, recording a missing or (worse) a stale ID from a
+# previous session.
+#
+# The previous ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}} chain broke exactly that way:
+# Claude Code's settings.json can set "env": {"TMPDIR": ...} — common, because /tmp
+# is mounted noexec in many containers — which the hook inherits and the tmux server
+# does not. $XDG_STATE_HOME would reintroduce the same bug with a rarer trigger, so
+# it is deliberately not consulted. $HOME is the one variable both sides are already
+# guaranteed to agree on: Claude Code resolved ~/.claude/settings.json through it and
+# tmux read ~/.tmux.conf through it. Same reasoning as the $HOME-only substitution in
+# the stored hook paths (see AGENTS.md, "portable hook paths").
+#
+# Note this deliberately differs from resurrect_data_dir() above, which *does* honour
+# $XDG_DATA_HOME. That one is only ever resolved inside the save/restore scripts, so
+# it has no second process to disagree with.
+#
+# To relocate the directory, set TMUX_ASSISTANT_RESURRECT_DIR where BOTH sides see it
+# (`tmux set-environment -g` plus the assistant's own env config). Exporting it from a
+# shell profile reaches only the assistant, and reintroduces the divergence.
+assistant_state_dir() {
+	if [ -n "${TMUX_ASSISTANT_RESURRECT_DIR:-}" ]; then
+		echo "$TMUX_ASSISTANT_RESURRECT_DIR"
+		return
+	fi
+	echo "${HOME:?tmux-assistant-resurrect: HOME is unset; set TMUX_ASSISTANT_RESURRECT_DIR instead}/.local/state/tmux-assistant-resurrect"
+}
+
+# Create the state directory if it is missing, private to its owner. Shared by both
+# writers for the same reason assistant_state_dir() is: they run in different process
+# environments and must not drift.
+#
+# Not `mkdir -p -m 0700`, which is wrong twice over. SC2174: `-m` applies only to the
+# deepest directory, so now that the path is three levels under $HOME it never
+# protected $HOME/.local or $HOME/.local/state anyway -- and those want the umask
+# default, 0755 being the XDG convention. Worse, Git Bash fails the call outright when
+# the path does not pre-exist, and under `set -e` that killed the whole save before it
+# wrote anything; the Windows canary is what caught it.
+#
+# Not `mkdir -p` followed by `chmod 700` either, which is what that first fix did:
+#   - it leaves the directory at the umask default until the chmod lands, so a
+#     concurrent reader gets a window, one that widens to world-writable at umask 000;
+#   - `chmod` follows symlinks, so a link left at $STATE_DIR gets its *target*
+#     re-moded;
+#   - it fires on every save, resetting a mode the user chose deliberately -- a
+#     group-readable TMUX_ASSISTANT_RESURRECT_DIR would be clamped back to 0700 every
+#     five minutes by continuum.
+# Creating the leaf under a scoped umask closes all three: the mode is applied
+# atomically by mkdir(2), and an existing directory is left exactly as it is.
+ensure_assistant_state_dir() {
+	local dir="${1:-}" parent
+	[ -n "$dir" ] || return 0
+	[ -d "$dir" ] && return 0
+
+	while [ "${dir%/}" != "$dir" ]; do dir="${dir%/}"; done
+	parent="${dir%/*}"
+	if [ -n "$parent" ] && [ "$parent" != "$dir" ]; then
+		mkdir -p "$parent" 2>/dev/null || true
+	fi
+	# The fallback is `-p` under the same umask, not a bare one: the leaf-only mkdir
+	# above fails if the parent creation was itself refused, and dropping to an
+	# ambient-mode create there would hand back exactly the 0755 state dir this
+	# function exists to avoid. It also absorbs the benign race where the other
+	# writer won between the -d test and here, since `mkdir -p` on an existing
+	# directory succeeds. Deliberately unguarded: a genuine failure (no space, a
+	# read-only $HOME) should still abort under `set -e`, as it did before.
+	(umask 077 && mkdir "$dir") 2>/dev/null || (umask 077 && mkdir -p "$dir")
+}
+
+# The pre-$HOME default locations, newline-separated, most-likely first. Used only by
+# the save hook, to migrate state files written by hooks that ran before the upgrade —
+# without it, every already-running assistant loses its session ID until it is
+# restarted, and continuum overwrites the good sidecar within five minutes.
+#
+# Why a *set* and not one resolved path: the old expression was
+# ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect, and issue #65 is
+# precisely that it resolved differently in the writer's environment than in the
+# reader's. Evaluating it once here resolves it in the reader's — so it would migrate
+# only the users whose two sides already agreed, i.e. the ones who were never broken,
+# and find nothing for the ones who were.
+#
+# So enumerate every location a pre-upgrade hook could plausibly have written to,
+# whether or not this process's environment names it:
+#   $XDG_RUNTIME_DIR   the reader's, when it has one
+#   /run/user/<uid>    the systemd default — covers the reader having no
+#                      XDG_RUNTIME_DIR while the hook, run from a login session, did
+#   $TMPDIR            the reader's, when it has one
+#   /var/folders/<hash>/T  macOS's per-uid temp dir, but only when this side has no
+#                      $TMPDIR of its own -- covers a tmux server started by launchd
+#                      or over ssh, which inherits none, while the hook that wrote
+#                      the file did. It is keyed on uid, not on the login session, so
+#                      it resolves to the same path the writer used.
+#   /tmp               the final fallback of the old chain
+#
+# Still not discoverable from this side: a settings.json naming a private TMPDIR for
+# the assistant alone. That residue is what missing_session_hint()'s diagnostic exists
+# to explain.
+#
+# Deliberately fork-free (no sed/id) on the hot path: this runs on every save cycle.
+# The one `getconf` is gated twice -- a normal macOS shell always exports $TMPDIR, and
+# /var/folders does not exist off Darwin -- so in practice it never runs.
+legacy_assistant_state_dirs() {
+	if [ -n "${TMUX_ASSISTANT_RESURRECT_DIR:-}" ]; then
+		return
+	fi
+
+	local nl='
+'
+	local current uid seen="" base dir darwin_tmp=""
+	current=$(assistant_state_dir)
+	uid="${EUID:-${UID:-}}"
+
+	if [ -z "${TMPDIR:-}" ] && [ -d /var/folders ]; then
+		# `|| darwin_tmp=""` is load-bearing: the save hook runs under `set -e`, and a
+		# getconf that does not know the key exits non-zero.
+		darwin_tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null) || darwin_tmp=""
+	fi
+
+	for base in \
+		"${XDG_RUNTIME_DIR:-}" \
+		"${uid:+/run/user/$uid}" \
+		"${TMPDIR:-}" \
+		"$darwin_tmp" \
+		/tmp; do
+		[ -n "$base" ] || continue
+		# Strip the trailing slash $TMPDIR usually carries, so the dedupe below and
+		# the log line both show a canonical path.
+		while [ "${base%/}" != "$base" ]; do base="${base%/}"; done
+		dir="$base/tmux-assistant-resurrect"
+		[ "$dir" = "$current" ] && continue
+		case "$nl$seen" in
+		*"$nl$dir$nl"*) continue ;;
+		esac
+		seen="$seen$dir$nl"
+	done
+
+	printf '%s' "$seen"
+}

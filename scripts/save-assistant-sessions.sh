@@ -40,7 +40,9 @@ source "$SCRIPT_DIR/lib-detect.sh"
 # hook. Delivering programs via argv sidesteps that failure mode entirely.
 PY_DIR="$SCRIPT_DIR/py"
 
-STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
+# Shared with the SessionStart/SessionEnd hooks, which write and delete these
+# files from the assistant's process environment rather than the tmux server's.
+STATE_DIR="$(assistant_state_dir)"
 # Follow tmux-resurrect's own save-dir resolution (see resurrect_data_dir in
 # lib-detect.sh) instead of hardcoding ~/.tmux/resurrect, so our sidecar lands
 # next to resurrect's saves on both legacy and XDG installs.
@@ -61,7 +63,8 @@ case "$SAVE_TIMEOUT" in
 '' | *[!0-9]*) SAVE_TIMEOUT=60 ;;
 esac
 
-mkdir -p -m 0700 "$STATE_DIR"
+# Shared with the SessionStart hook that writes what this reads; see the function.
+ensure_assistant_state_dir "$STATE_DIR"
 mkdir -p "$RESURRECT_DIR"
 
 # Rotate log: keep only the most recent 500 lines to prevent unbounded growth
@@ -74,6 +77,185 @@ log() {
 	local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
 	echo "$msg" >&2
 	echo "$msg" >>"$LOG_FILE"
+}
+
+# Move state files left in any pre-$HOME default into the current state dir.
+#
+# Upgrades happen under a live tmux server: assistants that were already running
+# fired their SessionStart hook against the old path and will not fire it again.
+# Without this, the first save after upgrade records no session ID for any of
+# them — and continuum overwrites the good sidecar within five minutes, so the
+# IDs are gone before the user notices. Files whose assistants have since exited
+# are harmless; reap_stale_state_files() clears them on the same pass.
+migrate_legacy_state_files() {
+	local rest
+	rest=$(legacy_assistant_state_dirs)
+	[ -n "$rest" ] || return 0
+
+	local moved=0 sources="" legacy f nl=$'\n'
+	# Walk the newline-separated list with parameter expansion. Deliberately not
+	# `read` fed by a here-string: this script must contain no `<<<` at all (issue
+	# #48 -- bash >= 5.1 writes one to a pipe before the reader is exec'd, and that
+	# write can block forever under pipe-KVA pressure on macOS, hanging the hook).
+	# test/run-tests.sh Test 11 greps for the construct and fails the build.
+	while [ -n "$rest" ]; do
+		legacy="${rest%%"$nl"*}"
+		if [ "$legacy" = "$rest" ]; then
+			rest=""
+		else
+			rest="${rest#*"$nl"}"
+		fi
+
+		[ -n "$legacy" ] || continue
+		[ -d "$legacy" ] || continue
+		# /tmp/tmux-assistant-resurrect is world-writable-parent and unscoped by uid:
+		# on a shared box it may be another user's directory, or a symlink planted
+		# where one was expected. Either way it holds nothing of ours to migrate --
+		# our own pre-upgrade hook could not have written into it.
+		[ -L "$legacy" ] && continue
+		[ -O "$legacy" ] || continue
+
+		local moved_here=0 dest
+		for f in "$legacy"/claude-*.json "$legacy"/opencode-*.json; do
+			[ -f "$f" ] || continue
+			[ -O "$f" ] || continue
+
+			dest="$STATE_DIR/$(basename "$f")"
+			# Two files can claim one PID: a leftover whose PID was recycled, or the
+			# same PID seen at two pre-upgrade roots. Neither the destination's mere
+			# existence nor a root's probe position says which is current, so mtime
+			# decides -- the hook writes just after its assistant starts, so the newer
+			# file belongs to whoever holds the PID now. Always preferring $dest can
+			# drop the only good copy and leave reap_stale_state_files() to delete the
+			# stale one it kept. `-nt` is a bash builtin, so this costs no fork.
+			if [ -e "$dest" ] && [ ! "$f" -nt "$dest" ]; then
+				# `|| true` for the same reason as the `mv` below: under `set -e` a
+				# bare `rm -f` that cannot unlink (a legacy root gone read-only) would
+				# abort the save before assistant-sessions.json is written. Leaving the
+				# older duplicate behind costs nothing — the destination already holds
+				# the copy that wins.
+				rm -f "$f" 2>/dev/null || true
+				continue
+			fi
+
+			# `|| true` is load-bearing under `set -e`: a bare mv that fails -- a
+			# read-only state dir, a cross-device legacy root -- would abort the whole
+			# save before assistant-sessions.json is written, turning a skippable file
+			# into total data loss for every pane. Failure here just leaves the file
+			# where it is for the next save to retry.
+			#
+			# Not `mv -n`: the two userlands disagree on what a refusal even is (BSD
+			# exits 0, GNU coreutils exits 1, so under `set -e` a perfectly normal
+			# refusal would kill the hook on Linux), and it cannot express the
+			# replace-the-stale-one case above anyway. The narrow window it would have
+			# guarded -- a SessionStart hook writing $dest between the check and the
+			# rename -- is bounded instead: rename preserves the source's mtime, so
+			# reap_stale_state_files(), which main() runs on the next line, drops a
+			# mis-migrated file on this same pass. The race costs a missing session ID,
+			# never a wrong one.
+			mv -f "$f" "$dest" 2>/dev/null || true
+			[ -e "$f" ] || moved_here=$((moved_here + 1))
+		done
+		# Best-effort: only succeeds once the directory is empty, which is what we want.
+		rmdir "$legacy" 2>/dev/null || true
+
+		if [ "$moved_here" -gt 0 ]; then
+			moved=$((moved + moved_here))
+			sources="$sources $legacy"
+		fi
+	done
+
+	[ "$moved" -gt 0 ] && log "migrated $moved state file(s) from legacy state dir(s):$sources"
+	return 0
+}
+
+# Remove state files whose process is gone.
+#
+# The SessionEnd hook deletes a session's own file, but it never runs on SIGKILL,
+# OOM, a crash, or a closed terminal. Under the old $TMPDIR/$XDG_RUNTIME_DIR
+# default those leftovers were cleared at reboot; $HOME persists, so the save hook
+# sweeps them itself. This bounds growth and, more importantly, shrinks the window
+# in which a recycled PID matches an unrelated assistant's stale file and restores
+# the wrong conversation.
+#
+# The PID comes from the filename (our own hooks write claude-<pid>.json), so the
+# liveness check costs no forks — `kill -0` is a builtin. Files not matching the
+# pattern are left alone rather than deleted, and the numeric guard mirrors
+# `just clean`: without it a corrupt `pid: 0` file would survive forever, because
+# `kill -0 0` signals the caller's own process group and always succeeds.
+reap_stale_state_files() {
+	local reaped=0 f base pid stale
+	for f in "$STATE_DIR"/claude-*.json "$STATE_DIR"/opencode-*.json; do
+		[ -f "$f" ] || continue
+		base=$(basename "$f")
+		pid="${base#*-}"
+		pid="${pid%.json}"
+		stale=0
+		if ! [[ "$pid" =~ ^[0-9]+$ ]] || [ "$pid" -le 1 ]; then
+			stale=1
+		elif ! kill -0 "$pid" 2>/dev/null; then
+			stale=1
+		# The PID is live — but is it still the same process? $HOME survives
+		# reboots, and after a reboot every PID is recycled, so a leftover file
+		# can land on an unrelated assistant and restore a stranger's
+		# conversation into the pane. Same test as the Copilot lock: the hook
+		# writes just after the assistant starts, so a file older than the
+		# process claiming it belongs to a dead predecessor.
+		elif _file_predates_process "$f" "$pid"; then
+			stale=1
+		fi
+		[ "$stale" -eq 1 ] || continue
+
+		# Tested rather than bare, for the same reason the `mv` in
+		# migrate_legacy_state_files() carries `|| true`: this script runs under
+		# `set -e`, and `rm -f` still fails on a file it cannot unlink (an
+		# unwritable $STATE_DIR, an immutable file). A bare one would abort the
+		# save before assistant-sessions.json is written, losing every pane's
+		# session ID over one undeletable leftover. Counting only on success also
+		# keeps the log honest — "reaped 3" must not include files still on disk.
+		if rm -f "$f" 2>/dev/null; then
+			reaped=$((reaped + 1))
+		fi
+	done
+	[ "$reaped" -gt 0 ] && log "reaped $reaped stale state file(s)"
+	return 0
+}
+
+# Explain where the save hook looked when it came up empty.
+#
+# "no session ID available" on its own is indistinguishable between "the hook
+# never ran", "the hook ran but wrote somewhere this process cannot see" (the
+# writer/reader path mismatch of issue #65) and "this assistant genuinely has no
+# ID yet". Naming the path turns that into a one-look diagnosis.
+missing_session_hint() {
+	local tool="$1" pid="$2" state_file=""
+	case "$tool" in
+	claude) state_file="$STATE_DIR/claude-${pid}.json" ;;
+	opencode) state_file="$STATE_DIR/opencode-${pid}.json" ;;
+	*)
+		echo "(no session ID in args)"
+		return
+		;;
+	esac
+
+	if [ -f "$state_file" ]; then
+		echo "(state file $state_file holds no session_id; no session ID in args)"
+		return
+	fi
+
+	# A live assistant in the pane but not one state file anywhere is the
+	# signature of a path mismatch: the hook wrote to a directory this process
+	# resolves differently.
+	local found=""
+	for found in "$STATE_DIR"/*.json; do
+		[ -e "$found" ] && break
+		found=""
+	done
+	if [ -z "$found" ]; then
+		echo "(no $state_file, and no state files at all in $STATE_DIR — is the $tool hook installed, and does it resolve the same state dir? override both sides with TMUX_ASSISTANT_RESURRECT_DIR)"
+	else
+		echo "(no $state_file; no session ID in args)"
+	fi
 }
 
 USED_CODEX_SESSION_IDS=""
@@ -216,20 +398,28 @@ _file_recency_key() {
 		LC_ALL=C stat -f '%Fm|%Fc' "$1" 2>/dev/null
 }
 
+# Is a file that was written at process start older than the process now holding
+# that PID? If so it belongs to a dead predecessor whose PID has been recycled,
+# and trusting it would map the new process onto the dead session. Advisory: when
+# either timestamp is unavailable, report "not stale" rather than lose a real
+# session.
+_file_predates_process() {
+	local file="$1" pid="$2"
+	local file_mtime proc_start
+	file_mtime=$(_file_mtime_epoch "$file")
+	[ -n "$file_mtime" ] || return 1
+	proc_start=$(get_process_start_epoch "$pid")
+	[ -n "$proc_start" ] || return 1
+	# Slack: the macOS start time is derived from second-granular elapsed time.
+	[ "$file_mtime" -lt "$((proc_start - 5))" ]
+}
+
 # A SIGKILLed Copilot leaves its lock behind. If that PID is later recycled by a
 # new Copilot, the stale lock would map the new process onto the dead session.
 # The lock is written at session start, so one older than the process claiming
-# it is stale. Advisory: when either timestamp is unavailable, accept the lock
-# rather than lose a real session.
+# it is stale.
 _copilot_lock_is_live() {
-	local lock="$1" pid="$2"
-	local lock_mtime proc_start
-	lock_mtime=$(_file_mtime_epoch "$lock")
-	[ -n "$lock_mtime" ] || return 0
-	proc_start=$(get_process_start_epoch "$pid")
-	[ -n "$proc_start" ] || return 0
-	# Slack: the macOS start time is derived from second-granular elapsed time.
-	[ "$lock_mtime" -ge "$((proc_start - 5))" ]
+	! _file_predates_process "$1" "$2"
 }
 
 get_copilot_session_from_lock() {
@@ -1690,7 +1880,7 @@ resolve_pane_candidates() {
 	done
 
 	if [ "$resolved" -eq 0 ] && [ -n "$first_tool" ]; then
-		log "detected $first_tool in $pane_target (pid $first_pid) but no session ID available"
+		log "detected $first_tool in $pane_target (pid $first_pid) but no session ID available $(missing_session_hint "$first_tool" "$first_pid")"
 	fi
 }
 
@@ -2016,6 +2206,11 @@ main() {
 
 	rm -f "$PS_FILE" "$PANE_FILE"
 
+	# Both must run before the cache glob below and before any get_*_session call,
+	# so the pass sees the migrated files and not the reaped ones.
+	migrate_legacy_state_files
+	reap_stale_state_files
+
 	# --- Pre-cache all state files in one jq call (requires jq 1.7+) ---
 	# Replaces ~58 per-file jq invocations with one jq + bash associative array.
 	# Uses jq 1.7+ input_filename to map filenames to PIDs.
@@ -2268,7 +2463,7 @@ emit_session() {
 		return 0
 	else
 		if [ "$log_missing" = "1" ]; then
-			log "detected $tool in $target (pid $cpid) but no session ID available"
+			log "detected $tool in $target (pid $cpid) but no session ID available $(missing_session_hint "$tool" "$cpid")"
 		fi
 		return 1
 	fi

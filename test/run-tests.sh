@@ -222,6 +222,28 @@ kill_pane_children() {
 	fi
 }
 
+# --- State-directory resolution suite ---
+#
+# Delegated rather than inlined: this suite exports TMUX_ASSISTANT_RESURRECT_DIR
+# globally, which short-circuits the resolver, so the resolution logic can only
+# be tested in a process that never saw that export. Test 20 below covers the
+# live hook/save-hook wiring, with the override removed for the duration.
+
+suite "state_dir_unit"
+echo ""
+echo "=== State directory resolution tests (issue #65) ==="
+echo ""
+
+state_dir_unit_output=""
+if state_dir_unit_output=$(env -u TMUX_ASSISTANT_RESURRECT_DIR "${TEST_BASH:-bash}" \
+	"$REPO_DIR/test/state-dir-unit-tests.sh" 2>&1); then
+	echo "$state_dir_unit_output"
+	pass "State directory resolution suite"
+else
+	echo "$state_dir_unit_output"
+	fail "State directory resolution suite"
+fi
+
 # --- Focused Copilot unit suite ---
 
 suite "copilot_unit"
@@ -4476,6 +4498,174 @@ assert_contains "failing serializer is reported, not masked as success" "$atomic
 rm -rf "$ATOMIC_DIR"
 
 rm -f "$WD_HELPER"
+
+# --- Test 20: state-dir rendezvous across divergent environments (issue #65) ---
+#
+# The state directory is a rendezvous point between two processes that never
+# share an environment: the SessionStart hook runs as a child of the assistant,
+# the save hook as a child of the tmux server. Everything above this point runs
+# with TMUX_ASSISTANT_RESURRECT_DIR exported, which short-circuits
+# assistant_state_dir() before any of its logic runs — that single export is why
+# #65 shipped green through this whole suite. Here the override comes OFF, so the
+# DEFAULT resolution is what is under test.
+#
+# The hermetic resolver tests live in test/state-dir-unit-tests.sh (which also
+# runs on macOS and Git Bash). This one drives the real hook and the real save
+# script against a live tmux pane, so it covers the wiring between them too.
+
+suite "state_dir_rendezvous"
+echo ""
+echo "=== Test 20: hook and save hook agree on the state dir (issue #65) ==="
+echo ""
+
+unset TMUX_ASSISTANT_RESURRECT_DIR
+
+RDV_STATE_DIR="$HOME/.local/state/tmux-assistant-resurrect"
+rm -rf "$RDV_STATE_DIR"
+
+# The writer's environment as Claude Code actually hands it to a hook:
+# settings.json can set "env": {"TMPDIR": ...} (common — /tmp is mounted noexec
+# in many containers), and XDG_RUNTIME_DIR exists for a login session. The tmux
+# server, started earlier and from elsewhere, has neither. Under the old
+# ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}} chain these two resolved to different
+# directories, so the save hook found nothing and silently recorded no ID.
+RDV_WRITER_TMPDIR="/tmp/rdv-writer-tmpdir"
+RDV_WRITER_XDG="/tmp/rdv-writer-xdg"
+RDV_READER_LEGACY="/tmp/tmux-assistant-resurrect"
+mkdir -p "$RDV_WRITER_TMPDIR" "$RDV_WRITER_XDG"
+rm -rf "$RDV_READER_LEGACY"
+
+# Stand-in for Claude Code: fires the SessionStart hook, then *becomes* claude.
+# The exec is the point — it makes the hook's PPID equal the final claude PID,
+# which is exactly the topology Claude Code produces when it spawns a hook.
+RDV_HELPER=$(mktemp)
+cat >"$RDV_HELPER" <<'RDVEOF'
+#!/usr/bin/env bash
+printf '%s' '{"session_id":"ses_rendezvous_65","cwd":"/tmp","model":"test"}' |
+	bash "$1/hooks/claude-session-track.sh"
+exec claude
+RDVEOF
+
+tmux new-session -d -s test-state-dir -c /tmp
+# `unset` in this shell is not enough: the tmux server was started far earlier,
+# with the override exported, and hands its own environment to every new pane.
+# Strip it in the pane too, or the hook resolves the override and this test
+# silently measures nothing.
+tmux send-keys -t test-state-dir \
+	"env -u TMUX_ASSISTANT_RESURRECT_DIR TMPDIR=$RDV_WRITER_TMPDIR XDG_RUNTIME_DIR=$RDV_WRITER_XDG bash $RDV_HELPER $REPO_DIR" Enter
+rdv_shell=$(tmux display-message -t test-state-dir -p '#{pane_pid}')
+wait_for_child "$rdv_shell" "claude" 15 >/dev/null || echo "WARN: claude child not found for rendezvous test"
+rdv_child=$(ps -eo pid=,ppid=,args= | awk -v ppid="$rdv_shell" '$2 == ppid && /claude/ {print $1; exit}')
+
+if [ -n "$rdv_child" ]; then
+	pass "Rendezvous pane is running claude (pid $rdv_child)"
+else
+	fail "Could not find claude child under rendezvous pane shell $rdv_shell"
+fi
+
+# Run the save hook with neither variable set — the reader's environment.
+rdv_save() {
+	rm -f "$TMUX_RESURRECT_DIR/assistant-sessions.json"
+	env -u TMUX_ASSISTANT_RESURRECT_DIR -u TMPDIR -u XDG_RUNTIME_DIR \
+		"${TEST_BASH:-bash}" "$SAVE_SCRIPT" >/dev/null 2>&1 || true
+}
+rdv_saved_id() {
+	jq -r '.sessions[] | select(.pane | contains("test-state-dir")) | .session_id' \
+		"$TMUX_RESURRECT_DIR/assistant-sessions.json" 2>/dev/null | head -1
+}
+
+# 1. The hook ignored its own TMPDIR/XDG_RUNTIME_DIR and anchored on $HOME.
+assert_file_exists "hook writes to the \$HOME-anchored state dir" \
+	"$RDV_STATE_DIR/claude-${rdv_child}.json"
+assert_file_not_exists "hook does not follow its own \$XDG_RUNTIME_DIR" \
+	"$RDV_WRITER_XDG/tmux-assistant-resurrect/claude-${rdv_child}.json"
+assert_file_not_exists "hook does not follow its own \$TMPDIR" \
+	"$RDV_WRITER_TMPDIR/tmux-assistant-resurrect/claude-${rdv_child}.json"
+
+# 2. The save hook, in a different environment, resolves the same directory and
+#    finds the ID. This is the assertion that fails on the pre-fix code.
+rdv_save
+assert_eq "save hook finds the ID the hook wrote in a divergent environment" \
+	"ses_rendezvous_65" "$(rdv_saved_id)"
+
+# 3. Upgrade path: an assistant that was already running when the plugin was
+#    upgraded fired its SessionStart hook against the OLD path and will never
+#    fire it again. Without migration the first save after upgrade drops its ID —
+#    and continuum overwrites the good sidecar within five minutes, so it is gone
+#    before anyone notices.
+rm -f "$RDV_STATE_DIR/claude-${rdv_child}.json"
+mkdir -p "$RDV_READER_LEGACY"
+cat >"$RDV_READER_LEGACY/claude-${rdv_child}.json" <<RDVLEOF
+{
+  "tool": "claude",
+  "session_id": "ses_pre_upgrade_65",
+  "ppid": $rdv_child,
+  "timestamp": "2026-01-01T00:00:00Z"
+}
+RDVLEOF
+rdv_save
+assert_eq "state file written before the upgrade is migrated, not lost" \
+	"ses_pre_upgrade_65" "$(rdv_saved_id)"
+assert_file_exists "migrated file now lives in the \$HOME-anchored dir" \
+	"$RDV_STATE_DIR/claude-${rdv_child}.json"
+assert_file_not_exists "migrated file no longer in the legacy dir" \
+	"$RDV_READER_LEGACY/claude-${rdv_child}.json"
+
+# 3b. The same upgrade, but the save hook now HAS an XDG_RUNTIME_DIR. The old
+#     chain was ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}, so re-evaluating it here
+#     resolves to that empty directory and the pre-upgrade file in /tmp is never
+#     found. That is the shape of #65 itself — the two sides resolve the legacy
+#     path differently too — so the migration has to probe every plausible root
+#     rather than the one this process's environment happens to name.
+rm -f "$RDV_STATE_DIR/claude-${rdv_child}.json"
+RDV_READER_XDG="/tmp/rdv-reader-xdg"
+mkdir -p "$RDV_READER_XDG/tmux-assistant-resurrect" "$RDV_READER_LEGACY"
+cat >"$RDV_READER_LEGACY/claude-${rdv_child}.json" <<RDVLEOF
+{
+  "tool": "claude",
+  "session_id": "ses_shadowed_root_65",
+  "ppid": $rdv_child,
+  "timestamp": "2026-01-01T00:00:00Z"
+}
+RDVLEOF
+rm -f "$TMUX_RESURRECT_DIR/assistant-sessions.json"
+env -u TMUX_ASSISTANT_RESURRECT_DIR -u TMPDIR "XDG_RUNTIME_DIR=$RDV_READER_XDG" \
+	"${TEST_BASH:-bash}" "$SAVE_SCRIPT" >/dev/null 2>&1 || true
+assert_eq "pre-upgrade file is migrated from a root the reader's own chain would skip" \
+	"ses_shadowed_root_65" "$(rdv_saved_id)"
+rm -rf "$RDV_READER_XDG"
+
+# 4. Stale files are reaped. $HOME survives reboots, so without this they
+#    accumulate forever — and a leftover matching a recycled PID would restore a
+#    stranger's conversation into the pane.
+echo '{"tool":"claude","session_id":"ses_dead"}' >"$RDV_STATE_DIR/claude-99999.json"
+echo '{"tool":"claude","session_id":"ses_zero"}' >"$RDV_STATE_DIR/claude-0.json"
+rdv_save
+assert_file_not_exists "save reaps a state file whose process is gone" \
+	"$RDV_STATE_DIR/claude-99999.json"
+assert_file_not_exists "save reaps a pid-0 state file (kill -0 0 always succeeds)" \
+	"$RDV_STATE_DIR/claude-0.json"
+assert_file_exists "save keeps the live session's state file" \
+	"$RDV_STATE_DIR/claude-${rdv_child}.json"
+
+# 5. When there genuinely is no state file, the log has to name the path it
+#    looked in — "no session ID available" alone cannot tell a missing hook apart
+#    from a hook writing somewhere this process cannot see, which is what made
+#    #65 take a debugging session instead of one glance at the log.
+rm -f "$RDV_STATE_DIR/claude-${rdv_child}.json"
+rm -rf "$RDV_READER_LEGACY"
+rdv_save
+rdv_log=$(cat "$TMUX_RESURRECT_DIR/assistant-save.log" 2>/dev/null)
+assert_contains "log still carries the documented phrase" \
+	"$rdv_log" "no session ID available"
+assert_contains "log names the state file that was missing" \
+	"$rdv_log" "$RDV_STATE_DIR/claude-${rdv_child}.json"
+
+# Clean up and put the suite-wide override back for anything added after this.
+kill_pane_children test-state-dir true
+rm -f "$RDV_HELPER"
+rm -rf "$RDV_STATE_DIR" "$RDV_WRITER_TMPDIR" "$RDV_WRITER_XDG"
+export TMUX_ASSISTANT_RESURRECT_DIR="$TEST_STATE_DIR"
 
 # --- Summary ---
 
