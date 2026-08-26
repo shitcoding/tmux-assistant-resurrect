@@ -329,6 +329,105 @@ save:
 restore:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/scripts/restore-assistant-sessions.sh"
 
+# Show structurally plausible session-less commands observed by the save hook.
+# This ledger is advisory only; entries are not authorized until explicitly
+# added to the voucher with `just relaunch-add '<command>'`.
+relaunch-candidates:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{repo_dir}}/scripts/lib-detect.sh"
+    resurrect_dir=$(resurrect_data_dir)
+    ledger="$resurrect_dir/assistant-relaunch-candidates.json"
+    if [ ! -f "$ledger" ] || [ "$(jq 'length' "$ledger" 2>/dev/null || echo 0)" -eq 0 ]; then
+        echo "No relaunch candidates observed yet."
+        exit 0
+    fi
+    duration() {
+        local total="$1" days hours mins secs
+        days=$((total / 86400))
+        hours=$(((total % 86400) / 3600))
+        mins=$(((total % 3600) / 60))
+        secs=$((total % 60))
+        if [ "$days" -gt 0 ]; then printf '%dd%02dh' "$days" "$hours"
+        elif [ "$hours" -gt 0 ]; then printf '%dh%02dm' "$hours" "$mins"
+        elif [ "$mins" -gt 0 ]; then printf '%dm%02ds' "$mins" "$secs"
+        else printf '%ds' "$secs"
+        fi
+    }
+    printf '%6s %10s   %s\n' seen longest command
+    while IFS=$'\t' read -r seen longest cmd; do
+        printf '%6s %10s   %s\n' "$seen" "$(duration "$longest")" "$cmd"
+    done < <(jq -r 'sort_by(.seen, .longest_seconds) | reverse[] | [.seen, .longest_seconds, .cmd] | @tsv' "$ledger")
+    echo
+    echo "Allow one: just relaunch-add 'claude agents'"
+
+# Create the empty user-owned relaunch voucher with explanatory comments.
+# Seeding never authorizes a command.
+relaunch-seed:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source "{{repo_dir}}/scripts/lib-detect.sh"
+    voucher=$(relaunch_voucher_file)
+    mkdir -p "$(dirname "$voucher")"
+    if [ ! -f "$voucher" ]; then
+        printf '%s\n' \
+            '# tmux-assistant-resurrect session-less relaunch vouchers' \
+            '# One canonical command per line. Comments and blank lines are ignored.' \
+            "# Add observed commands with: just relaunch-add 'claude agents'" >"$voucher"
+        chmod 600 "$voucher"
+        echo "Created empty voucher: $voucher"
+    else
+        echo "Voucher already exists: $voucher"
+    fi
+
+# Authorize one canonical command already present in the advisory ledger.
+# Hazard words only produce this interactive warning; save and restore never
+# consult this deliberately incomplete list.
+relaunch-add cmd force='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    requested={{quote(cmd)}}
+    force={{quote(force)}}
+    source "{{repo_dir}}/scripts/lib-detect.sh"
+    resurrect_dir=$(resurrect_data_dir)
+    ledger="$resurrect_dir/assistant-relaunch-candidates.json"
+    voucher=$(relaunch_voucher_file)
+    if [ ! -f "$ledger" ] || ! jq -e --arg cmd "$requested" '.[] | select(.cmd == $cmd)' "$ledger" >/dev/null; then
+        echo "Refusing: command is absent from $ledger" >&2
+        echo "Run 'just relaunch-candidates' after a save and copy the command exactly." >&2
+        exit 1
+    fi
+    tool=$(jq -r --arg cmd "$requested" '[.[] | select(.cmd == $cmd)] | first | .tool // empty' "$ledger")
+    canonical=$(relaunch_canon "$tool" "$requested" 2>/dev/null || true)
+    if [ "$canonical" != "$requested" ] || ! relaunch_shape_ok "$requested"; then
+        echo "Refusing: ledger entry is not a canonical relaunch candidate." >&2
+        exit 1
+    fi
+    hazard=0
+    set -f
+    for token in $requested; do
+        case "${token%%=*}" in
+            --dangerously-skip-permissions|--dangerously-bypass-approvals-and-sandbox|--allow-all|--yolo|--full-auto|--cloud|--environment|--worktree|--bare)
+                hazard=1
+                ;;
+        esac
+    done
+    set +f
+    if [ "$hazard" -eq 1 ] && [ "$force" != "--force" ]; then
+        echo "Warning: command contains a permission, remote, or workspace hazard token." >&2
+        echo "Review it, then rerun with a final --force argument to authorize it." >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "$voucher")"
+    touch "$voucher"
+    chmod 600 "$voucher"
+    if sed 's/\r$//' "$voucher" | grep -Fxq -- "$requested"; then
+        echo "Already vouched: $requested"
+        exit 0
+    fi
+    printf '\n# added %s via just relaunch-add\n%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$requested" >>"$voucher"
+    echo "Vouched: $requested"
+
 # Clean up stale state files (from dead processes)
 clean:
     #!/usr/bin/env bash
@@ -397,6 +496,10 @@ test-tmux-contract:
 # Run hermetic Copilot session-discovery tests (no binary or login required)
 test-copilot:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/test/copilot-unit-tests.sh"
+
+# Run hermetic session-less relaunch voucher tests (no tmux or CLI needed)
+test-relaunch:
+    @"${TEST_BASH:-bash}" "{{repo_dir}}/test/relaunch-unit-tests.sh"
 
 # Authenticated Copilot round trip: prompt -> save -> kill -> restore -> recall.
 # Needs a real Copilot login and spends a few AI credits; skips without a token.

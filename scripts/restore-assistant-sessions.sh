@@ -35,31 +35,38 @@ if [ ! -f "$INPUT_FILE" ]; then
 	exit 0
 fi
 
-# Read saved sessions
-sessions=$(jq -r '.sessions // []' "$INPUT_FILE")
-count=$(echo "$sessions" | jq 'length')
+# Read resumable sessions and vouched session-less relaunches as one tagged
+# stream. The sibling-key schema keeps both upgrade directions safe: old
+# restores ignore .relaunch, and new restores treat a missing key as empty.
+entries=$(jq -c \
+	'[ (.sessions // [])[] | . + {kind: "session"} ]
+	 + [ (.relaunch // [])[] | . + {kind: "relaunch"} ]' \
+	"$INPUT_FILE")
+count=$(echo "$entries" | jq 'length')
 
 if [ "$count" -eq 0 ]; then
-	log "no assistant sessions to restore"
+	log "no assistant panes to restore"
 	exit 0
 fi
 
 # Wait for panes to be fully initialized after resurrect restore
 sleep 2
 
-log "restoring $count assistant session(s)..."
+log "restoring $count assistant pane(s)..."
 
 # Use a temp file to avoid subshell variable scoping issues with pipes
 tmpfile=$(mktemp)
 trap 'rm -f "$tmpfile"' EXIT INT TERM
-echo "$sessions" | jq -c '.[]' >"$tmpfile"
+echo "$entries" | jq -c '.[]' >"$tmpfile"
 
 restored=0
 while read -r entry; do
 	pane=$(echo "$entry" | jq -r '.pane')
 	tool=$(echo "$entry" | jq -r '.tool')
-	session_id=$(echo "$entry" | jq -r '.session_id')
-	cwd=$(echo "$entry" | jq -r '.cwd')
+	kind=$(echo "$entry" | jq -r '.kind')
+	session_id=$(echo "$entry" | jq -r '.session_id // empty')
+	relaunch_cmd=$(echo "$entry" | jq -r '.cmd // empty')
+	cwd=$(echo "$entry" | jq -r '.cwd // empty')
 	cli_args=$(echo "$entry" | jq -r '.cli_args // empty')
 	model=$(echo "$entry" | jq -r '.model // empty')
 	env_json=$(echo "$entry" | jq -c '.env // {}')
@@ -172,34 +179,57 @@ while read -r entry; do
 		done
 	fi
 
-	# Build the resume command for each tool.
-	# Apply posix_quote to session_id defensively — IDs are alphanumeric in
-	# practice, but a corrupt/tampered sidecar JSON could inject shell commands.
-	safe_sid=$(posix_quote "$session_id")
-
-	# Quote cli_args tokens and disable glob expansion while splitting, so
-	# args like "claude-opus-4-6[1m]" are treated literally.
-	safe_cli_args=""
-	if [ -n "$cli_args" ]; then
-		set -f
-		for _arg in $cli_args; do
-			safe_cli_args="${safe_cli_args} $(posix_quote "$_arg")"
-		done
-		set +f
-	fi
-
-	# Add --model from the sidecar model field if not already in cli_args.
-	# Only for Claude — OpenCode and Codex don't support --model.
-	safe_model_arg=""
-	if [ -n "$model" ] && [ "$tool" = "claude" ]; then
-		case "$cli_args" in
-		*--model*) ;;
-		*) safe_model_arg=" --model $(posix_quote "$model")" ;;
-		esac
-	fi
-
 	resume_cmd=""
-	case "$tool" in
+	if [ "$kind" = "relaunch" ]; then
+		# Shape and hazard hints are intentionally absent here. The only gate is
+		# exact membership in the current user-owned voucher, and the returned
+		# command is rebuilt from that matching voucher line rather than from
+		# sidecar bytes.
+		relaunch_enabled=$(tmux show-option -gqv @assistant-resurrect-relaunch 2>/dev/null || true)
+		relaunch_enabled="${relaunch_enabled:-on}"
+		case "$relaunch_enabled" in
+		on | yes | true | 1) ;;
+		*)
+			log "relaunch disabled for $tool in $pane, skipping"
+			continue
+			;;
+		esac
+		if [ -z "$relaunch_cmd" ]; then
+			log "empty relaunch cmd for $tool in $pane, skipping"
+			continue
+		fi
+		resume_cmd=$(relaunch_command_from_voucher "$tool" "$relaunch_cmd" "$pane_cmd") || {
+			log "relaunch cmd not vouched for $tool in $pane: $relaunch_cmd"
+			continue
+		}
+	else
+		# Build the resume command for each tool. Apply posix_quote to the
+		# session ID defensively: IDs are alphanumeric in practice, but a
+		# corrupt/tampered sidecar must not inject shell commands.
+		safe_sid=$(posix_quote "$session_id")
+
+		# Quote cli_args tokens and disable glob expansion while splitting, so
+		# args like "claude-opus-4-6[1m]" are treated literally.
+		safe_cli_args=""
+		if [ -n "$cli_args" ]; then
+			set -f
+			for _arg in $cli_args; do
+				safe_cli_args="${safe_cli_args} $(posix_quote "$_arg")"
+			done
+			set +f
+		fi
+
+		# Add --model from the sidecar model field if not already in cli_args.
+		# Only for Claude — OpenCode and Codex don't support --model.
+		safe_model_arg=""
+		if [ -n "$model" ] && [ "$tool" = "claude" ]; then
+			case "$cli_args" in
+			*--model*) ;;
+			*) safe_model_arg=" --model $(posix_quote "$model")" ;;
+			esac
+		fi
+
+		case "$tool" in
 	claude)
 		if [ -n "$safe_cli_args" ] || [ -n "$safe_model_arg" ]; then
 			resume_cmd="command claude${safe_cli_args}${safe_model_arg} --resume ${safe_sid}"
@@ -263,13 +293,18 @@ while read -r entry; do
 		continue
 		;;
 	esac
+	fi
 
 	# Prepend env vars if present
 	if [ -n "$env_prefix" ]; then
 		resume_cmd="${env_prefix}${resume_cmd}"
 	fi
 
-	log "restoring $tool in $pane (session: $session_id, cmd: $resume_cmd)"
+	if [ "$kind" = "relaunch" ]; then
+		log "relaunching $tool in $pane (cmd: $resume_cmd)"
+	else
+		log "restoring $tool in $pane (session: $session_id, cmd: $resume_cmd)"
+	fi
 
 	# Clear the pane before launching: tmux-resurrect may have restored old
 	# pane contents (captured terminal text from the previous session). Without
@@ -297,4 +332,4 @@ done <"$tmpfile"
 
 rm -f "$tmpfile"
 
-log "restored $restored of $count assistant session(s)"
+log "restored $restored of $count assistant pane(s)"

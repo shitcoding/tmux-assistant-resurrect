@@ -4,6 +4,9 @@
 #
 # Provides:
 #   detect_tool <args>           — returns tool name or empty string
+#   relaunch_canon <tool> <argv> — canonical session-less command, or failure
+#   relaunch_shape_ok <canon>    — advisory candidate-shape filter
+#   relaunch_voucher_match <tool> <canon> — exact vouched line, or failure
 #   pane_has_assistant <pane_pid> [ps_snapshot] — returns 0 + prints PID if found
 #   split_pane_target <target>   — splits "session:window.pane" into its parts
 #   match_pane_id <s> <w> <p>    — filters a pane table on stdin to one pane id
@@ -46,6 +49,152 @@ detect_tool() {
 		;;
 	grok | grok\ * | */grok | */grok\ *) echo "grok" ;;
 	esac
+}
+
+# --- session-less relaunch vouchers ---
+
+# Canonicalize the flattened argv reported by ps. This is deliberately a
+# small, idempotent transform: it validates argv[0], removes the duplicate
+# Node script path form (`claude /path/to/claude ...`), and joins tokens with
+# one space. It does not interpret shell syntax or decide that a command is
+# safe to run; exact membership in the user-owned voucher file is the only
+# authorization gate.
+relaunch_canon() {
+	local tool="$1" raw_args="$2"
+	local first token result
+	[ "$(detect_tool "$tool")" = "$tool" ] || return 1
+
+	set -f
+	# shellcheck disable=SC2086 # ps argv is intentionally split into tokens.
+	set -- $raw_args
+	set +f
+	[ "$#" -gt 0 ] || return 1
+
+	first="$1"
+	[ "${first##*/}" = "$tool" ] || return 1
+	shift
+
+	# Node-based launchers can expose the script path as a second copy of the
+	# tool name. Mirror extract_cli_args() and remove that one token.
+	if [ "$#" -gt 0 ]; then
+		case "$1" in
+		*/"$tool") shift ;;
+		esac
+	fi
+
+	result="$tool"
+	for token in "$@"; do
+		result="$result $token"
+	done
+	printf '%s\n' "$result"
+}
+
+# Structural proposer for the advisory candidates ledger. Passing this filter
+# never authorizes a relaunch. Keep it conservative because ps has already lost
+# quoting boundaries; commands it cannot round-trip cleanly should not be
+# suggested to the user.
+relaunch_shape_ok() {
+	local canon="$1" token flag_name
+	local token_count=0 positional_count=0 byte_count
+	local flag_re='^--?[A-Za-z0-9][A-Za-z0-9._-]*(=[^[:space:]]{0,64})?$'
+	local positional_re='^[a-z][a-z0-9-]{0,31}$'
+
+	byte_count=$(printf '%s' "$canon" | LC_ALL=C wc -c | tr -d ' ')
+	[ "$byte_count" -le 128 ] || return 1
+	printf '%s' "$canon" | LC_ALL=C grep -Eq '^[ -~]+$' || return 1
+
+	set -f
+	# shellcheck disable=SC2086 # canonical argv is intentionally tokenized.
+	set -- $canon
+	set +f
+	[ "$#" -gt 1 ] || return 1
+	[ "$#" -le 10 ] || return 1
+	shift # validated tool token; relaunch_canon() owns that check
+
+	for token in "$@"; do
+		token_count=$((token_count + 1))
+		[ "$token" != "--" ] || return 1
+		case "$token" in
+		-*)
+			[[ "$token" =~ $flag_re ]] || return 1
+			flag_name="${token%%=*}"
+			# Prompt-bearing modes are one-shot work, not long-lived modes.
+			# This list is advisory-only and must never be used as the voucher
+			# authorization gate in save or restore.
+			case "$flag_name" in
+			-p | --print | --prompt | -i | --interactive | -m | --message | -q | --query | --input | --instruction | --instructions | --task)
+				return 1
+				;;
+			esac
+			;;
+		*)
+			[[ "$token" =~ $positional_re ]] || return 1
+			positional_count=$((positional_count + 1))
+			[ "$positional_count" -le 2 ] || return 1
+			;;
+		esac
+	done
+
+	[ "$token_count" -gt 0 ] && [ "$positional_count" -ge 1 ]
+}
+
+# Resolve the user-owned voucher file. An unset tmux option follows the
+# tmux-resurrect save directory; tests and unusual installations can keep using
+# TMUX_RESURRECT_DIR through resurrect_data_dir().
+relaunch_voucher_file() {
+	local configured
+	configured=$(tmux show-option -gqv @assistant-resurrect-relaunch-allow-file 2>/dev/null || true)
+	if [ -n "$configured" ]; then
+		printf '%s\n' "$configured"
+	else
+		printf '%s/assistant-relaunch-allow.txt\n' "$(resurrect_data_dir)"
+	fi
+}
+
+# Print the exact matching line from the voucher file. The sidecar value must
+# already be canonical: normalizing a tampered lookup key here would weaken the
+# whole-line byte-equality guarantee. CRLF line endings are accepted, but
+# trailing spaces remain significant and therefore do not match.
+relaunch_voucher_match() {
+	local tool="$1" canon="$2" file normalized line
+	normalized=$(relaunch_canon "$tool" "$canon") || return 1
+	[ "$normalized" = "$canon" ] || return 1
+
+	file=$(relaunch_voucher_file)
+	[ -f "$file" ] || return 1
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="${line%$'\r'}"
+		# Canonical commands cannot begin with whitespace, so all such lines
+		# are safely ignorable alongside blank lines and comments.
+		case "$line" in
+		'' | \#* | [[:space:]]*) continue ;;
+		esac
+		if printf '%s\n' "$line" | grep -Fxq -- "$canon"; then
+			printf '%s\n' "$line"
+			return 0
+		fi
+	done <"$file"
+	return 1
+}
+
+# Build a shell-safe command only from a line returned by the voucher matcher.
+# Metacharacters introduced by expansion are ordinary argv bytes, and every
+# token is quoted for the restored pane's shell before send-keys sees it.
+relaunch_command_from_voucher() {
+	local tool="$1" canon="$2" shell_name="${3:-sh}"
+	local line rest="" token
+	line=$(relaunch_voucher_match "$tool" "$canon") || return 1
+
+	set -f
+	# shellcheck disable=SC2086 # the vouched canonical line is tokenized as argv.
+	set -- $line
+	set +f
+	[ "$#" -gt 0 ] && [ "$1" = "$tool" ] || return 1
+	shift
+	for token in "$@"; do
+		rest="$rest $(shell_quote "$shell_name" "$token")"
+	done
+	printf 'command %s%s\n' "$tool" "$rest"
 }
 
 # --- pane_has_assistant ---

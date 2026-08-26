@@ -295,7 +295,8 @@ Example output:
       "cli_args": "",
       "env": {"tmux_pane": "%2", "shell": "/bin/zsh"}
     }
-  ]
+  ],
+  "relaunch": []
 }
 ```
 
@@ -350,10 +351,10 @@ cat ~/.local/share/tmux/resurrect/assistant-restore.log
 You should see lines like:
 
 ```
-[2026-02-15T20:34:31Z] restoring 2 assistant session(s)...
+[2026-02-15T20:34:31Z] restoring 2 assistant pane(s)...
 [2026-02-15T20:34:31Z] restoring claude in my-project:0.0 (session: 01abc..., cmd: claude --dangerously-skip-permissions --resume '01abc...')
 [2026-02-15T20:34:32Z] restoring opencode in other-project:0.0 (session: ses_xyz..., cmd: opencode -s 'ses_xyz...')
-[2026-02-15T20:34:33Z] restored 2 of 2 assistant session(s)
+[2026-02-15T20:34:33Z] restored 2 of 2 assistant pane(s)
 ```
 
 The save log is also available if you want to see what was detected:
@@ -438,6 +439,43 @@ State files live in a user-only directory (mode 0700).
 > **Note:** Avoid capturing secrets (API keys, tokens). State files and the
 > sidecar JSON persist to disk and may outlive the process they were captured
 > from.
+
+### Session-less relaunch vouchers
+
+Long-lived modes such as `claude agents`, `claude gateway`, and
+`claude mcp serve` do not have a resumable session ID. The save hook proposes
+short, structurally plausible commands in an advisory ledger, but it relaunches
+nothing until you explicitly vouch the exact canonical command:
+
+```bash
+just relaunch-candidates
+just relaunch-add 'claude agents'
+```
+
+The voucher defaults to
+`assistant-relaunch-allow.txt` beside tmux-resurrect's save files. It is plain
+text: one canonical command per line, with blank lines and `#` comments ignored.
+`just relaunch-seed` creates an empty documented file without authorizing
+anything. Commands containing advisory hazard words require a final `--force`
+argument to `relaunch-add`; that warning list is never consulted by save or
+restore.
+
+Authorization is fixed-string, whole-line equality. The sidecar stores vouched
+panes under the sibling `.relaunch` key, but its `cmd` is only a lookup key.
+Restore tokenizes and quotes the matching line read from the current voucher,
+never the sidecar value, before sending it to the pane. A missing or empty
+voucher therefore preserves the previous behavior: session-less panes return as
+bare shells. This is why relaunch support can safely default to on.
+
+Configure it in `tmux.conf` when needed:
+
+```bash
+# Disable all session-less relaunch handling.
+set -g @assistant-resurrect-relaunch 'off'
+
+# Store the voucher somewhere else.
+set -g @assistant-resurrect-relaunch-allow-file '/path/to/assistant-relaunch-allow.txt'
+```
 
 ### PATH in restricted environments (NixOS, systemd services)
 
@@ -624,7 +662,9 @@ matching binary names. Then extracts session IDs using tool-specific methods
   `--config-dir` root, replayed automatically so restore finds the same UUID
 
 Writes everything to `assistant-sessions.json` in tmux-resurrect's save
-directory (see **Save location** above).
+directory (see **Save location** above). Vouched session-less modes are written
+to the sibling `.relaunch` array; ordinary resumable entries retain the existing
+`.sessions` schema.
 
 Helper programs (SQLite/JSONL lookups, path resolution) live as standalone
 files under `scripts/py/` and are handed to `python3` via argv. They are
@@ -639,12 +679,28 @@ second line of defense.
 Runs after each tmux-resurrect restore. Reads the sidecar JSON and reconstructs
 the full CLI invocation for each assistant: `<env_prefix> <binary> <cli_args>
 <resume_arg>`. Sends the command to each pane via `tmux send-keys`. If enriched
-fields are missing (old-format JSON), falls back to bare resume commands.
+fields are missing (old-format JSON), falls back to bare resume commands. For a
+`.relaunch` entry, it instead requires an exact current voucher match and builds
+the command from the matching voucher line.
 
 ## Limitations
 
 - **Running state is not preserved**: Assistants restart with their conversation
   history loaded, but any in-flight tool calls or pending operations are lost.
+- **Session-less modes require one user action per command**: Until you add an
+  observed command to the voucher, that pane deliberately returns as a shell.
+- **The voucher is user authority**: `relaunch-add` warns about known hazard
+  tokens, but a user can hand-edit a dangerous command into the file. The safety
+  property is “nothing unattended,” not “nothing dangerous.”
+- **Flattened argv is lossy**: `ps` cannot preserve quoted multi-word argument
+  boundaries. The advisory shape filter excludes those commands instead of
+  proposing a replay it cannot reproduce exactly.
+- **Binary-name collisions remain possible**: Short names such as `pi`, `omp`,
+  and `grok` can identify an unrelated process. Bare commands are never eligible
+  for relaunch, and an exact user voucher is still required.
+- **Hazard warnings are deliberately incomplete**: The `relaunch-add` list is
+  advisory only. It does not participate in save or restore authorization and
+  cannot silently become a maintainer-owned command allowlist.
 - **First save after install (chicken-and-egg)**: An assistant must expose a
   session ID before it can be saved. Claude and OpenCode normally do this at
   session start. **A Copilot session you have not typed into yet cannot be
