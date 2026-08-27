@@ -1124,7 +1124,7 @@ relaunch_ledger_apply() {
 	fi
 	tmp="${RELAUNCH_LEDGER_FILE}.tmp.$$"
 	RELAUNCH_LEDGER_TMP="$tmp"
-	if ! jq -Rn \
+	if ! (umask 077 && jq -Rn \
 		--arg existing "$existing" \
 		--arg tool "$tool" \
 		--arg cmd "$canon" \
@@ -1148,7 +1148,7 @@ relaunch_ledger_apply() {
 			last_seen_epoch: $now
 		  }]
 		 | sort_by(.last_seen_epoch) | reverse | .[:200])
-	' >"$tmp"; then
+	' >"$tmp"); then
 		rm -f "$tmp"
 		RELAUNCH_LEDGER_TMP=""
 		return 1
@@ -1662,9 +1662,8 @@ _discover_option_value_flags() {
 }
 
 # Remove positional argv while retaining values belonging to known options.
-# Once the first positional is seen, later bare tokens are also treated as
-# positional even when a prompt contains a flag-looking word such as --model.
-# Dash-prefixed words themselves are deliberately retained by the exact rule.
+# Once the first positional is seen, discard it and the entire remaining tail:
+# a prompt can contain flag-looking words that must never become replayed flags.
 _drop_positional_args() {
 	local tool="$1" args="$2"
 	# Bash 3.2 treats an empty array expansion as an unbound variable under
@@ -1691,7 +1690,7 @@ _drop_positional_args() {
 	[ -n "$reglob" ] && set +f
 
 	local -a out=()
-	local word flag="" expects_value=0 variadic=0 saw_positional=0
+	local word flag="" expects_value=0 variadic=0
 	for word in "${words[@]}"; do
 		case "$word" in
 		-*)
@@ -1702,29 +1701,24 @@ _drop_positional_args() {
 			case "$word" in
 			*=*) ;;
 			*)
-				if [ "$saw_positional" -eq 0 ]; then
-					case "$value_flags" in
-					*" $flag "*) expects_value=1 ;;
-					esac
-					case "$variadic_flags" in
-					*" $flag "*) variadic=1 ;;
-					esac
-				fi
+				case "$value_flags" in
+				*" $flag "*) expects_value=1 ;;
+				esac
+				case "$variadic_flags" in
+				*" $flag "*) variadic=1 ;;
+				esac
 				;;
 			esac
 			;;
 		*)
-			if [ "$saw_positional" -eq 0 ] && [ "$expects_value" -eq 1 ]; then
+			if [ "$expects_value" -eq 1 ]; then
 				out[${#out[@]}]="$word"
 				if [ "$variadic" -eq 0 ]; then
 					expects_value=0
 					flag=""
 				fi
 			else
-				saw_positional=1
-				expects_value=0
-				variadic=0
-				flag=""
+				break
 			fi
 			;;
 		esac

@@ -487,9 +487,13 @@ short, structurally plausible commands in an advisory ledger, but it relaunches
 nothing until you explicitly vouch the exact canonical command:
 
 ```bash
+cd "${TMUX_PLUGIN_MANAGER_PATH:-$HOME/.tmux/plugins}/tmux-assistant-resurrect"
 just relaunch-candidates
 just relaunch-add 'claude agents'
 ```
+
+The `cd` is required for a normal TPM installation because these commands are
+recipes in the plugin's own `justfile`.
 
 The voucher defaults to
 `assistant-relaunch-allow.txt` beside tmux-resurrect's save files. It is plain

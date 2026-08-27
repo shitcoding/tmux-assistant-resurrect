@@ -3220,10 +3220,12 @@ assert_eq "OMP drops inline prompt and keeps option values" "--model opus" \
 assert_eq "Grok drops inline prompt and keeps option values" "--model grok-4" \
 	"$(extract_cli_args "grok" "grok --model grok-4 Fix the login bug")"
 
-# The exact dash-prefix rule retains flag-looking prompt words. Once a real
-# positional starts, however, the following bare word cannot become its value.
-assert_eq "Claude retains flag-looking prompt word only" "--dangerously-skip-permissions --model" \
+# Once a prompt starts, its entire tail is discarded, including text that
+# resembles an option and must not become an executable flag during restore.
+assert_eq "Claude drops all prompt tokens after the first positional" "--dangerously-skip-permissions" \
 	"$(extract_cli_args "claude" "claude --dangerously-skip-permissions Fix the --model flag")"
+assert_eq "Claude does not replay a privileged-looking prompt word" "--model sonnet" \
+	"$(extract_cli_args "claude" "claude --model sonnet Explain --dangerously-skip-permissions")"
 
 # OpenCode: strip -s <id>
 assert_eq "OpenCode strip -s" "--verbose" \

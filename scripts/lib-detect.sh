@@ -82,6 +82,7 @@ relaunch_canon() {
 	# tool name. Mirror extract_cli_args() and remove that one token.
 	if [ "$#" -gt 0 ]; then
 		case "$1" in
+		-*) ;;
 		*/"$tool") shift ;;
 		esac
 	fi
@@ -126,6 +127,13 @@ relaunch_shape_ok() {
 		-*)
 			[[ "$token" =~ $flag_re ]] || return 1
 			flag_name="${token%%=*}"
+			# Candidate commands are written to an advisory ledger. Never
+			# persist values attached to credential-shaped options there.
+			case "$flag_name" in
+			--api-key | --api-key-* | --api_key | --api_key_* | --token | --token-* | --token_* | --secret* | --password | --password-* | --password_* | --auth*)
+				return 1
+				;;
+			esac
 			# Prompt-bearing modes are one-shot work, not long-lived modes.
 			# This list is advisory-only and must never be used as the voucher
 			# authorization gate in save or restore.

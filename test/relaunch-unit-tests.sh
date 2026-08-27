@@ -64,6 +64,9 @@ assert_eq "absolute binary path and whitespace collapse" "claude agents" "$canon
 assert_eq "canonicalization is idempotent" "$canon" "$(relaunch_canon claude "$canon")"
 assert_eq "Node wrapper script path is removed" "claude agents" \
 	"$(relaunch_canon claude 'claude /opt/homebrew/lib/node_modules/@anthropic-ai/claude agents')"
+assert_eq "option value ending in the tool name is preserved" \
+	"claude --config=/home/user/claude agents" \
+	"$(relaunch_canon claude 'claude --config=/home/user/claude agents')"
 assert_false "argv[0] must equal the detected tool" relaunch_canon claude 'env claude agents'
 
 echo "== advisory shape filter =="
@@ -72,6 +75,11 @@ assert_true "flags plus one positional are eligible" relaunch_shape_ok 'claude -
 assert_false "bare Claude is refused" relaunch_shape_ok 'claude'
 assert_false "bare Pi is refused" relaunch_shape_ok 'pi'
 assert_false "prompt flag is refused" relaunch_shape_ok 'claude -p summarize this'
+assert_false "API key flag is never written to the ledger" relaunch_shape_ok 'pi --api-key=secret repl'
+assert_false "token flag is never written to the ledger" relaunch_shape_ok 'claude --token=secret agents'
+assert_false "secret flag is never written to the ledger" relaunch_shape_ok 'copilot --secret-env-vars=TOKEN shell'
+assert_false "password flag is never written to the ledger" relaunch_shape_ok 'claude --password=secret agents'
+assert_false "auth flag is never written to the ledger" relaunch_shape_ok 'claude --auth-token=secret agents'
 assert_false "bare double dash is refused" relaunch_shape_ok 'claude bg-pty-host worker -- claude agents'
 
 long_prompt_2k=""
@@ -143,13 +151,27 @@ jq -n --argjson now "$now" '
       first_seen:"2026-01-01T00:00:00Z", last_seen:"2026-01-01T00:00:00Z",
       last_seen_epoch:($now - 2678400)}]
 ' >"$RELAUNCH_LEDGER_FILE"
+original_umask=$(umask)
+umask 022
 relaunch_ledger_apply claude 'claude agents' "$$"
+umask "$original_umask"
 assert_eq "ledger is capped to 200 recent entries" "200" \
 	"$(jq 'length' "$RELAUNCH_LEDGER_FILE")"
 assert_eq "entries unseen for more than 30 days are pruned" "0" \
 	"$(jq '[.[] | select(.cmd == "claude stale")] | length' "$RELAUNCH_LEDGER_FILE")"
 assert_eq "current candidate survives the LRU cap" "1" \
 	"$(jq '[.[] | select(.cmd == "claude agents")] | length' "$RELAUNCH_LEDGER_FILE")"
+case "$(uname -s)" in
+Darwin)
+	assert_eq "ledger is written with owner-only permissions" "600" \
+		"$(stat -f '%Lp' "$RELAUNCH_LEDGER_FILE")"
+	;;
+MINGW* | MSYS* | CYGWIN*) ;;
+*)
+	assert_eq "ledger is written with owner-only permissions" "600" \
+		"$(stat -c '%a' "$RELAUNCH_LEDGER_FILE")"
+	;;
+esac
 
 jq -n --argjson old "$((now - 2678400))" \
 	'[{tool:"claude", cmd:"claude agents", seen:99, longest_seconds:999,
