@@ -6,21 +6,52 @@
 //
 // Install: symlink into ~/.config/opencode/plugins/ (global) or .opencode/plugins/ (project).
 
-import { writeFileSync, mkdirSync, unlinkSync } from "fs";
+import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "fs";
 import { execSync } from "child_process";
-import { tmpdir } from "os";
+import { homedir } from "os";
 
 export const SessionTracker = async ({ client, directory }) => {
+  // Must resolve to exactly what assistant_state_dir() in scripts/lib-detect.sh
+  // produces: this plugin runs inside opencode, the save hook runs as a child of
+  // the tmux server, and the two never share an environment. Anything the two
+  // sides can disagree about silently loses the session ID (issue #65) — which is
+  // why this is $HOME and not XDG_RUNTIME_DIR/tmpdir(). Prefer process.env.HOME
+  // over homedir() so the two implementations agree byte for byte; homedir() is
+  // only the fallback for the (never, under tmux) case where HOME is unset.
   const stateDir =
     process.env.TMUX_ASSISTANT_RESURRECT_DIR ||
-    `${process.env.XDG_RUNTIME_DIR || tmpdir()}/tmux-assistant-resurrect`;
+    `${process.env.HOME || homedir()}/.local/state/tmux-assistant-resurrect`;
   // OpenCode loads plugins in-process via `await import()` (no child process),
   // so process.pid is the opencode binary's PID — matching what the save script
   // finds via `ps` tree walk.
   const pid = process.pid;
   const stateFile = `${stateDir}/opencode-${pid}.json`;
 
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  // Mirrors ensure_assistant_state_dir() in scripts/lib-detect.sh — see the long
+  // comment there for why. The Node-specific trap: `recursive` applies `mode` to
+  // every level it creates, not just the deepest, so the one-liner this replaces
+  // would have clamped ~/.local and ~/.local/state to 0700 the moment the path
+  // moved under $HOME. Create the parents at the umask default, the leaf private,
+  // and leave a directory that already exists exactly as the user set it up.
+  if (!existsSync(stateDir)) {
+    const trimmed = stateDir.replace(/\/+$/, "");
+    const parent = trimmed.replace(/\/[^/]*$/, "");
+    // A slashless override ("state") leaves parent === trimmed, and creating that
+    // would make the leaf itself at the ambient mode — the private mkdirSync below
+    // would then just swallow EEXIST and hand back 0755. Same guard as the shell.
+    if (parent && parent !== trimmed) mkdirSync(parent, { recursive: true });
+    try {
+      mkdirSync(stateDir, { mode: 0o700 });
+    } catch (err) {
+      // EEXIST: the save hook won the race, and it created the leaf the same way.
+      // Anything else (a parent that could not be made): retry recursively but
+      // still under 0700, never at the ambient mode, so a missing state file — not
+      // a world-readable one, and not a dead plugin — is the worst outcome.
+      if (err.code !== "EEXIST") {
+        mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      }
+    }
+  }
 
   // Read user-configured env vars to capture from the tmux option
   // @assistant-resurrect-capture-env (space-separated list).

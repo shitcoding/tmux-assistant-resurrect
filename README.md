@@ -295,7 +295,8 @@ Example output:
       "cli_args": "",
       "env": {"tmux_pane": "%2", "shell": "/bin/zsh"}
     }
-  ]
+  ],
+  "relaunch": []
 }
 ```
 
@@ -350,10 +351,10 @@ cat ~/.local/share/tmux/resurrect/assistant-restore.log
 You should see lines like:
 
 ```
-[2026-02-15T20:34:31Z] restoring 2 assistant session(s)...
+[2026-02-15T20:34:31Z] restoring 2 assistant pane(s)...
 [2026-02-15T20:34:31Z] restoring claude in my-project:0.0 (session: 01abc..., cmd: claude --dangerously-skip-permissions --resume '01abc...')
 [2026-02-15T20:34:32Z] restoring opencode in other-project:0.0 (session: ses_xyz..., cmd: opencode -s 'ses_xyz...')
-[2026-02-15T20:34:33Z] restored 2 of 2 assistant session(s)
+[2026-02-15T20:34:33Z] restored 2 of 2 assistant pane(s)
 ```
 
 The save log is also available if you want to see what was detected:
@@ -368,6 +369,7 @@ cat ~/.local/share/tmux/resurrect/assistant-save.log
 |---------|-------|
 | Save finds 0 sessions | Run `ps -eo pid=,ppid=,args= \| grep -E 'claude\|copilot\|opencode\|codex\|pi'` to verify assistants are running |
 | Session ID missing for Claude | Verify the hook is installed: `jq '.hooks.SessionStart' ~/.claude/settings.json` |
+| Session ID missing, hook *is* installed | Check `assistant-save.log` — a `no session ID available` line names the state file it looked for. If that directory is empty but `ls ~/.local/state/tmux-assistant-resurrect` elsewhere is not, the two sides disagree on the path; see **State directory** below |
 | Session ID missing for Copilot | Check `ls ~/.copilot/session-state/*/inuse.*.lock` — the number in the filename must be the native Copilot PID from `ps`. If you set `COPILOT_HOME`, the save hook must see it too (tmux hooks do not inherit your shell profile; use `tmux set-environment -g COPILOT_HOME ...`) |
 | Session ID missing for OpenCode | Launch with `-s <id>`, or verify the plugin: `ls ~/.config/opencode/plugins/session-tracker.js` |
 | Session ID missing for Pi | Verify session files exist under `~/.pi/agent/sessions/--<cwd>--/*.jsonl` and that pane cwd matches the Pi session cwd |
@@ -380,24 +382,58 @@ cat ~/.local/share/tmux/resurrect/assistant-save.log
 
 ### State directory
 
-Session tracking files are written to a per-user temporary directory:
+Session tracking files are written to `$HOME/.local/state/tmux-assistant-resurrect`
+on every platform.
 
-| Platform | Default path |
-|----------|-------------|
-| **Linux (systemd)** | `$XDG_RUNTIME_DIR/tmux-assistant-resurrect` (e.g., `/run/user/1000/tmux-assistant-resurrect`) |
-| **macOS** | `$TMPDIR/tmux-assistant-resurrect` (e.g., `/var/folders/.../T/tmux-assistant-resurrect`) |
-| **Fallback** | `/tmp/tmux-assistant-resurrect` (only if both `XDG_RUNTIME_DIR` and `TMPDIR` are unset) |
+The path is deliberately a plain `$HOME` literal, and deliberately does *not*
+follow `XDG_STATE_HOME`, `XDG_RUNTIME_DIR` or `TMPDIR`. It is a rendezvous point
+between two processes that never share an environment: the assistant's
+SessionStart hook writes the files, and the save hook — a child of the tmux
+server — reads them. Any environment variable in the path is a chance for the two
+sides to disagree, and when they do the failure is silent: the save hook finds
+nothing and records no session ID. (This is [issue #65][issue-65]: Claude Code's
+`settings.json` can set `"env": {"TMPDIR": ...}`, which the hook inherits and the
+tmux server does not.) `$HOME` is the one variable both sides already agree on.
 
-This avoids permission conflicts on multi-user systems. Override with:
+To relocate the directory, set `TMUX_ASSISTANT_RESURRECT_DIR` **where both sides
+see it** — exporting it from your shell profile reaches only the assistant and
+reintroduces exactly the divergence above:
 
 ```bash
-export TMUX_ASSISTANT_RESURRECT_DIR=/path/to/state
+# in tmux.conf — reaches the save hook
+set-environment -g TMUX_ASSISTANT_RESURRECT_DIR /path/to/state
 ```
 
-Note: state files are transient — they track running assistant PIDs and session
-IDs while tmux is active. The persistent sidecar JSON
-(`assistant-sessions.json`, in tmux-resurrect's save directory — see **Save
-location** above) is what survives reboots.
+```jsonc
+// in ~/.claude/settings.json — reaches the SessionStart hook
+{ "env": { "TMUX_ASSISTANT_RESURRECT_DIR": "/path/to/state" } }
+```
+
+State files track running assistant PIDs and session IDs; the persistent sidecar
+JSON (`assistant-sessions.json`, in tmux-resurrect's save directory — see **Save
+location** above) is what a restore reads. Because `$HOME` survives reboots
+(where the old temporary directory did not), the save hook sweeps state files
+whose process is gone on every run, so the directory does not grow without bound.
+
+Upgrading from a version that used the temporary directory needs no action:
+assistants already running when you upgrade have their state files migrated on
+the next save. Because the old path resolved differently on either side — that
+being the bug — the migration does not just re-evaluate the old expression here;
+it sweeps every root a pre-upgrade hook could have landed on (`$XDG_RUNTIME_DIR`,
+`/run/user/<uid>`, `$TMPDIR`, macOS's per-user `/var/folders/…/T` when this side
+has no `$TMPDIR` of its own, and `/tmp`), skipping any it does not own. Where two
+files claim the same PID the newer one wins, since PIDs are recycled. Files whose
+assistant has since exited are dropped on the same pass.
+
+Two caveats remain, by construction. `TMUX_ASSISTANT_RESURRECT_DIR` is honoured
+independently on each side, so setting it in only one place *creates* the
+divergence rather than fixing it — hence the two snippets above. And if the
+assistant is launched with a different `$HOME` than the tmux server (a container,
+a `sudo -H`, a per-project home), the two sides part company again; the override,
+set on both, is the fix. When either happens the save log names the exact path it
+searched, so the mismatch is visible rather than silent.
+
+[issue-65]: https://github.com/timvw/tmux-assistant-resurrect/issues/65
 
 ### Environment variable capture and restoration
 
@@ -433,11 +469,56 @@ live process, the live process wins.
 
 Built-in variables (`TMUX_PANE`, `SHELL`) are **not** restored — `TMUX_PANE`
 would be stale after restore, and `SHELL` is already in the environment.
-State files live in a user-only directory (mode 0700).
+State files live in a user-only directory: it is created mode 0700, and its
+parents (`~/.local`, `~/.local/state`) are left at your umask. A directory that
+already exists keeps whatever mode you gave it — if you point
+`TMUX_ASSISTANT_RESURRECT_DIR` somewhere deliberately group-readable, that is
+respected rather than reset on every save.
 
 > **Note:** Avoid capturing secrets (API keys, tokens). State files and the
 > sidecar JSON persist to disk and may outlive the process they were captured
 > from.
+
+### Session-less relaunch vouchers
+
+Long-lived modes such as `claude agents`, `claude gateway`, and
+`claude mcp serve` do not have a resumable session ID. The save hook proposes
+short, structurally plausible commands in an advisory ledger, but it relaunches
+nothing until you explicitly vouch the exact canonical command:
+
+```bash
+cd "${TMUX_PLUGIN_MANAGER_PATH:-$HOME/.tmux/plugins}/tmux-assistant-resurrect"
+just relaunch-candidates
+just relaunch-add 'claude agents'
+```
+
+The `cd` is required for a normal TPM installation because these commands are
+recipes in the plugin's own `justfile`.
+
+The voucher defaults to
+`assistant-relaunch-allow.txt` beside tmux-resurrect's save files. It is plain
+text: one canonical command per line, with blank lines and `#` comments ignored.
+`just relaunch-seed` creates an empty documented file without authorizing
+anything. Commands containing advisory hazard words require a final `--force`
+argument to `relaunch-add`; that warning list is never consulted by save or
+restore.
+
+Authorization is fixed-string, whole-line equality. The sidecar stores vouched
+panes under the sibling `.relaunch` key, but its `cmd` is only a lookup key.
+Restore tokenizes and quotes the matching line read from the current voucher,
+never the sidecar value, before sending it to the pane. A missing or empty
+voucher therefore preserves the previous behavior: session-less panes return as
+bare shells. This is why relaunch support can safely default to on.
+
+Configure it in `tmux.conf` when needed:
+
+```bash
+# Disable all session-less relaunch handling.
+set -g @assistant-resurrect-relaunch 'off'
+
+# Store the voucher somewhere else.
+set -g @assistant-resurrect-relaunch-allow-file '/path/to/assistant-relaunch-allow.txt'
+```
 
 ### PATH in restricted environments (NixOS, systemd services)
 
@@ -624,7 +705,9 @@ matching binary names. Then extracts session IDs using tool-specific methods
   `--config-dir` root, replayed automatically so restore finds the same UUID
 
 Writes everything to `assistant-sessions.json` in tmux-resurrect's save
-directory (see **Save location** above).
+directory (see **Save location** above). Vouched session-less modes are written
+to the sibling `.relaunch` array; ordinary resumable entries retain the existing
+`.sessions` schema.
 
 Helper programs (SQLite/JSONL lookups, path resolution) live as standalone
 files under `scripts/py/` and are handed to `python3` via argv. They are
@@ -639,12 +722,28 @@ second line of defense.
 Runs after each tmux-resurrect restore. Reads the sidecar JSON and reconstructs
 the full CLI invocation for each assistant: `<env_prefix> <binary> <cli_args>
 <resume_arg>`. Sends the command to each pane via `tmux send-keys`. If enriched
-fields are missing (old-format JSON), falls back to bare resume commands.
+fields are missing (old-format JSON), falls back to bare resume commands. For a
+`.relaunch` entry, it instead requires an exact current voucher match and builds
+the command from the matching voucher line.
 
 ## Limitations
 
 - **Running state is not preserved**: Assistants restart with their conversation
   history loaded, but any in-flight tool calls or pending operations are lost.
+- **Session-less modes require one user action per command**: Until you add an
+  observed command to the voucher, that pane deliberately returns as a shell.
+- **The voucher is user authority**: `relaunch-add` warns about known hazard
+  tokens, but a user can hand-edit a dangerous command into the file. The safety
+  property is “nothing unattended,” not “nothing dangerous.”
+- **Flattened argv is lossy**: `ps` cannot preserve quoted multi-word argument
+  boundaries. The advisory shape filter excludes those commands instead of
+  proposing a replay it cannot reproduce exactly.
+- **Binary-name collisions remain possible**: Short names such as `pi`, `omp`,
+  and `grok` can identify an unrelated process. Bare commands are never eligible
+  for relaunch, and an exact user voucher is still required.
+- **Hazard warnings are deliberately incomplete**: The `relaunch-add` list is
+  advisory only. It does not participate in save or restore authorization and
+  cannot silently become a maintainer-owned command allowlist.
 - **First save after install (chicken-and-egg)**: An assistant must expose a
   session ID before it can be saved. Claude and OpenCode normally do this at
   session start. **A Copilot session you have not typed into yet cannot be

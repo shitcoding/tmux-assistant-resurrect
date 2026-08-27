@@ -26,7 +26,9 @@ tmux-resurrect to save session IDs and restore them automatically.
   hook/plugin systems instead.
 - **Restore hook is the sole launcher**: Assistants must NOT be listed in
   `@resurrect-processes`. The post-restore hook handles all resuming with correct
-  session IDs. Adding them to `@resurrect-processes` causes double-launch.
+  session IDs. Adding them to `@resurrect-processes` causes double-launch, and
+  its prefix-only command matching can also mistake prompt text for a promoted
+  long-lived mode; session-less relaunches therefore use the same restore hook.
 - **TPM-only installation for end users**: Users install via TPM (`set -g @plugin
   'timvw/tmux-assistant-resurrect'` + `prefix + I`). The `justfile` recipes are
   for developers only.
@@ -72,7 +74,28 @@ process args as a reliable fallback.
 ## Key conventions
 
 - All scripts use `set -euo pipefail`
-- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default: `$XDG_RUNTIME_DIR` or `$TMPDIR` + `/tmux-assistant-resurrect`)
+- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default:
+  `$HOME/.local/state/tmux-assistant-resurrect`), resolved *only* through
+  `assistant_state_dir()` in `scripts/lib-detect.sh`. Never inline the path or
+  add an environment variable to it: the hooks and the save script resolve it in
+  different process environments, so anything they can disagree about silently
+  loses session IDs (issue #65). `hooks/opencode-session-track.js` carries the
+  one unavoidable second implementation; `test/state-dir-unit-tests.sh` pins the
+  two together. The pre-#65 locations are enumerated by
+  `legacy_assistant_state_dirs()` as a *set*, not re-derived from the old
+  expression: that expression is the thing that resolved differently on either
+  side, so evaluating it once in the save script would migrate only the users who
+  were never broken.
+- Create that directory only through `ensure_assistant_state_dir()`, never with a
+  bare `mkdir`. It exists because the obvious spellings are all wrong once the
+  path is three levels under `$HOME`: `mkdir -p -m 0700` applies the mode to the
+  deepest directory only (SC2174) *and* fails outright on Git Bash, taking the
+  whole save down with it under `set -e`; `mkdir -p` plus `chmod 700` leaves a
+  window at the umask default, follows a symlink left at the path, and resets a
+  mode the user chose, on every save. The leaf is created under a scoped umask
+  and an existing directory is left alone. `hooks/opencode-session-track.js`
+  mirrors this, with the extra Node trap that `mkdirSync`'s `mode` applies to
+  *every* level `recursive` creates.
 - State files contain the full tool-provided context (merged from hook stdin /
   plugin events) plus plugin metadata (`tool`, `ppid`/`pid`, `timestamp`, `env`).
   The Claude hook merges Claude's entire SessionStart JSON; the OpenCode plugin
@@ -194,6 +217,12 @@ process args as a reliable fallback.
   `copilot_home` for Copilot's resolved state root, and `session_name` /
   `window_index` / `pane_index` (the pane's address as separate values). All are
   optional for backward compatibility.
+- Vouched session-less commands live in the sibling `.relaunch` array, never in
+  `.sessions`. Its `cmd` is only an exact lookup key; restore executes the
+  matching line from the user-owned voucher file. The shape filter only feeds
+  the advisory candidates ledger and must never authorize a relaunch. The
+  `relaunch-add` hazard list is likewise advisory-only and must never be read by
+  save or restore.
 - **Never hand a `session:window.pane` string to tmux as a target.** It is a
   display label, not an address: tmux's target grammar reserves `:` and `.`,
   session names may contain both (3.7 keeps them; 3.4-3.6 rewrote them to `_`),
