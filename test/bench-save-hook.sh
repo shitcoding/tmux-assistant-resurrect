@@ -27,8 +27,31 @@ fi
 
 BENCH_ROOT=$(mktemp -d)
 cleanup() {
+	# `tmux kill-server` only signals the server: it and all $PANES pane shells are
+	# still alive when the command returns, and each interactive shell flushes
+	# ~/.bash_history into $HOME on its way out. Removing the tree during that window
+	# loses a race -- rm walks $HOME, unlinks what it saw, then the final rmdir gets
+	# ENOTEMPTY because a dying shell recreated .bash_history behind it:
+	#
+	#   rm: cannot remove '/tmp/tmp.XXXXXXXX/home': Directory not empty
+	#
+	# Under `set -e` that fails the EXIT trap, which turns an exit status of 0 into 1
+	# and throws away a benchmark that had already printed its numbers. (A trap that
+	# *succeeds* cannot mask a real failure the other way -- bash keeps the status
+	# from before the trap ran -- so retrying here is safe.) The race is self-limiting:
+	# once the last shell is reaped nothing recreates anything, so retry rather than
+	# guess at how long teardown takes. Rare on a fast machine, routine on a 2-vCPU
+	# CI runner with 116 shells exiting at once.
 	tmux kill-server >/dev/null 2>&1 || true
-	rm -rf "$BENCH_ROOT"
+	local i
+	for i in $(seq 1 50); do
+		rm -rf "$BENCH_ROOT" 2>/dev/null && return 0
+		sleep 0.1
+	done
+	# Five seconds in, something other than teardown is holding the tree. Leave the
+	# directory rather than the benchmark: this runs in a `docker run --rm` container
+	# whose filesystem is discarded either way.
+	rm -rf "$BENCH_ROOT" 2>/dev/null || true
 }
 trap cleanup EXIT
 

@@ -36,11 +36,8 @@ if [ -z "$(tmux show-option -gqv @assistant-resurrect-relaunch)" ]; then
     tmux set-option -g @assistant-resurrect-relaunch 'on'
 fi
 # @assistant-resurrect-relaunch-allow-file may override the default voucher
-# beside tmux-resurrect's save files. An empty value keeps save-dir discovery
+# beside tmux-resurrect's save files. Leaving it unset keeps save-dir discovery
 # dynamic when users change @resurrect-dir.
-if ! tmux show-option -gq @assistant-resurrect-relaunch-allow-file >/dev/null 2>&1; then
-	tmux set-option -g @assistant-resurrect-relaunch-allow-file ''
-fi
 tmux set-option -g @resurrect-hook-post-save-all "bash '${CURRENT_DIR}/scripts/save-assistant-sessions.sh'"
 tmux set-option -g @resurrect-hook-post-restore-all "bash '${CURRENT_DIR}/scripts/restore-assistant-sessions.sh'"
 # Respect user's @continuum-save-interval if already set

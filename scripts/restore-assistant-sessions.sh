@@ -174,7 +174,7 @@ while read -r entry; do
 			fi
 			val=$(echo "$env_json" | jq -r --arg k "$var" '.[$k] // empty')
 			if [ -n "$val" ]; then
-				env_prefix="${env_prefix}${var}=$(posix_quote "$val") "
+				env_prefix="${env_prefix}${var}=$(shell_quote "$pane_cmd" "$val") "
 			fi
 		done
 	fi

@@ -15,9 +15,15 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-claude-pid.sh
 source "$HOOK_DIR/lib-claude-pid.sh"
+# assistant_state_dir() — shared with the save hook, which reads what we write
+# here from a completely different process environment. Both sides MUST derive
+# the path from this one definition; see the comment on the function.
+# shellcheck source=../scripts/lib-detect.sh
+source "$HOOK_DIR/../scripts/lib-detect.sh"
 
-STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
-mkdir -p -m 0700 "$STATE_DIR"
+STATE_DIR="$(assistant_state_dir)"
+# Shared with the save hook that reads what this writes; see the function.
+ensure_assistant_state_dir "$STATE_DIR"
 
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')

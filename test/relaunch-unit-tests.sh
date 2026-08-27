@@ -13,6 +13,10 @@ mkdir -p "$TMUX_RESURRECT_DIR"
 # shellcheck source=../scripts/lib-detect.sh
 source "$REPO_DIR/scripts/lib-detect.sh"
 
+# Keep voucher resolution independent of options on the developer's live tmux
+# server; an unavailable option falls back to TMUX_RESURRECT_DIR.
+tmux() { return 1; }
+
 PASS=0
 FAIL=0
 assert_eq() {
@@ -46,6 +50,12 @@ assert_false() {
 		PASS=$((PASS + 1))
 		printf '  [pass] %s\n' "$desc"
 	fi
+}
+noglob_is_set() {
+	case "$-" in
+	*f*) return 0 ;;
+	*) return 1 ;;
+	esac
 }
 
 echo "== canonicalization =="
@@ -104,12 +114,24 @@ assert_eq "metacharacters become one quoted literal argument" \
 	"command claude '--x;curl|sh'" \
 	"$(relaunch_command_from_voucher claude 'claude --x;curl|sh')"
 
+set -f
+relaunch_shape_ok 'claude agents'
+assert_true "shape filter preserves caller noglob state" noglob_is_set
+relaunch_canon claude 'claude agents' >/dev/null
+assert_true "canonicalizer preserves caller noglob state" noglob_is_set
+relaunch_command_from_voucher claude 'claude --x;curl|sh' >/dev/null
+assert_true "voucher command builder preserves caller noglob state" noglob_is_set
+set +f
+
 echo "== advisory ledger retention =="
 # Source the guarded save script for relaunch_ledger_apply(). All top-level
 # paths remain inside the sandbox via the exported overrides above.
 export TMUX_ASSISTANT_RESURRECT_DIR="$SANDBOX/state"
 # shellcheck source=../scripts/save-assistant-sessions.sh
+had_errexit=0
+case "$-" in *e*) had_errexit=1 ;; esac
 source "$REPO_DIR/scripts/save-assistant-sessions.sh" >/dev/null 2>&1
+[ "$had_errexit" -eq 1 ] || set +e
 now=$(date +%s)
 jq -n --argjson now "$now" '
   [range(0;205) | {

@@ -5,11 +5,12 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 repo_dir := justfile_directory()
-# State directory: uses TMUX_ASSISTANT_RESURRECT_DIR if set, else XDG_RUNTIME_DIR/TMPDIR/tmp.
-# The just env() function can't do nested expansion, so recipes compute the
-# default via shell. This variable is only used when the env var IS set.
-state_dir_override := env("TMUX_ASSISTANT_RESURRECT_DIR", "")
-_state_dir_expr := 'STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"'
+# State directory. Never inline the path here: the hooks and the save script must
+# all agree on it, so assistant_state_dir() in scripts/lib-detect.sh is the only
+# definition. A copy in this file would be a fourth one, free to drift — which is
+# exactly how issue #65 happened. Injected into shebang recipes, which run as one
+# shell, so the assignment survives to the following lines.
+_state_dir_expr := 'source "' + justfile_directory() + '/scripts/lib-detect.sh"; STATE_DIR="$(assistant_state_dir)"'
 
 # Show available recipes
 default:
@@ -492,6 +493,12 @@ test-targets:
 # Runs on its own socket; skips without tmux or below tmux 3.7.
 test-tmux-contract:
     @"${TEST_BASH:-bash}" "{{repo_dir}}/test/tmux-target-contract-test.sh"
+
+# Run hermetic state-directory tests (no Docker / no assistant binaries needed).
+# Covers the hook/save-hook rendezvous that issue #65 broke; worth running on
+# macOS, where $TMPDIR really does differ between the two sides.
+test-state-dir:
+    @"${TEST_BASH:-bash}" "{{repo_dir}}/test/state-dir-unit-tests.sh"
 
 # Run hermetic Copilot session-discovery tests (no binary or login required)
 test-copilot:

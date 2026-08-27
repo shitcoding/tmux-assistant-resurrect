@@ -74,7 +74,28 @@ process args as a reliable fallback.
 ## Key conventions
 
 - All scripts use `set -euo pipefail`
-- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default: `$XDG_RUNTIME_DIR` or `$TMPDIR` + `/tmux-assistant-resurrect`)
+- State files go to `$TMUX_ASSISTANT_RESURRECT_DIR` (default:
+  `$HOME/.local/state/tmux-assistant-resurrect`), resolved *only* through
+  `assistant_state_dir()` in `scripts/lib-detect.sh`. Never inline the path or
+  add an environment variable to it: the hooks and the save script resolve it in
+  different process environments, so anything they can disagree about silently
+  loses session IDs (issue #65). `hooks/opencode-session-track.js` carries the
+  one unavoidable second implementation; `test/state-dir-unit-tests.sh` pins the
+  two together. The pre-#65 locations are enumerated by
+  `legacy_assistant_state_dirs()` as a *set*, not re-derived from the old
+  expression: that expression is the thing that resolved differently on either
+  side, so evaluating it once in the save script would migrate only the users who
+  were never broken.
+- Create that directory only through `ensure_assistant_state_dir()`, never with a
+  bare `mkdir`. It exists because the obvious spellings are all wrong once the
+  path is three levels under `$HOME`: `mkdir -p -m 0700` applies the mode to the
+  deepest directory only (SC2174) *and* fails outright on Git Bash, taking the
+  whole save down with it under `set -e`; `mkdir -p` plus `chmod 700` leaves a
+  window at the umask default, follows a symlink left at the path, and resets a
+  mode the user chose, on every save. The leaf is created under a scoped umask
+  and an existing directory is left alone. `hooks/opencode-session-track.js`
+  mirrors this, with the extra Node trap that `mkdirSync`'s `mode` applies to
+  *every* level `recursive` creates.
 - State files contain the full tool-provided context (merged from hook stdin /
   plugin events) plus plugin metadata (`tool`, `ppid`/`pid`, `timestamp`, `env`).
   The Claude hook merges Claude's entire SessionStart JSON; the OpenCode plugin
