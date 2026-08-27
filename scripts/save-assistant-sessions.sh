@@ -1162,7 +1162,6 @@ merge_process_env() {
 
 # Copilot's variadic options -- the ones whose --help spelling ends in `...`,
 # e.g. `--allow-tool[=tools...]`. They legitimately occupy several argv tokens.
-SESSION_EXTRA_WARM_copilot=_copilot_variadic_flags
 SESSION_VARIADIC_FALLBACK_copilot="--allow-tool --allow-url --available-tools --deny-tool --deny-url --excluded-tools --secret-env-vars"
 
 _copilot_variadic_flags() {
@@ -1473,6 +1472,139 @@ _tool_help() {
 	return 0
 }
 
+# Static value-taking option fallbacks for when a running assistant is not on
+# the save hook's PATH. Dynamic discovery below is authoritative when --help is
+# available; these keep common replay settings intact in the degraded path.
+OPTION_VALUE_FLAGS_FALLBACK_claude="--add-dir --agent --agents --allowedTools --allowed-tools --append-system-prompt --autocompact --betas --cloud -d --debug --debug-file --disallowedTools --disallowed-tools --effort --environment --fallback-model --file --input-format --json-schema --max-budget-usd --mcp-config --model -n --name --output-format --permission-mode --plugin-dir --plugin-url --prompt-suggestions --remote-control --remote-control-session-name-prefix --setting-sources --settings --system-prompt --teleport --tools -w --worktree"
+OPTION_VALUE_FLAGS_FALLBACK_copilot="--add-dir --add-github-mcp-tool --add-github-mcp-toolset --additional-mcp-config --agent --allow-tool --allow-url --attachment --available-tools --bash-env -C --context --deny-tool --deny-url --disable-mcp-server --effort --reasoning-effort --excluded-tools --extension-sdk-path --log-dir --log-level --max-ai-credits --max-autopilot-continues --mode --model --mouse --output-format --plugin-dir --secret-env-vars --share --stream"
+OPTION_VALUE_FLAGS_FALLBACK_opencode="--log-level --port --hostname --mdns-domain --cors -m --model --prompt --agent --replay-limit"
+OPTION_VALUE_FLAGS_FALLBACK_codex="-c --config --enable --disable --remote --remote-auth-token-env -i --image -m --model --local-provider -p --profile -s --sandbox -C --cd --add-dir -a --ask-for-approval"
+OPTION_VALUE_FLAGS_FALLBACK_pi="--provider --model --api-key --system-prompt --append-system-prompt --mode -n --name --models -t --tools -xt --exclude-tools --thinking -e --extension --skill --prompt-template --theme --use-theme --export --list-models --tui-mode"
+OPTION_VALUE_FLAGS_FALLBACK_omp="--model --smol --slow --plan --prewalk-into --plan-yolo-into --provider --api-key --system-prompt --append-system-prompt --profile --alias --cwd --mode --config --session-dir --models --tools --thinking --hook -e --extension --skills --export --max-time --approval-mode --plugin-dir"
+OPTION_VALUE_FLAGS_FALLBACK_grok="--model --effort --cwd"
+
+# Discover options that accept a separate value from the top-level --help.
+# Commander/clap-style help marks values as <...> or [...]; yargs-style help
+# uses type annotations such as [string], [number], or [array], sometimes on a
+# continuation line. Emit both long and short spellings so the argv filter can
+# distinguish an option value from a positional prompt.
+_discover_option_value_flags() {
+	local tool="$1"
+	local cache_var="_OPTION_VALUE_FLAGS_${tool}"
+	local cached="${!cache_var:-}"
+	if [ -n "$cached" ]; then
+		[ "$cached" = "-" ] || echo "$cached"
+		return 0
+	fi
+
+	local fallback_var="OPTION_VALUE_FLAGS_FALLBACK_${tool}"
+	local fallback="${!fallback_var:-}"
+	local help_out result=""
+	help_out=$(_tool_help "$tool") || true
+	if [ -n "$help_out" ]; then
+		result=$(printf '%s\n' "$help_out" | awk '
+			function flush() {
+				if (head == "") return
+				decl = head
+				sub(/^[[:space:]]+/, "", decl)
+				sub(/[[:space:]][[:space:]].*$/, "", decl)
+				if (decl ~ /<[^>]+>/ ||
+				    (decl ~ /\[[^]]+\]/ && decl !~ /\[boolean\]/) ||
+				    entry ~ /\[(string|number|array)\]/) {
+					print decl
+				}
+				head = ""
+				entry = ""
+			}
+			/^[[:space:]]+(-[A-Za-z][A-Za-z0-9-]*[[:space:],]|--[A-Za-z][A-Za-z0-9-]*)/ {
+				flush()
+				head = $0
+				entry = $0
+				next
+			}
+			{ if (head != "") entry = entry "\n" $0 }
+			END { flush() }
+		' | grep -oE -- '--[A-Za-z][A-Za-z0-9-]*|(^|[[:space:],])-[A-Za-z][A-Za-z0-9-]*' |
+			sed -E 's/^[[:space:],]+//') || true
+	fi
+
+	# Help output can be partial (and some supported options are hidden), so
+	# supplement discovery with the pinned safe fallback just as session-flag
+	# discovery does.
+	result=$(printf '%s\n%s\n' "$result" "$fallback" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')
+	result="${result% }"
+	printf -v "$cache_var" '%s' "${result:--}"
+	[ -n "$result" ] && echo "$result"
+	return 0
+}
+
+# Remove positional argv while retaining values belonging to known options.
+# Once the first positional is seen, later bare tokens are also treated as
+# positional even when a prompt contains a flag-looking word such as --model.
+# Dash-prefixed words themselves are deliberately retained by the exact rule.
+_drop_positional_args() {
+	local tool="$1" args="$2"
+	local value_flags
+	value_flags=" $(_discover_option_value_flags "$tool") "
+	local variadic_flags=""
+	[ "$tool" = "copilot" ] && variadic_flags=" $(_copilot_variadic_flags) "
+
+	# Word-split with pathname expansion disabled: argv is data, so values such
+	# as '*' must never expand against the save hook's working directory.
+	local reglob=""
+	case "$-" in
+	*f*) ;;
+	*) reglob=1 ;;
+	esac
+	set -f
+	# shellcheck disable=SC2206  # deliberate word-split of flattened argv
+	local -a words=($args)
+	[ -n "$reglob" ] && set +f
+
+	local -a out=()
+	local word flag="" expects_value=0 variadic=0 saw_positional=0
+	for word in "${words[@]}"; do
+		case "$word" in
+		-*)
+			out[${#out[@]}]="$word"
+			flag="${word%%=*}"
+			expects_value=0
+			variadic=0
+			case "$word" in
+			*=*) ;;
+			*)
+				if [ "$saw_positional" -eq 0 ]; then
+					case "$value_flags" in
+					*" $flag "*) expects_value=1 ;;
+					esac
+					case "$variadic_flags" in
+					*" $flag "*) variadic=1 ;;
+					esac
+				fi
+				;;
+			esac
+			;;
+		*)
+			if [ "$saw_positional" -eq 0 ] && [ "$expects_value" -eq 1 ]; then
+				out[${#out[@]}]="$word"
+				if [ "$variadic" -eq 0 ]; then
+					expects_value=0
+					flag=""
+				fi
+			else
+				saw_positional=1
+				expects_value=0
+				variadic=0
+				flag=""
+			fi
+			;;
+		esac
+	done
+
+	[ "${#out[@]}" -gt 0 ] && echo "${out[*]}"
+	return 0
+}
+
 # Discover session-identity flags from a tool's --help output.
 # Matches long option names against a keyword pattern and emits lines of
 # "long [short]" pairs (e.g. "--resume -r" or "--fork-session").
@@ -1591,6 +1723,24 @@ SESSION_FLAGS_FALLBACK_grok="--continue -c
 --resume -r
 --session-id -s"
 
+# Every helper that parses --help must be warmed in main's shell so its cache
+# survives the per-pane extract_cli_args command substitutions. The Copilot
+# wrapper also retains the existing variadic-option discovery warmup.
+_warm_cli_arg_helpers() {
+	local tool="$1"
+	_discover_option_value_flags "$tool" >/dev/null
+	[ "$tool" = "copilot" ] && _copilot_variadic_flags >/dev/null
+	return 0
+}
+
+SESSION_EXTRA_WARM_claude=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_copilot=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_opencode=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_codex=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_pi=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_omp=_warm_cli_arg_helpers
+SESSION_EXTRA_WARM_grok=_warm_cli_arg_helpers
+
 # Pre-warm session-identity discovery once per tool present in a tab-separated
 # MATCHES blob (tool name in field 2). extract_cli_args runs in a $() subshell
 # per pane and the discovery helpers cache into a shell var that does not
@@ -1625,7 +1775,7 @@ _warm_session_discovery() {
 		# Per-tool extras that also parse --help and cache into a shell var.
 		extra_warm="SESSION_EXTRA_WARM_${tool}"
 		if [ -n "${!extra_warm:-}" ]; then
-			"${!extra_warm}" >/dev/null
+			"${!extra_warm}" "$tool" >/dev/null
 		fi
 	done < <(printf '%s\n' "$matches" | cut -f2 | sort -u)
 	return 0
@@ -1637,7 +1787,8 @@ _warm_session_discovery() {
 # name/path and tool-specific session/resume arguments.
 #
 # Usage: extract_cli_args <tool> <full_args_from_ps>
-# Returns: the remaining flags/args as a single whitespace-normalized string.
+# Returns: replayable options and their recognized values as a single
+# whitespace-normalized string. Positional arguments are omitted.
 #
 # Session-identity flags are discovered dynamically from <tool> --help,
 # matched by name pattern. This keeps stripping in sync with the installed
@@ -1754,6 +1905,13 @@ extract_cli_args() {
 			done
 		fi
 	fi
+
+	# A remaining positional is an initial prompt (or, for OpenCode, a project
+	# path already represented by pane cwd). Never replay it into a resumed
+	# conversation. Preserve recognized separate option values such as
+	# `--model sonnet`; a boolean option followed by a prompt is not mistaken for
+	# a value because option arity comes from --help rather than adjacency.
+	args=$(_drop_positional_args "$tool" "$args")
 
 	# Normalize whitespace: collapse multiple spaces, trim leading/trailing
 	echo "$args" | sed -E 's/  +/ /g; s/^ //; s/ $//'
