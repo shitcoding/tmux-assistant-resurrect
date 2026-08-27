@@ -154,6 +154,17 @@ wait_for_child() {
 	return 1
 }
 
+# Poll for a file created by an asynchronously driven tmux pane.
+wait_for_file() {
+	local path="$1" timeout="${2:-10}"
+	local deadline=$((SECONDS + timeout))
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		[ -e "$path" ] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
 # Poll for a descendant process anywhere in the tree under a given root PID
 # whose args match detect_tool(). Handles wrapper chains like npx → node → opencode.
 # Unlike wait_for_child (direct children only), this walks the full tree.
@@ -260,6 +271,22 @@ else
 	fail "Copilot focused unit suite"
 fi
 
+# --- Session-less relaunch voucher unit suite ---
+
+suite "relaunch_unit"
+echo ""
+echo "=== Session-less relaunch voucher tests ==="
+echo ""
+
+relaunch_unit_output=""
+if relaunch_unit_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/relaunch-unit-tests.sh" 2>&1); then
+	echo "$relaunch_unit_output"
+	pass "Relaunch voucher focused unit suite"
+else
+	echo "$relaunch_unit_output"
+	fail "Relaunch voucher focused unit suite"
+fi
+
 # --- Copilot upstream contract ---
 #
 # The suite above fabricates the artifacts it looks for, so on its own it cannot
@@ -355,7 +382,9 @@ fi
 assert_file_exists "tmux.conf exists" "$HOME/.tmux.conf"
 assert_contains "tmux.conf has marker block" "$(cat "$HOME/.tmux.conf")" "begin tmux-assistant-resurrect"
 assert_contains "tmux.conf has hook paths" "$(cat "$HOME/.tmux.conf")" "save-assistant-sessions.sh"
-
+assert_contains "TPM entry point defaults session-less relaunch on" \
+	"$(cat "$REPO_DIR/tmux-assistant-resurrect.tmux")" \
+	"tmux set-option -g @assistant-resurrect-relaunch 'on'"
 # Verify idempotent install (run again, should not duplicate)
 just install 2>&1 >/dev/null
 
@@ -599,6 +628,47 @@ fi
 
 saved_after_test2=$(mktemp)
 cp "$SAVED" "$saved_after_test2"
+
+# --- Test 2a: session-less commands require an exact voucher ---
+
+echo ""
+echo "=== Test 2a: save session-less relaunch voucher ==="
+echo ""
+
+RELAUNCH_CWD="/tmp/relaunch-save-cwd"
+RELAUNCH_BIN="/tmp/relaunch-save-bin"
+RELAUNCH_VOUCHER="$HOME/.tmux/resurrect/assistant-relaunch-allow.txt"
+mkdir -p "$RELAUNCH_CWD" "$RELAUNCH_BIN"
+# A PATH stub with argv `claude agents`: cat blocks opening the FIFO named
+# "agents", keeping the exact process argv alive without invoking a real CLI.
+ln -sf /bin/cat "$RELAUNCH_BIN/claude"
+rm -f "$RELAUNCH_CWD/agents"
+mkfifo "$RELAUNCH_CWD/agents"
+tmux new-session -d -s test-relaunch-save -c "$RELAUNCH_CWD"
+tmux send-keys -t test-relaunch-save "PATH='$RELAUNCH_BIN':\$PATH claude agents" Enter
+relaunch_save_shell=$(tmux display-message -t test-relaunch-save -p '#{pane_pid}')
+wait_for_child "$relaunch_save_shell" 'claude agents' 10 >/dev/null || \
+	fail "Session-less PATH stub did not start"
+
+: >"$RELAUNCH_VOUCHER"
+just save 2>&1
+empty_relaunch_count=$(jq '[.relaunch[]? | select(.pane | contains("test-relaunch-save"))] | length' "$SAVED")
+assert_eq "Empty voucher emits no relaunch entry" "0" "$empty_relaunch_count"
+ledger_cmd=$(jq -r '[.[] | select(.cmd == "claude agents")] | first | .cmd // empty' \
+	"$HOME/.tmux/resurrect/assistant-relaunch-candidates.json")
+assert_eq "Shape-ok command is proposed in advisory ledger" "claude agents" "$ledger_cmd"
+
+printf '%s\n' 'claude agents' >"$RELAUNCH_VOUCHER"
+just save 2>&1
+vouched_relaunch=$(jq -r '[.relaunch[]? | select(.pane | contains("test-relaunch-save"))] | first | .cmd // empty' "$SAVED")
+assert_eq "Exact voucher emits sibling relaunch entry" "claude agents" "$vouched_relaunch"
+session_schema_unchanged=$(jq '[.sessions[] | has("cmd")] | any' "$SAVED")
+assert_eq "Relaunch does not widen the sessions entry schema" "false" "$session_schema_unchanged"
+
+kill_pane_children test-relaunch-save true
+: >"$RELAUNCH_VOUCHER"
+cp "$saved_after_test2" "$SAVED"
+rm -f "$RELAUNCH_CWD/agents"
 
 # --- Test 2b: Save detects assistants launched via wrappers (npx) ---
 
@@ -2946,11 +3016,13 @@ source "$REPO_DIR/scripts/save-assistant-sessions.sh"
 #   assistant-session:0.0  (assistant — should be stripped)
 #   regular-session:0.0    (non-assistant — should be preserved)
 #   assistant-session:1.0  (assistant — should be stripped)
+#   relaunch-session:0.0   (vouched relaunch — should be stripped)
 strip_tmpdir=$(mktemp -d)
 mkdir -p "$strip_tmpdir/pane_contents"
 echo "old claude TUI output here" >"$strip_tmpdir/pane_contents/pane-assistant-session:0.0"
 echo "regular shell output here" >"$strip_tmpdir/pane_contents/pane-regular-session:0.0"
 echo "old opencode TUI output" >"$strip_tmpdir/pane_contents/pane-assistant-session:1.0"
+echo "old agents TUI output" >"$strip_tmpdir/pane_contents/pane-relaunch-session:0.0"
 tar cf - -C "$strip_tmpdir" ./pane_contents/ | gzip >"$RESURRECT_DIR/pane_contents.tar.gz"
 rm -rf "$strip_tmpdir"
 
@@ -2961,6 +3033,9 @@ cat >"$OUTPUT_FILE" <<'STRIPEOF'
   "sessions": [
     {"pane": "assistant-session:0.0", "tool": "claude", "session_id": "ses_1", "cwd": "/tmp", "pid": "111"},
     {"pane": "assistant-session:1.0", "tool": "opencode", "session_id": "ses_2", "cwd": "/tmp", "pid": "222"}
+  ],
+  "relaunch": [
+    {"pane": "relaunch-session:0.0", "tool": "claude", "cwd": "/tmp", "pid": "333", "cmd": "claude agents"}
   ]
 }
 STRIPEOF
@@ -2984,6 +3059,12 @@ else
 	pass "Assistant pane content stripped (assistant-session:1.0)"
 fi
 
+if [ -f "$strip_verify/pane_contents/pane-relaunch-session:0.0" ]; then
+	fail "Relaunch pane content not stripped (relaunch-session:0.0)"
+else
+	pass "Relaunch pane content stripped (relaunch-session:0.0)"
+fi
+
 if [ -f "$strip_verify/pane_contents/pane-regular-session:0.0" ]; then
 	pass "Non-assistant pane content preserved (regular-session:0.0)"
 	content=$(cat "$strip_verify/pane_contents/pane-regular-session:0.0")
@@ -2993,7 +3074,7 @@ else
 fi
 
 # Verify log message
-if grep -q "stripped pane contents for 2 assistant pane" "$LOG_FILE" 2>/dev/null; then
+if grep -q "stripped pane contents for 3 assistant pane" "$LOG_FILE" 2>/dev/null; then
 	pass "Strip function logs count of removed panes"
 else
 	fail "Strip function log message missing or wrong count"
@@ -3114,6 +3195,12 @@ assert_eq "Claude no extra flags" "" \
 assert_eq "Claude bare binary" "" \
 	"$(extract_cli_args "claude" "claude")"
 
+# Bash 3.2 raises an unbound-variable error when an empty array is expanded
+# under nounset. Empty positional input must stay silent on every supported
+# Bash version.
+empty_filter_output=$(_drop_positional_args "claude" "" 2>&1 || true)
+assert_eq "Empty positional filtering is quiet under nounset" "" "$empty_filter_output"
+
 # Positionals are initial prompts (or OpenCode's cwd-equivalent project path),
 # so they must never be replayed on a resume. Separate option values remain.
 assert_eq "Claude drops inline prompt and keeps option values" "--dangerously-skip-permissions --model sonnet" \
@@ -3133,10 +3220,12 @@ assert_eq "OMP drops inline prompt and keeps option values" "--model opus" \
 assert_eq "Grok drops inline prompt and keeps option values" "--model grok-4" \
 	"$(extract_cli_args "grok" "grok --model grok-4 Fix the login bug")"
 
-# The exact dash-prefix rule retains flag-looking prompt words. Once a real
-# positional starts, however, the following bare word cannot become its value.
-assert_eq "Claude retains flag-looking prompt word only" "--dangerously-skip-permissions --model" \
+# Once a prompt starts, its entire tail is discarded, including text that
+# resembles an option and must not become an executable flag during restore.
+assert_eq "Claude drops all prompt tokens after the first positional" "--dangerously-skip-permissions" \
 	"$(extract_cli_args "claude" "claude --dangerously-skip-permissions Fix the --model flag")"
+assert_eq "Claude does not replay a privileged-looking prompt word" "--model sonnet" \
+	"$(extract_cli_args "claude" "claude --model sonnet Explain --dangerously-skip-permissions")"
 
 # OpenCode: strip -s <id>
 assert_eq "OpenCode strip -s" "--verbose" \
@@ -3820,6 +3909,80 @@ assert_contains "Backward compat: restore still works" "$compat_log" "ses_compat
 assert_contains "Backward compat: bare resume command" "$compat_log" "restoring claude"
 
 kill_pane_children test-restore-compat true
+
+# --- Test 10c1: restore session-less relaunch vouchers ---
+
+echo ""
+echo "=== Test 10c1: restore session-less relaunch vouchers ==="
+echo ""
+
+RELAUNCH_RESTORE_BIN="/tmp/relaunch-restore-bin"
+RELAUNCH_RESTORE_MARKER="/tmp/relaunch-restore-marker"
+RELAUNCH_RESTORE_READY="/tmp/relaunch-restore-ready"
+RELAUNCH_VOUCHER="$HOME/.tmux/resurrect/assistant-relaunch-allow.txt"
+mkdir -p "$RELAUNCH_RESTORE_BIN"
+cat >"$RELAUNCH_RESTORE_BIN/claude" <<'RSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$RELAUNCH_MARKER"
+RSTUB
+chmod +x "$RELAUNCH_RESTORE_BIN/claude"
+tmux new-session -d -s test-restore-relaunch -c /tmp 2>/dev/null || true
+rm -f "$RELAUNCH_RESTORE_READY"
+tmux send-keys -t test-restore-relaunch \
+	"export PATH='$RELAUNCH_RESTORE_BIN':\$PATH RELAUNCH_MARKER='$RELAUNCH_RESTORE_MARKER'; : > '$RELAUNCH_RESTORE_READY'" Enter
+wait_for_file "$RELAUNCH_RESTORE_READY" 10 || fail "Relaunch restore pane did not become ready"
+
+cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RRELAUNCH'
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "sessions": [],
+  "relaunch": [
+    {"pane": "test-restore-relaunch:0.0", "tool": "claude", "cwd": "/tmp", "pid": "99999", "cmd": "claude agents"}
+  ]
+}
+RRELAUNCH
+
+# A relaunch-only sidecar leaves the legacy .sessions array empty; pre-feature
+# restore scripts read only that array and therefore have nothing to execute.
+old_restore_count=$(jq '.sessions // [] | length' "$HOME/.tmux/resurrect/assistant-sessions.json")
+assert_eq "Relaunch-only sidecar keeps legacy sessions empty" "0" "$old_restore_count"
+
+rm -f "$RELAUNCH_RESTORE_MARKER"
+: >"$RELAUNCH_VOUCHER"
+: >"$RESTORE_LOG"
+just restore 2>&1
+refused_log=$(cat "$RESTORE_LOG")
+assert_contains "Empty voucher refuses relaunch" "$refused_log" "relaunch cmd not vouched"
+assert_file_not_exists "Refused relaunch executes nothing" "$RELAUNCH_RESTORE_MARKER"
+
+printf '%s\n' 'claude agents' >"$RELAUNCH_VOUCHER"
+: >"$RESTORE_LOG"
+just restore 2>&1
+allowed_log=$(cat "$RESTORE_LOG")
+assert_contains "Exact voucher allows relaunch" "$allowed_log" "relaunching claude"
+allowed_args=$(cat "$RELAUNCH_RESTORE_MARKER" 2>/dev/null || true)
+assert_eq "Allowed relaunch executes voucher argv" "agents" "$allowed_args"
+
+rm -f "$RELAUNCH_RESTORE_MARKER"
+python3 - "$HOME/.tmux/resurrect/assistant-sessions.json" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+with open(path) as handle:
+    data = json.load(handle)
+data["relaunch"][0]["cmd"] = "claude  agents"
+with open(path, "w") as handle:
+    json.dump(data, handle)
+PY
+: >"$RESTORE_LOG"
+just restore 2>&1
+whitespace_log=$(cat "$RESTORE_LOG")
+assert_contains "Noncanonical sidecar whitespace is refused" "$whitespace_log" "relaunch cmd not vouched"
+assert_file_not_exists "Whitespace mismatch executes nothing" "$RELAUNCH_RESTORE_MARKER"
+
+: >"$RELAUNCH_VOUCHER"
+kill_pane_children test-restore-relaunch true
+rm -f "$RELAUNCH_RESTORE_READY"
 
 # --- Test 10c2: Pi restore with enriched cli_args ---
 

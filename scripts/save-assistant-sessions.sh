@@ -50,6 +50,10 @@ RESURRECT_DIR="$(resurrect_data_dir)"
 OUTPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-save.log"
 CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
+RELAUNCH_ENABLED=$(tmux show-option -gqv @assistant-resurrect-relaunch 2>/dev/null || true)
+RELAUNCH_ENABLED="${RELAUNCH_ENABLED:-on}"
+RELAUNCH_LEDGER_FILE="${RESURRECT_DIR}/assistant-relaunch-candidates.json"
+RELAUNCH_LEDGER_TMP=""
 
 # Watchdog deadline (seconds). Defense-in-depth: even without heredoc pipes, a
 # subprocess (python3 on a locked sqlite, a stat on a slow filesystem, a wedged
@@ -1093,6 +1097,125 @@ _etime_to_seconds() {
 	echo "$((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))"
 }
 
+# Merge one advisory relaunch candidate into the user-visible ledger. Process
+# lifetime is only a ranking hint: it never participates in voucher matching or
+# restore authorization. Entries unseen for 30 days are pruned and the 200 most
+# recently observed entries are retained.
+relaunch_ledger_apply() {
+	local tool="$1" canon="$2" pid="$3"
+	local now_epoch now_iso start_epoch lifetime=0 cutoff existing tmp
+	now_epoch=$(date +%s)
+	now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	start_epoch=$(get_process_start_epoch "$pid")
+	case "$start_epoch" in
+	'' | *[!0-9]*) ;;
+	*)
+		if [ "$start_epoch" -le "$now_epoch" ]; then
+			lifetime=$((now_epoch - start_epoch))
+		fi
+		;;
+	esac
+	cutoff=$((now_epoch - 30 * 24 * 60 * 60))
+
+	if [ -f "$RELAUNCH_LEDGER_FILE" ]; then
+		existing=$(sed -n '1,$p' "$RELAUNCH_LEDGER_FILE" 2>/dev/null || printf '[]')
+	else
+		existing='[]'
+	fi
+	tmp="${RELAUNCH_LEDGER_FILE}.tmp.$$"
+	RELAUNCH_LEDGER_TMP="$tmp"
+	if ! (umask 077 && jq -Rn \
+		--arg existing "$existing" \
+		--arg tool "$tool" \
+		--arg cmd "$canon" \
+		--arg now_iso "$now_iso" \
+		--argjson now "$now_epoch" \
+		--argjson cutoff "$cutoff" \
+		--argjson lifetime "$lifetime" '
+		($existing | try fromjson catch []) as $decoded |
+		(if ($decoded | type) == "array" then $decoded else [] end) as $entries |
+		($entries | map(select((.last_seen_epoch // 0) >= $cutoff))) as $fresh |
+		($fresh | map(select(.tool == $tool and .cmd == $cmd)) | first // {}) as $prior |
+		($fresh
+		 | map(select(.tool != $tool or .cmd != $cmd))
+		 | . + [{
+			tool: $tool,
+			cmd: $cmd,
+			seen: (($prior.seen // 0) + 1),
+			longest_seconds: ([($prior.longest_seconds // 0), $lifetime] | max),
+			first_seen: ($prior.first_seen // $now_iso),
+			last_seen: $now_iso,
+			last_seen_epoch: $now
+		  }]
+		 | sort_by(.last_seen_epoch) | reverse | .[:200])
+	' >"$tmp"); then
+		rm -f "$tmp"
+		RELAUNCH_LEDGER_TMP=""
+		return 1
+	fi
+	mv -f "$tmp" "$RELAUNCH_LEDGER_FILE"
+	RELAUNCH_LEDGER_TMP=""
+}
+
+# Handle the shared no-session-ID path used by both the batched resolver and
+# legacy emit_session(). Shape only controls whether the command is proposed in
+# the ledger. A hand-written exact voucher can authorize a shape-rejected line;
+# conversely, a shape-ok line is never authorization by itself.
+handle_sessionless_relaunch() {
+	local target="$1" tool="$2" pid="$3" raw_args="$4" cwd="$5"
+	local log_missing="${6:-1}"
+	local prefix
+	prefix="detected $tool in $target (pid $pid) but no session ID available $(missing_session_hint "$tool" "$pid")"
+	local canon="" vouched_line="" shape_ok=0 relaunch_parts
+
+	case "$RELAUNCH_ENABLED" in
+	on | yes | true | 1) ;;
+	*)
+		[ "$log_missing" = "1" ] && log "$prefix: relaunch disabled"
+		return 1
+		;;
+	esac
+
+	canon=$(relaunch_canon "$tool" "$raw_args") || {
+		[ "$log_missing" = "1" ] && log "$prefix: relaunch argv could not be canonicalized"
+		return 1
+	}
+
+	if relaunch_shape_ok "$canon"; then
+		shape_ok=1
+		if ! relaunch_ledger_apply "$tool" "$canon" "$pid"; then
+			log "warning: failed to update relaunch candidates ledger for $canon"
+		fi
+	fi
+
+	vouched_line=$(relaunch_voucher_match "$tool" "$canon") || {
+		if [ "$log_missing" = "1" ]; then
+			if [ "$shape_ok" -eq 1 ]; then
+				log "$prefix: relaunch cmd not vouched: $canon"
+			else
+				log "$prefix: relaunch shape rejected: $canon"
+			fi
+		fi
+		return 1
+	}
+
+	relaunch_parts="${RELAUNCH_PARTS_FILE:-}"
+	if [ -z "$relaunch_parts" ] && [ -n "${PARTS_FILE:-}" ]; then
+		relaunch_parts="${PARTS_FILE}.relaunch"
+		RELAUNCH_PARTS_FILE="$relaunch_parts"
+	fi
+	if [ -z "$relaunch_parts" ]; then
+		log "warning: no relaunch parts file available for $canon"
+		return 1
+	fi
+
+	# Five fields by design: keep the established session TSV schema untouched.
+	printf '%s\t%s\t%s\t%s\t%s\n' \
+		"$target" "$tool" "$cwd" "$pid" "$vouched_line" >>"$relaunch_parts"
+	[ "$log_missing" = "1" ] && log "$prefix: relaunch vouched: $vouched_line"
+	return 0
+}
+
 # Read user-configured variables directly from a detected assistant process.
 # Claude and OpenCode normally provide these through their session hooks, but
 # tools without hooks (including Codex) need save-time process inspection.
@@ -1539,11 +1662,16 @@ _discover_option_value_flags() {
 }
 
 # Remove positional argv while retaining values belonging to known options.
-# Once the first positional is seen, later bare tokens are also treated as
-# positional even when a prompt contains a flag-looking word such as --model.
-# Dash-prefixed words themselves are deliberately retained by the exact rule.
+# Once the first positional is seen, discard it and the entire remaining tail:
+# a prompt can contain flag-looking words that must never become replayed flags.
 _drop_positional_args() {
 	local tool="$1" args="$2"
+	# Bash 3.2 treats an empty array expansion as an unbound variable under
+	# nounset.  Avoid constructing/iterating that array when there is no argv.
+	case "$args" in
+	*[![:space:]]*) ;;
+	*) return 0 ;;
+	esac
 	local value_flags
 	value_flags=" $(_discover_option_value_flags "$tool") "
 	local variadic_flags=""
@@ -1562,7 +1690,7 @@ _drop_positional_args() {
 	[ -n "$reglob" ] && set +f
 
 	local -a out=()
-	local word flag="" expects_value=0 variadic=0 saw_positional=0
+	local word flag="" expects_value=0 variadic=0
 	for word in "${words[@]}"; do
 		case "$word" in
 		-*)
@@ -1573,29 +1701,24 @@ _drop_positional_args() {
 			case "$word" in
 			*=*) ;;
 			*)
-				if [ "$saw_positional" -eq 0 ]; then
-					case "$value_flags" in
-					*" $flag "*) expects_value=1 ;;
-					esac
-					case "$variadic_flags" in
-					*" $flag "*) variadic=1 ;;
-					esac
-				fi
+				case "$value_flags" in
+				*" $flag "*) expects_value=1 ;;
+				esac
+				case "$variadic_flags" in
+				*" $flag "*) variadic=1 ;;
+				esac
 				;;
 			esac
 			;;
 		*)
-			if [ "$saw_positional" -eq 0 ] && [ "$expects_value" -eq 1 ]; then
+			if [ "$expects_value" -eq 1 ]; then
 				out[${#out[@]}]="$word"
 				if [ "$variadic" -eq 0 ]; then
 					expects_value=0
 					flag=""
 				fi
 			else
-				saw_positional=1
-				expects_value=0
-				variadic=0
-				flag=""
+				break
 			fi
 			;;
 		esac
@@ -1938,14 +2061,18 @@ resolve_pane_candidates() {
 	local pane_window="${10:-}"
 	local pane_pane_index="${11:-}"
 
-	local resolved=0 first_tool="" first_pid=""
+	local resolved=0 first_tool="" first_pid="" first_args=""
 	for pass in 1 2; do
 		[ "$resolved" -eq 1 ] && break
 		local allow_deferred_fallback=0
 		[ "$pass" -eq 2 ] && allow_deferred_fallback=1
 		while IFS="$us" read -r cand_tool cand_pid cand_args; do
 			[ -z "$cand_tool" ] && continue
-			[ -z "$first_tool" ] && first_tool="$cand_tool" && first_pid="$cand_pid"
+			if [ -z "$first_tool" ]; then
+				first_tool="$cand_tool"
+				first_pid="$cand_pid"
+				first_args="$cand_args"
+			fi
 
 			# Pass 2 is only for fallbacks that can misidentify a live session:
 			# OpenCode's cwd-scoped DB and Copilot's possibly stale loader argv.
@@ -2038,7 +2165,7 @@ resolve_pane_candidates() {
 	done
 
 	if [ "$resolved" -eq 0 ] && [ -n "$first_tool" ]; then
-		log "detected $first_tool in $pane_target (pid $first_pid) but no session ID available $(missing_session_hint "$first_tool" "$first_pid")"
+		handle_sessionless_relaunch "$pane_target" "$first_tool" "$first_pid" "$first_args" "$pane_cwd" 1 || true
 	fi
 }
 
@@ -2178,6 +2305,7 @@ main() {
 	PS_FILE=$(mktemp)
 	PANE_FILE=$(mktemp)
 	PARTS_FILE=$(mktemp)
+	RELAUNCH_PARTS_FILE=$(mktemp)
 	STATE_CACHE_FILE=$(mktemp)
 	WATCHDOG_PID=""
 	WATCHDOG_SELF_FILE=""
@@ -2186,7 +2314,7 @@ main() {
 	# decide whether the watchdog has already fired (and so must not be cancelled).
 	# Deleting that file first would make the fired-check always fail, cancelling a
 	# mid-escalation watchdog and defeating the whole grandchild-leak guarantee.
-	trap 'stop_save_watchdog; rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${WATCHDOG_FIRED_FILE:-}" "${OUTPUT_FILE}.tmp.$$"' EXIT INT TERM
+	trap 'stop_save_watchdog; rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$RELAUNCH_PARTS_FILE" "$STATE_CACHE_FILE" "${WATCHDOG_SELF_FILE:-}" "${WATCHDOG_FIRED_FILE:-}" "${RELAUNCH_LEDGER_TMP:-}" "${OUTPUT_FILE}.sessions.tmp.$$" "${OUTPUT_FILE}.tmp.$$"' EXIT INT TERM
 
 	# Arm the watchdog (unless disabled with a 0/invalid timeout).
 	if [ "$SAVE_TIMEOUT" -gt 0 ]; then
@@ -2212,7 +2340,7 @@ main() {
 	ps -eo pid=,ppid=,args= >"$PS_FILE" 2>/dev/null
 	if [ ! -s "$PS_FILE" ]; then
 		log "ps snapshot failed or empty, skipping save"
-		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE"
+		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$RELAUNCH_PARTS_FILE"
 		return 1
 	fi
 	# Two tagged records per pane, both ending in the one field that may itself
@@ -2348,47 +2476,47 @@ main() {
 		fi
 	fi
 
-	# Single jq: convert TSV to JSON array + build final output (replaces N+3 jq calls).
+	# Keep the established session TSV untouched, then convert the separate
+	# five-field relaunch TSV and attach it as an optional sibling key. Older
+	# restore scripts read only .sessions and safely ignore .relaunch.
 	# Write to a temp file and rename into place so a failed or watchdog-killed jq
 	# leaves the previous valid sidecar intact (a bare `>"$OUTPUT_FILE"` truncates
 	# it before jq runs, which would lose all saved sessions on a timeout).
-	local count=0
+	local count=0 relaunch_count=0
+	local SESSIONS_TMP="${OUTPUT_FILE}.sessions.tmp.$$"
 	local OUTPUT_TMP="${OUTPUT_FILE}.tmp.$$"
-	if [ -s "$PARTS_FILE" ]; then
-		if jq -Rs --arg ts "$SAVE_TS" '
+	if ! jq -Rs --arg ts "$SAVE_TS" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
 			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // ""),
 			 session_name:(.[9] // ""), window_index:(.[10] // ""), pane_index:(.[11] // "")})
 			| {timestamp: $ts, sessions: .}
-		' "$PARTS_FILE" >"$OUTPUT_TMP"; then
-			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
-			count=$(jq '.sessions | length' "$OUTPUT_FILE")
-		else
-			rm -f "$OUTPUT_TMP"
-			log "warning: failed to serialize sessions; keeping previous $OUTPUT_FILE"
-			return 1
-		fi
-	else
-		if jq -n --arg ts "$SAVE_TS" '{timestamp: $ts, sessions: []}' >"$OUTPUT_TMP"; then
-			mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
-		else
-			# Symmetric with the non-empty branch: if we cannot even write the
-			# empty sidecar (e.g. disk full), do not claim "saved 0" and silently
-			# leave a stale, possibly non-empty sidecar that would later restore
-			# sessions that are no longer running. Surface the failure instead.
-			rm -f "$OUTPUT_TMP"
-			log "warning: failed to write empty sidecar; keeping previous $OUTPUT_FILE"
-			return 1
-		fi
+		' "$PARTS_FILE" >"$SESSIONS_TMP"; then
+		rm -f "$SESSIONS_TMP" "$OUTPUT_TMP"
+		log "warning: failed to serialize sessions; keeping previous $OUTPUT_FILE"
+		return 1
 	fi
+	if ! jq -Rs --slurpfile envelope "$SESSIONS_TMP" '
+		split("\n") | map(select(length > 0) | split("\t") |
+		{pane:.[0], tool:.[1], cwd:.[2], pid:.[3], cmd:.[4]}) as $relaunch |
+		$envelope[0] + {relaunch: $relaunch}
+	' "$RELAUNCH_PARTS_FILE" >"$OUTPUT_TMP"; then
+		rm -f "$SESSIONS_TMP" "$OUTPUT_TMP"
+		log "warning: failed to serialize relaunch entries; keeping previous $OUTPUT_FILE"
+		return 1
+	fi
+	rm -f "$SESSIONS_TMP"
+	mv -f "$OUTPUT_TMP" "$OUTPUT_FILE"
+	count=$(jq '.sessions | length' "$OUTPUT_FILE")
+	relaunch_count=$(jq '.relaunch | length' "$OUTPUT_FILE")
 
 	log "saved $count assistant session(s) to $OUTPUT_FILE"
+	[ "$relaunch_count" -gt 0 ] && log "saved $relaunch_count vouched assistant relaunch command(s)"
 
 	# Strip captured pane contents for assistant panes so tmux-resurrect
 	# won't restore stale TUI output that the post-restore hook would
 	# immediately replace. Non-assistant pane contents are preserved.
-	if [ "$count" -gt 0 ]; then
+	if [ $((count + relaunch_count)) -gt 0 ]; then
 		strip_assistant_pane_contents
 	fi
 }
@@ -2405,9 +2533,9 @@ strip_assistant_pane_contents() {
 	local archive="$RESURRECT_DIR/pane_contents.tar.gz"
 	[ -f "$archive" ] || return 0
 
-	# Collect pane targets from the sessions we just saved
+	# Collect pane targets from saved sessions and vouched relaunches.
 	local panes
-	panes=$(jq -r '.sessions[].pane' "$OUTPUT_FILE" 2>/dev/null) || return 0
+	panes=$(jq -r '(.sessions // [])[]?.pane, (.relaunch // [])[]?.pane' "$OUTPUT_FILE" 2>/dev/null) || return 0
 	[ -z "$panes" ] && return 0
 
 	local tmpdir
@@ -2516,10 +2644,7 @@ emit_session() {
 		esac
 		return 0
 	else
-		if [ "$log_missing" = "1" ]; then
-			log "detected $tool in $target (pid $cpid) but no session ID available $(missing_session_hint "$tool" "$cpid")"
-		fi
-		return 1
+		handle_sessionless_relaunch "$target" "$tool" "$cpid" "$cargs" "$cwd" "$log_missing"
 	fi
 }
 

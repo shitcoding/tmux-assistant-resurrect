@@ -26,7 +26,9 @@ tmux-resurrect to save session IDs and restore them automatically.
   hook/plugin systems instead.
 - **Restore hook is the sole launcher**: Assistants must NOT be listed in
   `@resurrect-processes`. The post-restore hook handles all resuming with correct
-  session IDs. Adding them to `@resurrect-processes` causes double-launch.
+  session IDs. Adding them to `@resurrect-processes` causes double-launch, and
+  its prefix-only command matching can also mistake prompt text for a promoted
+  long-lived mode; session-less relaunches therefore use the same restore hook.
 - **TPM-only installation for end users**: Users install via TPM (`set -g @plugin
   'timvw/tmux-assistant-resurrect'` + `prefix + I`). The `justfile` recipes are
   for developers only.
@@ -215,6 +217,12 @@ process args as a reliable fallback.
   `copilot_home` for Copilot's resolved state root, and `session_name` /
   `window_index` / `pane_index` (the pane's address as separate values). All are
   optional for backward compatibility.
+- Vouched session-less commands live in the sibling `.relaunch` array, never in
+  `.sessions`. Its `cmd` is only an exact lookup key; restore executes the
+  matching line from the user-owned voucher file. The shape filter only feeds
+  the advisory candidates ledger and must never authorize a relaunch. The
+  `relaunch-add` hazard list is likewise advisory-only and must never be read by
+  save or restore.
 - **Never hand a `session:window.pane` string to tmux as a target.** It is a
   display label, not an address: tmux's target grammar reserves `:` and `.`,
   session names may contain both (3.7 keeps them; 3.4-3.6 rewrote them to `_`),
