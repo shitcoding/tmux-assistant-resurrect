@@ -1,6 +1,7 @@
 # OpenCode SQLite fallback (get_opencode_session, Method 4).
 # Invoked as: python3 opencode_db.py <db_file> <cwd>
-# Prints the most recently updated session id whose directory matches cwd.
+# Prints the most recently updated session id whose directory matches cwd,
+# reading OpenCode v2's session_v2 table when present and v1's session otherwise.
 # The broad `except Exception` guards below are deliberate (hence the noqa):
 # this runs inside the save hook against files written by another process,
 # and one unreadable or malformed file must be skipped, never propagated.
@@ -16,10 +17,19 @@ try:
     db_uri = Path(os.path.abspath(sys.argv[1])).as_uri() + "?mode=ro"
     conn = sqlite3.connect(db_uri, uri=True)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM session WHERE directory = ? ORDER BY time_updated DESC LIMIT 1",
-        (sys.argv[2],),
-    )
+    tables = {
+        name for (name,) in cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    # OpenCode v2 keeps sessions in session_v2; child (subagent) and archived
+    # sessions are not resumable top-level conversations.
+    if "session_v2" in tables:
+        query = (
+            "SELECT id FROM session_v2 WHERE directory = ? AND parent_id IS NULL"
+            " AND time_archived IS NULL ORDER BY time_updated DESC LIMIT 1"
+        )
+    else:
+        query = "SELECT id FROM session WHERE directory = ? ORDER BY time_updated DESC LIMIT 1"
+    cur.execute(query, (sys.argv[2],))
     row = cur.fetchone()
     if row and isinstance(row[0], str) and row[0]:
         print(row[0])
