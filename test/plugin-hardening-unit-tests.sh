@@ -692,6 +692,33 @@ PY
 assert_eq "OpenCode DB helper reads v2 top-level sessions" ses_top \
     "$(python3 "$ROOT_DIR/scripts/py/opencode_db.py" "$DB_ROOT/opencode-v2.sqlite" /work)"
 
+# V1 and V2 can share opencode.db. With both tables populated, the pane's
+# version picks the table, and the helper asks for it when it is missing.
+python3 - "$DB_ROOT/opencode-mixed.sqlite" <<'PY'
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE session (id TEXT, directory TEXT, time_updated INTEGER)")
+db.execute("INSERT INTO session VALUES (?, ?, ?)", ("ses_v1", "/work", 10))
+db.execute(
+    "CREATE TABLE session_v2 (id TEXT, directory TEXT, parent_id TEXT, "
+    "time_archived INTEGER, time_updated INTEGER)"
+)
+db.execute("INSERT INTO session_v2 VALUES (?, ?, ?, ?, ?)", ("ses_v2", "/work", None, None, 20))
+db.commit()
+db.close()
+PY
+assert_eq "OpenCode DB helper reads v1 table for a v1 pane" ses_v1 \
+    "$(python3 "$ROOT_DIR/scripts/py/opencode_db.py" "$DB_ROOT/opencode-mixed.sqlite" /work 1)"
+assert_eq "OpenCode DB helper reads v2 table for a v2 pane" ses_v2 \
+    "$(python3 "$ROOT_DIR/scripts/py/opencode_db.py" "$DB_ROOT/opencode-mixed.sqlite" /work 2)"
+assert_eq "OpenCode DB helper prefers v2 table for an unknown pane" ses_v2 \
+    "$(python3 "$ROOT_DIR/scripts/py/opencode_db.py" "$DB_ROOT/opencode-mixed.sqlite" /work unknown)"
+mixed_rc=0
+mixed_out=$(python3 "$ROOT_DIR/scripts/py/opencode_db.py" "$DB_ROOT/opencode-mixed.sqlite" /work) || mixed_rc=$?
+assert_eq "OpenCode DB helper requests the pane version for a shared database" "3:" "${mixed_rc}:${mixed_out}"
+
 # Non-finite SQLite values compare surprisingly (NaN is never less than a
 # finite process start). They must not outrank a valid thread.
 python3 - "$DB_ROOT/codex/state_2.sqlite" <<'PY'
