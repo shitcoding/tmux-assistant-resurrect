@@ -656,11 +656,19 @@ get_copilot_session() {
 # cannot be determined. The running executable is checked rather than PATH:
 # a package upgrade replaces PATH's binary while the pane keeps the old one,
 # and Homebrew deletes the old Cellar directory, so its path is read first.
+# Linux marks a replaced binary "<path> (deleted)"; /proc/<pid>/exe still
+# executes the retained inode, so it is what gets probed.
 opencode_pane_major_version() {
-	local pid="$1" exe="" version=""
+	local pid="$1" exe="" run_exe="" version=""
 	[ -n "$pid" ] || return 0
 	if [ -e "/proc/${pid}/exe" ]; then
 		exe=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+		case "$exe" in
+		*' (deleted)')
+			exe=${exe% (deleted)}
+			run_exe="/proc/${pid}/exe"
+			;;
+		esac
 	elif command -v lsof >/dev/null 2>&1; then
 		exe=$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
 	fi
@@ -671,8 +679,9 @@ opencode_pane_major_version() {
 		version=${version%%/*}
 		;;
 	*)
-		[ -x "$exe" ] || return 0
-		version=$("$exe" --version 2>/dev/null) || return 0
+		run_exe=${run_exe:-$exe}
+		[ -x "$run_exe" ] || return 0
+		version=$("$run_exe" --version 2>/dev/null) || return 0
 		;;
 	esac
 	case "$version" in *$'\n'*) return 0 ;; esac
