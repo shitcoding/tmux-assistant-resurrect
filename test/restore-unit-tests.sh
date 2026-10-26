@@ -253,7 +253,7 @@ MOCK_CLAUDE
 # pane_has_assistant() takes an explicit process snapshot as its second
 # argument in the other suites' unit tests, but restore-assistant-sessions.sh
 # calls it with only a pid, so it falls back to a live `ps -eo
-# pid=,ppid=,args=` snapshot. Mock that fallback here: MOCK_PS_SNAPSHOT, if
+# pid= -o ppid= -o args=` snapshot. Mock that fallback here: MOCK_PS_SNAPSHOT, if
 # set, is echoed verbatim (one "pid ppid args" row per line, matching what
 # pane_has_assistant's own tree walk expects); otherwise this reports no
 # processes at all, which is a safe default for every test that never sets

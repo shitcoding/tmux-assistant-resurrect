@@ -103,7 +103,7 @@ def main():
             root = int(tm("display", "-pt", pane, "#{pane_pid}"))
             rows = []
             for line in subprocess.check_output(
-                ["ps", "-eo", "pid=,ppid=,args="], text=True
+                ["ps", "-eo", "pid=", "-o", "ppid=", "-o", "args="], text=True
             ).splitlines():
                 fields = line.strip().split(None, 2)
                 if len(fields) == 3:

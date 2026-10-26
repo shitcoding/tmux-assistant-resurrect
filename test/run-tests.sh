@@ -153,7 +153,7 @@ wait_for_child() {
 	local deadline=$((SECONDS + timeout))
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		local cpid
-		cpid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$ppid" -v pat="$pattern" \
+		cpid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$ppid" -v pat="$pattern" \
 			'$2 == ppid && $0 ~ pat {print $1; exit}')
 		if [ -n "$cpid" ]; then
 			echo "$cpid"
@@ -186,7 +186,7 @@ wait_for_descendant() {
 	local deadline=$((SECONDS + timeout))
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		local dpid
-		dpid=$(ps -eo pid=,ppid=,args= | awk -v root="$root" '
+		dpid=$(ps -eo pid= -o ppid= -o args= | awk -v root="$root" '
 			BEGIN { pids[root]=1 }
 			{ if ($2 in pids) { pids[$1]=1; print $1, substr($0, index($0,$3)) } }
 		' | while read -r cpid cargs; do
@@ -232,7 +232,7 @@ kill_pane_children() {
 		# Give the C-c a moment to propagate
 		sleep 0.5
 		# Force-kill all descendants via full tree walk
-		ps -eo pid=,ppid= | awk -v root="$spid" '
+		ps -eo pid= -o ppid= | awk -v root="$spid" '
 			BEGIN { pids[root]=1 }
 			{ if ($2 in pids) { pids[$1]=1; print $1 } }
 		' | while read -r cpid; do kill -9 "$cpid" 2>/dev/null || true; done
@@ -726,7 +726,7 @@ fi
 # Create a Claude hook state file keyed by the Claude child PID
 # (When Claude runs the hook, hook's $PPID = Claude PID, so the save script
 #  looks for claude-{child_pid}.json where child_pid = the claude process PID)
-claude_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$claude_pane_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
+claude_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$claude_pane_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
 mkdir -p "$TEST_STATE_DIR"
 cat >"$TEST_STATE_DIR/claude-${claude_child_pid}.json" <<EOF
 {
@@ -741,7 +741,7 @@ EOF
 # (The Go binary overwrites its process title, so -s flag is NOT visible
 #  in `ps` output. The plugin writes a state file instead — same mechanism
 #  as Claude's hook.)
-opencode_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$opencode_pane_shell_pid" '$2 == ppid && /opencode/ {print $1; exit}')
+opencode_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$opencode_pane_shell_pid" '$2 == ppid && /opencode/ {print $1; exit}')
 cat >"$TEST_STATE_DIR/opencode-${opencode_child_pid}.json" <<EOF
 {
   "tool": "opencode",
@@ -752,7 +752,7 @@ cat >"$TEST_STATE_DIR/opencode-${opencode_child_pid}.json" <<EOF
 EOF
 
 # Create a Codex session-tags.jsonl entry
-codex_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$codex_pane_shell_pid" '$2 == ppid && /codex/ {print $1; exit}')
+codex_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$codex_pane_shell_pid" '$2 == ppid && /codex/ {print $1; exit}')
 mkdir -p "$HOME/.codex"
 echo "{\"pid\": ${codex_child_pid}, \"session\": \"ses_codex_test_789\", \"host\": \"test\", \"started_at\": \"2026-01-01T00:00:00Z\"}" >"$HOME/.codex/session-tags.jsonl"
 
@@ -786,7 +786,7 @@ EOF
 # this registry. The stub process (exec -a grok cat) gives us a real PID to
 # key on, exercising the same PID-based lookup the production code uses.
 grok_sid="019f1897-89a9-7a40-baa4-587f80e772c0"
-grok_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$grok_pane_shell_pid" '$2 == ppid && /grok/ {print $1; exit}')
+grok_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$grok_pane_shell_pid" '$2 == ppid && /grok/ {print $1; exit}')
 cat >"$GROK_HOME/active_sessions.json" <<EOF
 [
   { "session_id": "${grok_sid}", "pid": ${grok_child_pid}, "cwd": "${GROK_TEST_CWD}", "opened_at": "2026-06-30T12:57:31.562612Z" }
@@ -1418,7 +1418,7 @@ tmux send-keys -t test-claude-pid "claude --resume ses_pid_test" Enter
 claude_pid_test_shell=$(tmux display-message -t test-claude-pid -p '#{pane_pid}')
 wait_for_child "$claude_pid_test_shell" "claude" 10 >/dev/null || echo "WARN: claude child not found for pid test"
 
-claude_pid_test_child=$(ps -eo pid=,ppid=,args= | awk -v ppid="$claude_pid_test_shell" '$2 == ppid && /claude/ {print $1; exit}')
+claude_pid_test_child=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$claude_pid_test_shell" '$2 == ppid && /claude/ {print $1; exit}')
 
 # Sanity: make sure we found the child
 if [ -n "$claude_pid_test_child" ]; then
@@ -2034,7 +2034,7 @@ tmux send-keys -t test-claude-priority "claude --resume ses_args_old" Enter
 priority_shell_pid=$(tmux display-message -t test-claude-priority -p '#{pane_pid}')
 wait_for_child "$priority_shell_pid" "claude" 10 >/dev/null || echo "WARN: claude child not found for priority test"
 
-priority_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$priority_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
+priority_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$priority_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
 
 # Create a state file with a DIFFERENT session ID (simulating a session switch)
 cat >"$PID_TEST_STATE_DIR/claude-${priority_child_pid}.json" <<PEOF
@@ -2431,7 +2431,7 @@ tmux send-keys -t test-corrupt "claude" Enter
 corrupt_shell_pid=$(tmux display-message -t test-corrupt -p '#{pane_pid}')
 wait_for_child "$corrupt_shell_pid" "claude" 10 >/dev/null || echo "WARN: claude child not found for corrupt test"
 
-corrupt_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$corrupt_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
+corrupt_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$corrupt_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
 
 # Write a corrupt (non-JSON) state file
 echo "THIS IS NOT JSON" >"$PID_TEST_STATE_DIR/claude-${corrupt_child_pid}.json"
@@ -3877,7 +3877,7 @@ tmux new-session -d -s test-enrich-claude -c /tmp
 tmux send-keys -t test-enrich-claude "claude --dangerously-skip-permissions --resume ses_enrich_test" Enter
 enrich_shell_pid=$(tmux display-message -t test-enrich-claude -p '#{pane_pid}')
 wait_for_child "$enrich_shell_pid" "claude" 10 >/dev/null || echo "WARN: claude child not found for enrich test"
-enrich_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$enrich_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
+enrich_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$enrich_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
 
 # Create an enriched state file (model, env) keyed by child PID
 mkdir -p "$TEST_STATE_DIR"
@@ -3934,7 +3934,7 @@ tmux new-session -d -s test-enrich-minimal -c /tmp
 tmux send-keys -t test-enrich-minimal "claude --resume ses_minimal_enrich" Enter
 minimal_enrich_shell=$(tmux display-message -t test-enrich-minimal -p '#{pane_pid}')
 wait_for_child "$minimal_enrich_shell" "claude" 10 >/dev/null || echo "WARN"
-minimal_enrich_child=$(ps -eo pid=,ppid=,args= | awk -v ppid="$minimal_enrich_shell" '$2 == ppid && /claude/ {print $1; exit}')
+minimal_enrich_child=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$minimal_enrich_shell" '$2 == ppid && /claude/ {print $1; exit}')
 
 cat >"$TEST_STATE_DIR/claude-${minimal_enrich_child}.json" <<MEOF
 {
@@ -3976,7 +3976,7 @@ tmux new-session -d -s test-model-fallback -c /tmp
 tmux send-keys -t test-model-fallback "claude --model sonnet --resume ses_model_fb" Enter
 model_fb_shell=$(tmux display-message -t test-model-fallback -p '#{pane_pid}')
 wait_for_child "$model_fb_shell" "claude" 10 >/dev/null || echo "WARN"
-model_fb_child=$(ps -eo pid=,ppid=,args= | awk -v ppid="$model_fb_shell" '$2 == ppid && /claude/ {print $1; exit}')
+model_fb_child=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$model_fb_shell" '$2 == ppid && /claude/ {print $1; exit}')
 
 # State file WITHOUT model field (simulating old hook or missing field)
 cat >"$TEST_STATE_DIR/claude-${model_fb_child}.json" <<FBEOF
@@ -4589,7 +4589,7 @@ tmux new-session -d -s "$PIPE_SESSION" -c "$PIPE_CWD"
 tmux send-keys -t "$PIPE_SESSION" "claude --resume ses_pipe_name" Enter
 pipe_shell_pid=$(tmux display-message -t "$PIPE_SESSION" -p '#{pane_pid}')
 wait_for_child "$pipe_shell_pid" "claude" 10 >/dev/null || echo "WARN: claude child not found for pipe-name test"
-pipe_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$pipe_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
+pipe_child_pid=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$pipe_shell_pid" '$2 == ppid && /claude/ {print $1; exit}')
 mkdir -p "$TEST_STATE_DIR"
 cat >"$TEST_STATE_DIR/claude-${pipe_child_pid}.json" <<PIPEEOF
 {
@@ -4986,7 +4986,7 @@ tmux send-keys -t test-state-dir \
 	"env -u TMUX_ASSISTANT_RESURRECT_DIR TMPDIR=$RDV_WRITER_TMPDIR XDG_RUNTIME_DIR=$RDV_WRITER_XDG bash $RDV_HELPER $REPO_DIR" Enter
 rdv_shell=$(tmux display-message -t test-state-dir -p '#{pane_pid}')
 wait_for_child "$rdv_shell" "claude" 15 >/dev/null || echo "WARN: claude child not found for rendezvous test"
-rdv_child=$(ps -eo pid=,ppid=,args= | awk -v ppid="$rdv_shell" '$2 == ppid && /claude/ {print $1; exit}')
+rdv_child=$(ps -eo pid= -o ppid= -o args= | awk -v ppid="$rdv_shell" '$2 == ppid && /claude/ {print $1; exit}')
 
 if [ -n "$rdv_child" ]; then
 	pass "Rendezvous pane is running claude (pid $rdv_child)"

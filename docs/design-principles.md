@@ -5,7 +5,7 @@
 Agent detection uses direct process inspection rather than LLM-based
 classification or screen content analysis. The save script:
 
-1. Takes a single `ps -eo pid=,ppid=,args=` snapshot (efficient, no per-pane calls)
+1. Takes a single `ps -eo pid= -o ppid= -o args=` snapshot (efficient, no per-pane calls)
 2. For each tmux pane, finds direct child processes of the pane's shell
 3. Matches binary names via `case` patterns (`*/claude`, `*/copilot`,
    `*/opencode`, `*/codex`, `*/pi`, `*/omp`, `*/grok`)
@@ -122,7 +122,7 @@ To add support for a new tool:
 ## macOS considerations
 
 - `pgrep -P` is unreliable on macOS (silently misses children). Always use
-  `ps -eo pid=,ppid=` with awk filtering instead.
+  `ps -eo pid= -o ppid=` with awk filtering instead.
 - Copilot's active session is resolved with a plain glob over its own state
   directory — deliberately no `lsof` and no `/proc`, so it behaves identically
   on every platform and costs no fork.

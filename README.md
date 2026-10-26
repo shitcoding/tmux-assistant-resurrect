@@ -483,7 +483,7 @@ cat "$RESURRECT_DIR/assistant-save.log"
 
 | Symptom | Check |
 |---------|-------|
-| Save finds 0 sessions | Run `ps -eo pid=,ppid=,args= \| grep -E 'claude\|copilot\|opencode\|codex\|pi\|omp\|grok'` to verify assistants are running |
+| Save finds 0 sessions | Run `ps -eo pid= -o ppid= -o args= \| grep -E 'claude\|copilot\|opencode\|codex\|pi\|omp\|grok'` to verify assistants are running |
 | Session ID missing for Claude | Verify the hook is installed: `jq '.hooks.SessionStart' ~/.claude/settings.json` |
 | Session ID missing, hook *is* installed | Check `assistant-save.log` — a `no session ID available` line names the state file it looked for. If that directory is empty but `ls ~/.local/state/tmux-assistant-resurrect` elsewhere is not, the two sides disagree on the path; see **State directory** below |
 | Session ID missing for Copilot | Check `ls ~/.copilot/session-state/*/inuse.*.lock` — the number in the filename must be the native Copilot PID from `ps`. If you set `COPILOT_HOME`, the save hook must see it too (tmux hooks do not inherit your shell profile; use `tmux set-environment -g COPILOT_HOME ...`) |
@@ -1006,7 +1006,7 @@ the command from the matching voucher line.
 - **Pi session-file fallback (same-cwd ambiguity)**: Pi session lookup is cwd-
   scoped (`~/.pi/agent/sessions/--<cwd>--`). If multiple live Pi sessions share
   a cwd and look equally recent, one pane may be matched to the wrong ID.
-- **Process inspection on macOS**: Uses `ps -eo pid=,ppid=` instead of `pgrep -P`
+- **Process inspection on macOS**: Uses `ps -eo pid= -o ppid=` instead of `pgrep -P`
   due to reliability issues with `pgrep` on macOS.
 - **Pane matching after restore**: tmux-resurrect preserves pane indices, so the
   restore hook looks for the same session name, window index and pane index. It

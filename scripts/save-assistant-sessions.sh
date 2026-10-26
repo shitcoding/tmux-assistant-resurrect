@@ -2523,7 +2523,7 @@ resolve_pane_candidates() {
 # of the order ps lists processes in.
 descendant_pids() {
 	local root="$1"
-	ps -eo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+	ps -eo pid= -o ppid= 2>/dev/null | awk -v root="$root" '
 		{ pid[NR] = $1; parent[$1] = $2 }
 		END {
 			seen[root] = 1
@@ -2648,6 +2648,13 @@ stop_save_watchdog() {
 
 # --- Main ---
 
+# Save flow: snapshot the process table and the tmux pane table once each,
+# resolve every pane's assistant and session id from those snapshots, then
+# publish the sidecar JSON and log how many sessions were saved. Arms a
+# watchdog first so a hung session lookup cannot wedge tmux-resurrect's save,
+# and clears every temp file on any exit path.
+#
+# Usage: main (no arguments; reads tmux options and the live process table)
 main() {
 	# Reset per-run: the script is sourceable, so main() can be entered more
 	# than once in one shell and a stale count would carry over.
@@ -2689,7 +2696,7 @@ main() {
 	SAVE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 	# Snapshot process table and pane info to temp files (each read once)
-	ps -eo pid=,ppid=,args= >"$PS_FILE" 2>/dev/null
+	ps -eo pid= -o ppid= -o args= >"$PS_FILE" 2>/dev/null
 	if [ ! -s "$PS_FILE" ]; then
 		log "ps snapshot failed or empty, skipping save"
 		rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$RELAUNCH_PARTS_FILE"

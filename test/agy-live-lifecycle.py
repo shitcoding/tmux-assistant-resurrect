@@ -108,7 +108,7 @@ def main():
 
         def selected():
             rows = subprocess.check_output(
-                ["ps", "-axo", "pid=,ppid=,args="], text=True
+                ["ps", "-axo", "pid=", "-o", "ppid=", "-o", "args="], text=True
             ).splitlines()
             pane = pane_id()
             parent = tm("display", "-pt", pane, "#{pane_pid}")

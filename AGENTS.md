@@ -61,7 +61,7 @@ restore them automatically.
 ## Detection approach
 
 Agent detection uses direct process inspection: the save script takes a single
-`ps -eo pid=,ppid=,args=` snapshot, builds the complete parent/child map before
+`ps -eo pid= -o ppid= -o args=` snapshot, builds the complete parent/child map before
 walking it (never assume `ps` row order), and matches only the executable token
 or a script directly launched by a known runtime against assistant binary names
 via `detect_tool()` in `scripts/lib-detect.sh`. Never match assistant-looking
@@ -218,7 +218,7 @@ process args as a reliable fallback.
   run). Sidecars, state files, and logs contain session/environment data: create
   them owner-only, publish JSON atomically, use unpredictable same-directory
   temporary files, and never append through a symlinked log path.
-- Process inspection uses `ps -eo pid=,ppid=` (not `pgrep -P` -- unreliable on macOS)
+- Process inspection uses `ps -eo pid= -o ppid=` (not `pgrep -P` -- unreliable on macOS)
 - Agent detection matches binary names via `case` patterns in `detect_tool()`
 - Hook install uses two-phase matching: **exact equality** (`== $cmd`) to detect
   whether the current-path hook is already installed, and **substring match**
@@ -306,7 +306,7 @@ changes after an upgrade, check the relevant source to confirm.
 | **Cursor launchers expose `--use-system-ca <package>/index.js` before user argv** | These runtime-only tokens must be removed before `extract_cli_args()` drops positional prompts, otherwise all real user options after `index.js` are lost. | Run `ps -eo args=` on the current `agent` and `cursor-agent` installer symlinks |
 | **Claude transcript project keys use ASCII replacement plus a 200-character hash cap** | The cwd-scoped last-resort resolver must name the same `~/.claude/projects/<key>` directory for underscores, Unicode, astral characters, and long paths. | Claude Code source: `L1o()` / `GV()` project-key helpers; inspect a transcript directory created from an edge-case cwd |
 | **Copilot writes `<session-state>/<uuid>/inuse.<pid>.lock`** | Primary PID-to-session mapping for bare launches and in-process `/resume`; avoids same-cwd ambiguity and stale npm-loader argv. Undocumented upstream, hence the contract test | `test/copilot-contract-test.sh` asserts it against the real binary; manually, `ls ~/.copilot/session-state/*/inuse.*.lock` while Copilot runs |
-| **Claude hook spawns intermediate `sh -c`** | `$PPID` in the hook is NOT Claude's PID; hooks walk the process tree via `find_claude_pid()` (max 5 levels) | Run `ps -eo pid=,ppid=,args=` while a hook is executing |
+| **Claude hook spawns intermediate `sh -c`** | `$PPID` in the hook is NOT Claude's PID; hooks walk the process tree via `find_claude_pid()` (max 5 levels) | Run `ps -eo pid= -o ppid= -o args=` while a hook is executing |
 | **Claude hides `--system-prompt-file` and `--append-system-prompt-file` from `--help`** | Both are accepted, but neither appears in the option list -- they are named only in the prose of `--setting-sources`. `_discover_option_value_flags()` therefore cannot see them, and only `OPTION_VALUE_FLAGS_FALLBACK_claude` pins them as value-taking. Read as booleans, the path becomes the first positional and `_drop_positional_args()` discards it along with the whole tail; restore then replays a bare flag and claude consumes the next one as its filename. If a future release documents them, discovery covers it and the fallback entries become redundant rather than wrong | `claude --help \| grep -- '--system-prompt-file'` -- currently no match in the option list; `test/save-hardening-unit-tests.sh` pins the resulting behaviour |
 | **OpenCode plugins run in-process** | `process.pid` in the plugin IS the opencode binary's PID; state file is keyed by this PID | OpenCode source: search for `await import(` in the plugin loader (approx. `packages/opencode/src/plugin/index.ts` -- path may move) |
 | **OpenCode Go binary overwrites process title** | `-s <id>` is NOT visible in `ps`; plugin state file or SQLite DB are the reliable sources | Run `ps -eo args=` on a running `opencode -s <id>` process |
@@ -323,7 +323,8 @@ These are hard-won lessons. Do not "simplify" them away.
 
 | Gotcha | Details |
 |--------|---------|
-| **macOS `pgrep -P` is unreliable** | Silently misses child processes. Always use `ps -eo pid=,ppid=` with awk |
+| **macOS `pgrep -P` is unreliable** | Silently misses child processes. Always use `ps -eo pid= -o ppid=` with awk |
+| **procps-ng 3.3.x splits `ps -o` lists differently** | `-o pid=,ppid=` is one `pid` column headed `,ppid=` on Amazon Linux 2 / RHEL 7, so every row is a bare pid and detection finds nothing. Give each field its own `-o` (`ps -eo pid= -o ppid= -o args=`); `test/save-hardening-unit-tests.sh` rejects the comma form |
 | **tmux < 3.7 mangles delimiters** | Tabs become underscores; control characters are escaped differently per version (3.4 octal, 3.5a hex, 3.6 underscore), so no control character is a portable delimiter. Use `|` (plain pipe), and order the `-F` fields so the free-form one is last — `|` is legal in both session names and paths |
 | **`printf %q` breaks fish shell** | Not POSIX. Use `posix_quote()` (single-quote wrapping with `'\''` escaping) instead |
 | **`\|\| continue` inside `$()` runs in the subshell** | `continue` executes but only affects the subshell, not the outer loop. Place `\|\| continue` outside the `$()` |

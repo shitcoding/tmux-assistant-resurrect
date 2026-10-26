@@ -608,5 +608,14 @@ assert_eq "--verbose is not credential" "no" "$(_cred_rc "--verbose")"
 assert_eq "--debug is not credential" "no" "$(_cred_rc "--debug")"
 
 echo
+echo "== ps field selection =="
+# procps-ng 3.3.x (Amazon Linux 2, RHEL/CentOS 7) reads `-o pid=,ppid=` as one
+# `pid` column headed ",ppid=", so every process-table walk silently finds
+# nothing there. No CI image ships that ps, so pin the spelling statically.
+comma_ps=$(grep -rnE -- '[a-z]=,[a-z]+=' "$REPO_DIR/scripts" "$REPO_DIR/hooks" "$REPO_DIR/test" 2>/dev/null |
+	grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+assert_eq "no ps -o list joins an empty-header field with a comma" "" "$comma_ps"
+
+echo
 echo "save hardening unit tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

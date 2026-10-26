@@ -87,7 +87,7 @@ pane_pid=$(tmux -L "$TMUX_SOCKET" display-message -t contract -p '#{pane_pid}')
 # The root itself is included: when tmux runs the command without an
 # intermediate shell, the pane process IS the loader.
 find_copilot_pids() {
-	ps -eo pid=,ppid=,args= | awk -v root="$1" '
+	ps -eo pid= -o ppid= -o args= | awk -v root="$1" '
 		BEGIN { pids[root] = 1 }
 		{
 			if ($1 == root || $2 in pids) {
