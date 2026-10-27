@@ -665,6 +665,61 @@ comma_ps=$(grep -rnE -- '[a-z]=,[a-z]+=' "$REPO_DIR/scripts" "$REPO_DIR/hooks" "
 	grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
 assert_eq "no ps -o list joins an empty-header field with a comma" "" "$comma_ps"
 
+# --- repeated options are stripped completely ---------------------------------
+# The strip patterns consume the separator on both sides, so with /g the
+# separator an adjacent repeat needs has already been eaten and only every
+# other occurrence went. _strip_long_opt is used for --attachment, --worktree
+# and each discovered session-identity flag, so a survivor is replayed verbatim.
+norm_args() { printf '%s' "$1" | tr -s ' ' | sed 's/^ //; s/ $//'; }
+
+assert_eq "long opt: single occurrence still stripped" "--dsp" \
+	"$(norm_args "$(_strip_long_opt --session-id '--session-id A --dsp')")"
+assert_eq "long opt: repeated space form fully stripped" "" \
+	"$(norm_args "$(_strip_long_opt --session-id '--session-id A --session-id B')")"
+assert_eq "long opt: repeated equals form fully stripped" "" \
+	"$(norm_args "$(_strip_long_opt --session-id '--session-id=A --session-id=B')")"
+assert_eq "long opt: three in a row fully stripped" "" \
+	"$(norm_args "$(_strip_long_opt --session-id '--session-id A --session-id B --session-id C')")"
+assert_eq "long opt: repeated --worktree fully stripped" "--keep k" \
+	"$(norm_args "$(_strip_long_opt --worktree '--worktree /p --worktree /q --keep k')")"
+assert_eq "long opt: a look-alike flag is left alone" "--session-id-extra v --other x" \
+	"$(norm_args "$(_strip_long_opt --session-id '--session-id-extra v --other x')")"
+assert_eq "long opt: surrounding args survive" "--model m --resume R" \
+	"$(norm_args "$(_strip_long_opt --session-id '--model m --session-id A --resume R')")"
+assert_eq "short opt: repeated form fully stripped" "" \
+	"$(norm_args "$(_strip_short_opt -r '-r A -r B')")"
+assert_eq "short opt: single occurrence still stripped" "-x" \
+	"$(norm_args "$(_strip_short_opt -r '-r A -x')")"
+assert_eq "bool opt: repeated form fully stripped" "--keep" \
+	"$(norm_args "$(_strip_bool_opt --cloud '--cloud --cloud --keep')")"
+assert_eq "bool opt: single occurrence still stripped" "--keep" \
+	"$(norm_args "$(_strip_bool_opt --cloud '--cloud --keep')")"
+assert_eq "bool opt: a look-alike flag is left alone" "--cloudy --keep" \
+	"$(norm_args "$(_strip_bool_opt --cloud '--cloudy --keep')")"
+
+# An empty or whitespace-only flag is the class of input the t loop made worse:
+# "(^| )( |$)" matches a lone space and puts a lone space back, so it never
+# reaches a fixpoint, where /g returned at once. No caller passes one today, so
+# this guards the helpers rather than a call site. ulimit -t caps the CPU of
+# the subshell and the sed it starts, so an unguarded helper fails these on
+# empty output instead of stalling CI; where RLIMIT_CPU cannot be set the
+# ulimit is a no-op and it would stall instead, which is why the guard belongs
+# in the helper and is not left to the test.
+strip_bounded() { (ulimit -t 5 2>/dev/null; "$@") 2>/dev/null; }
+
+assert_eq "long opt: an empty flag returns the args untouched" "x y " \
+	"$(strip_bounded _strip_long_opt '' 'x y ')"
+assert_eq "short opt: an empty flag returns the args untouched" "x  y" \
+	"$(strip_bounded _strip_short_opt '' 'x  y')"
+assert_eq "bool opt: an empty flag returns the args untouched" " " \
+	"$(strip_bounded _strip_bool_opt '' ' ')"
+assert_eq "long opt: a whitespace-only flag returns the args untouched" "x y " \
+	"$(strip_bounded _strip_long_opt ' ' 'x y ')"
+assert_eq "short opt: a whitespace-only flag returns the args untouched" " " \
+	"$(strip_bounded _strip_short_opt ' ' ' ')"
+assert_eq "bool opt: a whitespace-only flag returns the args untouched" " " \
+	"$(strip_bounded _strip_bool_opt ' ' ' ')"
+
 echo
 echo "save hardening unit tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
