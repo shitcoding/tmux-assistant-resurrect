@@ -187,6 +187,59 @@ install_claude_hooks() {
         }
     fi
 
+    # settings.json is commonly a symlink into a dotfiles repo, and the comment
+    # above says as much -- but the write below would mv onto the link path and
+    # replace the link with a regular file, detaching it from the repo tracking
+    # it. Resolve first and publish beside the resolved target, keeping this
+    # sequence aligned with remove_assistant_json_hooks and the Cursor installer.
+    local target="$settings" link target_mode="" link_depth=0
+    while [ -L "$target" ] && [ "$link_depth" -lt 16 ]; do
+        # Known limitation: a target name ending in a newline reads back
+        # identically to one without it -- BSD readlink and stat -f '%Y' emit
+        # the same bytes for either -- so such a link resolves to the shorter
+        # name. Shared with the other two resolution sites in this file.
+        link=$(readlink "$target") || {
+            echo "tmux-assistant-resurrect: cannot read symlink $target; left unchanged" >&2
+            return
+        }
+        case "$link" in
+            /*) target="$link" ;;
+            *) target="$(dirname "$target")/$link" ;;
+        esac
+        link_depth=$((link_depth + 1))
+    done
+    if [ -L "$target" ]; then
+        echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $settings" >&2
+        return
+    fi
+    # BSD stat's %p includes the file type plus all permission bits; keep its
+    # final four octal digits. The literal prefix makes GNU stat -f output
+    # fail the octal guard before -c retries. GNU's own -c '%a' may return three.
+    target_mode=$(stat -f 'mode:%p' "$target" 2>/dev/null || true)
+    case "$target_mode" in
+        mode:*) target_mode=${target_mode#mode:} ;;
+        *) target_mode="" ;;
+    esac
+    case "$target_mode" in
+        '' | *[!0-7]*) target_mode="" ;;
+        *)
+            if [ "${#target_mode}" -ge 4 ]; then
+                target_mode=${target_mode#"${target_mode%????}"}
+            else
+                target_mode=""
+            fi
+            ;;
+    esac
+    case "$target_mode" in
+        '' | *[!0-7]*) target_mode=$(stat -c '%a' "$target" 2>/dev/null || true) ;;
+    esac
+    case "$target_mode" in
+        '' | *[!0-7]*)
+            echo "tmux-assistant-resurrect: cannot read mode for $settings; left unchanged" >&2
+            return
+            ;;
+    esac
+
     # Install SessionStart hook, refreshing stale paths if any exist.
     # Skip only when the current command is present AND no stale copies remain.
     local has_current_track has_stale_track
@@ -194,7 +247,10 @@ install_claude_hooks() {
     has_stale_track=$(jq --arg cmd "$track_cmd" '[.hooks.SessionStart[]?.hooks[]? | select(((.command // "") | contains("claude-session-track")) and ((.command // "") != $cmd))] | length' "$settings" 2>/dev/null || echo 0)
     if [ "$has_current_track" = "0" ] || [ "$has_stale_track" != "0" ]; then
         local tmp
-        tmp=$(mktemp "${settings}.tmp.XXXXXX") || return
+        tmp=$(mktemp "${target}.tmp.XXXXXX") || {
+            echo "tmux-assistant-resurrect: cannot prepare update for $settings; left unchanged" >&2
+            return
+        }
         if jq --arg cmd "$track_cmd" '
             .hooks //= {} |
             .hooks.SessionStart //= [] |
@@ -209,7 +265,7 @@ install_claude_hooks() {
                 "hooks": [{"type": "command", "command": $cmd}]
             }]
         ' "$settings" > "$tmp"; then
-            if ! mv "$tmp" "$settings"; then
+            if ! chmod "$target_mode" "$tmp" || ! mv -f "$tmp" "$target"; then
                 rm -f "$tmp"
                 echo "tmux-assistant-resurrect: cannot replace $settings" >&2
                 return
@@ -227,7 +283,10 @@ install_claude_hooks() {
     has_stale_cleanup=$(jq --arg cmd "$cleanup_cmd" '[.hooks.SessionEnd[]?.hooks[]? | select(((.command // "") | contains("claude-session-cleanup")) and ((.command // "") != $cmd))] | length' "$settings" 2>/dev/null || echo 0)
     if [ "$has_current_cleanup" = "0" ] || [ "$has_stale_cleanup" != "0" ]; then
         local tmp
-        tmp=$(mktemp "${settings}.tmp.XXXXXX") || return
+        tmp=$(mktemp "${target}.tmp.XXXXXX") || {
+            echo "tmux-assistant-resurrect: cannot prepare update for $settings; left unchanged" >&2
+            return
+        }
         if jq --arg cmd "$cleanup_cmd" '
             .hooks //= {} |
             .hooks.SessionEnd //= [] |
@@ -240,7 +299,7 @@ install_claude_hooks() {
                 "hooks": [{"type": "command", "command": $cmd}]
             }]
         ' "$settings" > "$tmp"; then
-            if ! mv "$tmp" "$settings"; then
+            if ! chmod "$target_mode" "$tmp" || ! mv -f "$tmp" "$target"; then
                 rm -f "$tmp"
                 echo "tmux-assistant-resurrect: cannot replace $settings" >&2
                 return
