@@ -630,6 +630,33 @@ assert_eq "a hardcoded ~/.codex or opencode.db path no longer exists in the save
 		grep -vE '^[0-9]*:[[:space:]]*#|CODEX_HOME:-|XDG_DATA_HOME:-' || true)"
 
 echo
+echo "== parts rows survive tabs, newlines and pretty JSON =="
+# A cwd or prompt can carry a tab or a newline, and the state file's env is
+# read as JSON; none of them may split or shift a TSV row.
+# emit_session reads state files from the STATE_DIR resolved when the script
+# was sourced, which this suite points at its sandbox.
+printf '{"session_id":"ses_row","model":"opus","env":{"A":"x\\ty","B":"line1\\nline2"}}\n' >"$STATE_DIR/claude-424242.json"
+ROW_PARTS="$SANDBOX/row-parts.tsv"
+: >"$ROW_PARTS"
+ROW_CWD=$'/tmp/odd\tdir\nsecond line'
+(
+	# shellcheck disable=SC2034  # read by the sourced emit_session
+	PARTS_FILE="$ROW_PARTS" CAPTURE_ENV=''
+	get_claude_session() { echo ses_row; }
+	emit_session "work:0.0" claude 424242 'claude --verbose' "$ROW_CWD" 1 0
+)
+rm -f "$STATE_DIR/claude-424242.json"
+assert_eq "one emitted session is one row" 1 "$(wc -l <"$ROW_PARTS" | tr -d ' ')"
+assert_eq "cwd with a tab and a newline round-trips" "$ROW_CWD" \
+	"$(sessions_parts_to_json "$ROW_PARTS" | jq -r '.[0].cwd')"
+assert_eq "env read from the state file stays one JSON value" '{"A":"x\ty","B":"line1\nline2"}' \
+	"$(sessions_parts_to_json "$ROW_PARTS" | jq -c '.[0].env')"
+assert_eq "tsv_row escapes backslash, tab and newline within a column" $'a\\\\b\\tc\\nd\te' \
+	"$(tsv_row $'a\\b\tc\nd' e)"
+assert_eq "no parts writer bypasses tsv_row" "" \
+	"$(grep -nE "printf '%s(\\\\t%s)+\\\\n'" "$REPO_DIR/scripts/save-assistant-sessions.sh" || true)"
+
+echo
 echo "== ps field selection =="
 # procps-ng 3.3.x (Amazon Linux 2, RHEL/CentOS 7) reads `-o pid=,ppid=` as one
 # `pid` column headed ",ppid=", so every process-table walk silently finds

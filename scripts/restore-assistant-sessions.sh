@@ -14,6 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib-detect.sh"
 # shellcheck source=lib-replay.sh
 source "$SCRIPT_DIR/lib-replay.sh"
+# shellcheck source=lib-log.sh
+source "$SCRIPT_DIR/lib-log.sh"
 
 # Follow tmux-resurrect's own save-dir resolution (resurrect_data_dir in
 # lib-detect.sh) so we read the sidecar from wherever resurrect saved it.
@@ -21,74 +23,11 @@ RESURRECT_DIR="$(resurrect_data_dir)"
 INPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-restore.log"
 
-# The log contains session ids and reconstructed CLI arguments/environment.
-# Keep newly-created logs private and never reopen the published path for
-# writing: a retained descriptor prevents a later symlink swap from redirecting
-# log output.
+# The log contains session ids and reconstructed CLI arguments/environment;
+# rotation and log() live in lib-log.sh, shared with the save hook. Keep the
+# umask private for everything else this hook creates, too.
 umask 077
-LOG_ENABLED=0
-log_previous=""
-log_previous_copied=0
-if [ -e "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
-	if [ -L "$LOG_FILE" ]; then
-		printf '%s\n' "tmux-assistant-resurrect: refusing symlinked restore log: $LOG_FILE" >&2
-	elif [ ! -f "$LOG_FILE" ]; then
-		printf '%s\n' "tmux-assistant-resurrect: refusing non-regular restore log: $LOG_FILE" >&2
-	else
-		log_previous=$(mktemp "${LOG_FILE}.rotate.XXXXXX" 2>/dev/null || true)
-		if [ -z "$log_previous" ] || ! mv "$LOG_FILE" "$log_previous" 2>/dev/null; then
-			printf '%s\n' "tmux-assistant-resurrect: cannot rotate restore log, disabling file logging: $LOG_FILE" >&2
-			[ -z "$log_previous" ] || rm -f "$log_previous"
-			log_previous=""
-		fi
-	fi
-fi
-
-if { [ ! -e "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ]; } &&
-	{ [ -z "$log_previous" ] || { [ -f "$log_previous" ] && [ ! -L "$log_previous" ]; }; }; then
-	log_had_noclobber=0
-	case "$-" in *C*) log_had_noclobber=1 ;; esac
-	set -C
-	if exec 9>"$LOG_FILE"; then
-		LOG_ENABLED=1
-	fi
-	[ "$log_had_noclobber" -eq 1 ] || set +C
-	if [ "$LOG_ENABLED" -eq 1 ] && [ -n "$log_previous" ]; then
-		if tail -n 500 "$log_previous" >&9 2>/dev/null; then
-			log_previous_copied=1
-		fi
-	fi
-fi
-
-if [ -n "$log_previous" ]; then
-	if [ "$LOG_ENABLED" -eq 1 ] && [ "$log_previous_copied" -eq 1 ]; then
-		rm -f "$log_previous"
-	else
-		printf '%s\n' "tmux-assistant-resurrect: previous restore log retained at $log_previous" >&2
-	fi
-fi
-if [ "$LOG_ENABLED" -ne 1 ] && [ ! -e "$LOG_FILE" ]; then
-	printf '%s\n' "tmux-assistant-resurrect: cannot securely open restore log, disabling file logging: $LOG_FILE" >&2
-fi
-unset log_previous log_previous_copied log_had_noclobber
-
-log() {
-	local msg
-	msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
-	# Sidecar values may contain control characters. Keep one event per physical
-	# line and prevent a corrupt cache from forging log entries or emitting an
-	# escape sequence into the restore hook's terminal.
-	msg="${msg//$'\r'/\\r}"
-	msg="${msg//$'\n'/\\n}"
-	msg="${msg//$'\033'/\\e}"
-	printf '%s\n' "$msg" >&2
-	if [ "$LOG_ENABLED" -eq 1 ]; then
-		if ! printf '%s\n' "$msg" >&9 2>/dev/null; then
-			LOG_ENABLED=0
-			printf '%s\n' "tmux-assistant-resurrect: cannot write restore log, disabling file logging: $LOG_FILE" >&2
-		fi
-	fi
-}
+open_assistant_log "$LOG_FILE" restore
 
 # Best-effort mitigation for boot flows where tmux-continuum restores the
 # server before any terminal client has attached. TUI tools that query the

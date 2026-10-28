@@ -2094,7 +2094,7 @@ emit_session "wrapper-test:0.0" "opencode" "11111" "/usr/local/bin/bash -c /usr/
 # Child PID (has state file): should emit the state-file session ID.
 emit_session "wrapper-test:0.0" "opencode" "22222" "/usr/local/bin/opencode" "/tmp/wrapper-case" 0 1 || true
 
-wrap_sessions=$(jq -s '.' "$PARTS_FILE")
+wrap_sessions=$(sessions_parts_to_json "$PARTS_FILE")
 wrap_count=$(echo "$wrap_sessions" | jq 'length')
 wrap_sid=$(echo "$wrap_sessions" | jq -r '.[0].session_id // empty')
 assert_eq "Wrapper pass: only one OpenCode entry emitted" "1" "$wrap_count"
