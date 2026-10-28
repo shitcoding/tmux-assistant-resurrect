@@ -63,6 +63,20 @@ assert_eq "pid 1001 -> session A"             "019f1897-89a9-7a40-baa4-587f80e77
 assert_eq "pid 1002 same cwd -> session B"    "019f18aa-bd4b-70b3-862e-5b8771880ca4" "$(get_grok_session 1002 'grok')"
 assert_eq "pid 1003 other cwd -> session C"   "019eff47-9b97-7681-9d9c-ca48cc5e2a2a" "$(get_grok_session 1003 'grok')"
 
+echo "== grok_active_sessions_file: GROK_HOME from the process wins =="
+GROK_PROC="$SANDBOX/proc"
+GROK_ALT="$SANDBOX/alt-grok"
+mkdir -p "$GROK_PROC/1004" "$GROK_PROC/1005" "$GROK_ALT"
+printf 'GROK_HOME=%s\0' "$GROK_ALT" >"$GROK_PROC/1004/environ"
+printf 'PATH=/usr/bin\0' >"$GROK_PROC/1005/environ"
+printf '[{"session_id":"019f0000-0000-7000-8000-000000001004","pid":1004,"cwd":"/w","opened_at":"x"}]\n' >"$GROK_ALT/active_sessions.json"
+assert_eq "process GROK_HOME outranks the hook's" "$GROK_ALT/active_sessions.json" \
+	"$(ASSISTANT_PROC_ROOT="$GROK_PROC" grok_active_sessions_file 1004)"
+assert_eq "no process value falls back to the hook's GROK_HOME" "$GROK_HOME/active_sessions.json" \
+	"$(ASSISTANT_PROC_ROOT="$GROK_PROC" grok_active_sessions_file 1005)"
+assert_eq "pid 1004 is found in the process-scoped registry" "019f0000-0000-7000-8000-000000001004" \
+	"$(ASSISTANT_PROC_ROOT="$GROK_PROC" get_grok_session 1004 'grok')"
+
 echo "== get_grok_session: args fallback (chicken-and-egg after restore) =="
 assert_eq "unknown pid, --resume <uuid>" "0193abcd-1234-7abc-8def-0123456789ab" "$(get_grok_session 9999 'grok --resume 0193abcd-1234-7abc-8def-0123456789ab')"
 assert_eq "unknown pid, --resume=<uuid>" "0193abcd-1234-7abc-8def-0123456789ab" "$(get_grok_session 9999 'grok --resume=0193abcd-1234-7abc-8def-0123456789ab')"

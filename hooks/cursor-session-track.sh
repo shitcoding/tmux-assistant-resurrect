@@ -23,15 +23,19 @@ CURSOR_PID=$(find_cursor_pid || true)
 STATE_DIR="$(assistant_state_dir)"
 ensure_assistant_state_dir "$STATE_DIR"
 
-ENV_JSON=$(jq -n --arg tmux_pane "${TMUX_PANE:-}" --arg shell "${SHELL:-}" \
-	'{tmux_pane: $tmux_pane, shell: $shell}')
+if ! ENV_JSON=$(jq -n --arg tmux_pane "${TMUX_PANE:-}" --arg shell "${SHELL:-}" \
+	'{tmux_pane: $tmux_pane, shell: $shell}' 2>/dev/null); then
+	ENV_JSON='{}'
+fi
 CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
 set -f
 for var in $CAPTURE_ENV; do
 	[[ "$var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || continue
-	NEXT_ENV_JSON=$(printf '%s' "$ENV_JSON" | jq --arg k "$var" --arg v "${!var:-}" \
-		'. + {($k): $v}' 2>/dev/null || true)
-	[ -z "$NEXT_ENV_JSON" ] || ENV_JSON="$NEXT_ENV_JSON"
+	# Accept the update only when jq succeeds; partial output is not JSON.
+	if NEXT_ENV_JSON=$(printf '%s' "$ENV_JSON" | jq --arg k "$var" --arg v "${!var:-}" \
+		'. + {($k): $v}' 2>/dev/null); then
+		ENV_JSON="$NEXT_ENV_JSON"
+	fi
 done
 set +f
 
