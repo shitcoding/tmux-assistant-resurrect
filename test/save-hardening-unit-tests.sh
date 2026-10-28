@@ -20,18 +20,8 @@ source "$REPO_DIR/scripts/lib-detect.sh"
 source "$REPO_DIR/scripts/save-assistant-sessions.sh" >/dev/null 2>&1
 set +e
 
-PASS=0
-FAIL=0
-assert_eq() {
-	local desc="$1" expected="$2" actual="$3"
-	if [ "$expected" = "$actual" ]; then
-		PASS=$((PASS + 1))
-		printf '  [pass] %s\n' "$desc"
-	else
-		FAIL=$((FAIL + 1))
-		printf '  [FAIL] %s\n        expected: [%s]\n        actual:   [%s]\n' "$desc" "$expected" "$actual"
-	fi
-}
+# shellcheck source=lib-assert.sh
+source "$REPO_DIR/test/lib-assert.sh"
 
 awk_detect_tool() {
 	printf '%s\n' "$1" | awk -v classify_only=1 -f "$REPO_DIR/scripts/lib-detect.awk"

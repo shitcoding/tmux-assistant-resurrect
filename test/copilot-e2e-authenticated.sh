@@ -30,7 +30,7 @@ if ! command -v copilot >/dev/null 2>&1; then
 	exit 0
 fi
 
-REPO="${REPO_DIR:-$HOME/tmux-assistant-resurrect}"
+REPO="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export COPILOT_AUTO_UPDATE=false
 MAGIC="BANANAPHONE7"
 UUID="1c0f11a7-0000-4000-8000-$(printf %012x "$$")"

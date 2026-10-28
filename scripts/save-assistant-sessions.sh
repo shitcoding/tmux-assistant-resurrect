@@ -1444,22 +1444,22 @@ relaunch_ledger_apply() {
 	esac
 	cutoff=$((now_epoch - 30 * 24 * 60 * 60))
 
-	if [ -f "$RELAUNCH_LEDGER_FILE" ]; then
-		existing=$(sed -n '1,$p' "$RELAUNCH_LEDGER_FILE" 2>/dev/null || printf '[]')
-	else
-		existing='[]'
-	fi
+	# The existing ledger reaches jq on stdin, never as an argument: at the
+	# 200-entry cap it exceeds the argv limit on Git Bash ("Argument list too
+	# long"), and the retention logic silently stops applying. A missing or
+	# unreadable file reads as empty, which the program decodes as [].
+	existing=/dev/null
+	[ -f "$RELAUNCH_LEDGER_FILE" ] && existing="$RELAUNCH_LEDGER_FILE"
 	tmp=$(mktemp "${RELAUNCH_LEDGER_FILE}.tmp.XXXXXX") || return 1
 	RELAUNCH_LEDGER_TMP="$tmp"
-	if ! (umask 077 && jq -Rn \
-		--arg existing "$existing" \
+	if ! (umask 077 && jq -Rs \
 		--arg tool "$tool" \
 		--arg cmd "$canon" \
 		--arg now_iso "$now_iso" \
 		--argjson now "$now_epoch" \
 		--argjson cutoff "$cutoff" \
 		--argjson lifetime "$lifetime" '
-		($existing | try fromjson catch []) as $decoded |
+		(. | try fromjson catch []) as $decoded |
 		(if ($decoded | type) == "array" then $decoded else [] end) as $entries |
 		($entries | map(select((.last_seen_epoch // 0) >= $cutoff))) as $fresh |
 		($fresh | map(select(.tool == $tool and .cmd == $cmd)) | first // {}) as $prior |
@@ -1475,7 +1475,7 @@ relaunch_ledger_apply() {
 			last_seen_epoch: $now
 		  }]
 		 | sort_by(.last_seen_epoch) | reverse | .[:200])
-	' >"$tmp"); then
+	' <"$existing" >"$tmp"); then
 		rm -f "$tmp"
 		RELAUNCH_LEDGER_TMP=""
 		return 1

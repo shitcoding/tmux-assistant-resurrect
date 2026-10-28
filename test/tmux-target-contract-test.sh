@@ -53,18 +53,8 @@ trap cleanup EXIT INT TERM
 # shellcheck source=../scripts/lib-detect.sh
 source "$REPO_DIR/scripts/lib-detect.sh"
 
-PASS=0
-FAIL=0
-assert_eq() {
-	local desc="$1" expected="$2" actual="$3"
-	if [ "$expected" = "$actual" ]; then
-		PASS=$((PASS + 1))
-		printf '  [pass] %s\n' "$desc"
-	else
-		FAIL=$((FAIL + 1))
-		printf '  [FAIL] %s\n        expected: [%s]\n        actual:   [%s]\n' "$desc" "$expected" "$actual"
-	fi
-}
+# shellcheck source=lib-assert.sh
+source "$REPO_DIR/test/lib-assert.sh"
 
 echo "tmux: $("$REAL_TMUX" -V)"
 

@@ -439,6 +439,19 @@ cat ~/.local/share/tmux/resurrect/assistant-restore.log
 
 ### Test infrastructure notes
 
+- Hermetic suites share `test/lib-assert.sh` (`pass`, `fail`, `skip`,
+  `assert_eq`, `assert_contains`, and the `PASS`/`FAIL`/`SKIP` counters).
+  Source it as `"$REPO_DIR/test/lib-assert.sh"`, not via `SCRIPT_DIR`: sourcing
+  the scripts under test overwrites `SCRIPT_DIR`. `run-tests.sh` keeps its own
+  JUnit-emitting helpers, and the real-tmux lifecycle tests keep abort-on-first-
+  failure ones; do not add a fifth copy elsewhere.
+- Every hermetic suite is invoked directly by `run-tests.sh` and by the macOS
+  and Windows CI jobs; a suite must never be reached only by being nested
+  inside another suite, or a platform silently loses it.
+- Restore tests assert on `assistant-restore.log`, which the hook writes before
+  `just restore` returns; do not reintroduce a fixed sleep after it. A pane
+  created with `new-session` is awaited with `wait_for_pane_shell`, and output
+  produced *inside* a pane with `wait_for_file`.
 - The save script has a `main()` guard so tests can `source` it to call
   extraction functions directly without executing the full save flow.
 - Tests use polling helpers (`wait_for_child`, `wait_for_descendant`,

@@ -29,9 +29,8 @@ SANDBOX="$(mktemp -d)" || exit 1
 [ -d "$SANDBOX" ] || exit 1
 trap 'rm -rf "$SANDBOX"' EXIT INT TERM
 
-PASS=0
-FAIL=0
-SKIP=0
+# shellcheck source=lib-assert.sh
+source "$REPO_DIR/test/lib-assert.sh"
 
 # Which interpreter the code *under test* runs under. The harness itself runs
 # under whatever invoked it, but every tested function is exercised in a child
@@ -40,36 +39,6 @@ SKIP=0
 # hook behave under it. $BASH is the running interpreter's own path, so
 # `bash3.2 test/state-dir-unit-tests.sh` now exercises 3.2 end to end.
 UNDER_TEST="${BASH:-bash}"
-
-assert_eq() {
-	local desc="$1" expected="$2" actual="$3"
-	if [ "$expected" = "$actual" ]; then
-		PASS=$((PASS + 1))
-		printf '  [pass] %s\n' "$desc"
-	else
-		FAIL=$((FAIL + 1))
-		printf '  [FAIL] %s\n        expected: [%s]\n        actual:   [%s]\n' "$desc" "$expected" "$actual"
-	fi
-}
-
-assert_contains() {
-	local desc="$1" haystack="$2" needle="$3"
-	case "$haystack" in
-	*"$needle"*)
-		PASS=$((PASS + 1))
-		printf '  [pass] %s\n' "$desc"
-		;;
-	*)
-		FAIL=$((FAIL + 1))
-		printf '  [FAIL] %s\n        expected to contain: [%s]\n        actual:              [%s]\n' "$desc" "$needle" "$haystack"
-		;;
-	esac
-}
-
-skip() {
-	SKIP=$((SKIP + 1))
-	printf '  [skip] %s (%s)\n' "$1" "$2"
-}
 
 # Write a fixture file, creating its directory, and fail loudly if that did not
 # work. This suite runs without `set -e` (a failed case must not abort the rest),
