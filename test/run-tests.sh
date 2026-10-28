@@ -218,6 +218,23 @@ wait_for_death() {
 	return 1
 }
 
+# Wait until a pane's foreground process is an interactive shell, i.e. the
+# pane created a moment ago is ready to receive send-keys. new-session returns
+# before the shell has finished starting, so a fixed sleep here was a guess.
+# Usage: wait_for_pane_shell <tmux_target> [timeout_secs]
+wait_for_pane_shell() {
+	local target="$1" timeout="${2:-5}"
+	local deadline=$((SECONDS + timeout)) cmd
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		cmd=$(tmux display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null || true)
+		case "${cmd#-}" in
+		bash | zsh | fish | sh | dash | ksh | tcsh | csh | nu) return 0 ;;
+		esac
+		sleep 0.1
+	done
+	return 1
+}
+
 # Kill all descendant processes of a tmux pane, then optionally kill the session.
 # Sends C-c first to allow graceful exit, then force-kills remaining children.
 #
@@ -440,6 +457,54 @@ if save_hardening_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/save-hardening-u
 else
 	echo "$save_hardening_output"
 	fail "Save and process-detection hardening unit suite"
+fi
+
+# --- Focused Grok session tests ---
+
+suite "grok_unit"
+echo ""
+echo "=== Focused Grok session tests ==="
+echo ""
+
+grok_unit_output=""
+if grok_unit_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/grok-unit-tests.sh" 2>&1); then
+	echo "$grok_unit_output"
+	pass "Grok focused unit suite"
+else
+	echo "$grok_unit_output"
+	fail "Grok focused unit suite"
+fi
+
+# --- Shared replay policy (drop-flags / drop-env) tests ---
+
+suite "replay_policy_unit"
+echo ""
+echo "=== Shared replay policy (drop-flags / drop-env) tests ==="
+echo ""
+
+replay_policy_unit_output=""
+if replay_policy_unit_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/replay-policy-unit-tests.sh" 2>&1); then
+	echo "$replay_policy_unit_output"
+	pass "Replay policy unit suite"
+else
+	echo "$replay_policy_unit_output"
+	fail "Replay policy unit suite"
+fi
+
+# --- Antigravity CLI session tests ---
+
+suite "agy_unit"
+echo ""
+echo "=== Antigravity CLI session tests ==="
+echo ""
+
+agy_unit_output=""
+if agy_unit_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/agy-unit-tests.sh" 2>&1); then
+	echo "$agy_unit_output"
+	pass "Antigravity CLI unit suite"
+else
+	echo "$agy_unit_output"
+	fail "Antigravity CLI unit suite"
 fi
 
 # Real Claude chooses the model; a loopback API supplies deterministic replies.
@@ -1080,7 +1145,6 @@ BG_EOF
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 restore_log_bg=$(cat "$RESTORE_LOG")
 if echo "$restore_log_bg" | grep -q "already has a running assistant"; then
@@ -1123,7 +1187,6 @@ CWDEOF
 : >"$RESTORE_LOG"
 restore_exit=0
 just restore 2>&1 || restore_exit=$?
-sleep 5
 
 assert_eq "Restore doesn't crash on cwd with single quote" "0" "$restore_exit"
 assert_contains "Restore attempted resume with tricky cwd" "$(cat "$RESTORE_LOG")" "ses_cwd_test"
@@ -1144,7 +1207,6 @@ CWDEOF2
 : >"$RESTORE_LOG"
 restore_exit2=0
 just restore 2>&1 || restore_exit2=$?
-sleep 5
 
 assert_eq "Restore doesn't crash on missing cwd" "0" "$restore_exit2"
 assert_contains "Restore reports missing saved cwd" "$(cat "$RESTORE_LOG")" "no longer exists, skipping"
@@ -1217,7 +1279,6 @@ UNKNEOF
 : >"$RESTORE_LOG"
 restore_exit_unknown=0
 just restore 2>&1 || restore_exit_unknown=$?
-sleep 3
 
 assert_eq "Restore doesn't crash on unknown tool" "0" "$restore_exit_unknown"
 assert_contains "Restore logs unknown tool" "$(cat "$RESTORE_LOG")" "unknown tool"
@@ -1250,7 +1311,6 @@ NOSHELLEOF
 : >"$RESTORE_LOG"
 restore_exit_noshell=0
 just restore 2>&1 || restore_exit_noshell=$?
-sleep 3
 
 assert_eq "Restore doesn't crash on non-shell pane" "0" "$restore_exit_noshell"
 assert_contains "Restore skips non-shell pane" "$(cat "$RESTORE_LOG")" "not a shell"
@@ -4040,7 +4100,7 @@ echo ""
 
 # Ensure a clean test pane
 tmux new-session -d -s test-restore-enrich -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-enrich
 
 # Create enriched sidecar JSON with cli_args
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RENRICH'
@@ -4064,7 +4124,6 @@ RENRICH
 RESTORE_LOG="$HOME/.tmux/resurrect/assistant-restore.log"
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 restore_enrich_log=$(cat "$RESTORE_LOG")
 
@@ -4081,7 +4140,7 @@ echo "=== Test 10a: restore Copilot with saved state root ==="
 echo ""
 
 tmux new-session -d -s test-restore-copilot-home -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-copilot-home
 
 copilot_restore_home="/tmp/copilot restore home.$$"
 mkdir -p "$copilot_restore_home"
@@ -4105,7 +4164,6 @@ RECOPEOF
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 restore_copilot_home_log=$(cat "$RESTORE_LOG")
 assert_contains "Restore pins Copilot to the saved state root" "$restore_copilot_home_log" \
@@ -4121,7 +4179,7 @@ echo "=== Test 10b: restore with env vars ==="
 echo ""
 
 tmux new-session -d -s test-restore-env -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-env
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RENVEOF'
 {
@@ -4145,7 +4203,6 @@ tmux set-option -g @assistant-resurrect-capture-env 'ANTHROPIC_BASE_URL' 2>/dev/
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 restore_env_log=$(cat "$RESTORE_LOG")
 assert_contains "Restore includes ANTHROPIC_BASE_URL env prefix" "$restore_env_log" "ANTHROPIC_BASE_URL="
@@ -4160,7 +4217,7 @@ echo "=== Test 10c: restore backward compat — no enriched fields ==="
 echo ""
 
 tmux new-session -d -s test-restore-compat -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-compat
 
 # Old-format sidecar (no cli_args, no model, no env)
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RCOMPAT'
@@ -4180,7 +4237,6 @@ RCOMPAT
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 compat_log=$(cat "$RESTORE_LOG")
 assert_contains "Backward compat: restore still works" "$compat_log" "ses_compat_test"
@@ -4229,6 +4285,9 @@ rm -f "$RELAUNCH_RESTORE_MARKER"
 : >"$RELAUNCH_VOUCHER"
 : >"$RESTORE_LOG"
 just restore 2>&1
+# Negative check: give a wrongly sent command time to show up before asserting
+# that nothing was executed.
+sleep 1
 refused_log=$(cat "$RESTORE_LOG")
 assert_contains "Empty voucher refuses relaunch" "$refused_log" "relaunch cmd not vouched"
 assert_file_not_exists "Refused relaunch executes nothing" "$RELAUNCH_RESTORE_MARKER"
@@ -4236,6 +4295,9 @@ assert_file_not_exists "Refused relaunch executes nothing" "$RELAUNCH_RESTORE_MA
 printf '%s\n' 'claude agents' >"$RELAUNCH_VOUCHER"
 : >"$RESTORE_LOG"
 just restore 2>&1
+# The marker is written by the relaunched command inside the pane, so it
+# lands asynchronously; the log alone does not prove the argv reached it.
+wait_for_file "$RELAUNCH_RESTORE_MARKER" 10 || true
 allowed_log=$(cat "$RESTORE_LOG")
 assert_contains "Exact voucher allows relaunch" "$allowed_log" "relaunching claude"
 allowed_args=$(cat "$RELAUNCH_RESTORE_MARKER" 2>/dev/null || true)
@@ -4254,6 +4316,9 @@ with open(path, "w") as handle:
 PY
 : >"$RESTORE_LOG"
 just restore 2>&1
+# Negative check: give a wrongly sent command time to show up before asserting
+# that nothing was executed.
+sleep 1
 whitespace_log=$(cat "$RESTORE_LOG")
 assert_contains "Noncanonical sidecar whitespace is refused" "$whitespace_log" "relaunch cmd not vouched"
 assert_file_not_exists "Whitespace mismatch executes nothing" "$RELAUNCH_RESTORE_MARKER"
@@ -4269,7 +4334,7 @@ echo "=== Test 10c2: Pi restore with enriched cli_args ==="
 echo ""
 
 tmux new-session -d -s test-restore-pi -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-pi
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RPIENRICH'
 {
@@ -4289,7 +4354,6 @@ RPIENRICH
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 pi_enrich_log=$(cat "$RESTORE_LOG")
 assert_contains "Pi restore: session ID present" "$pi_enrich_log" "ses_pi_enrich"
@@ -4306,7 +4370,7 @@ echo "=== Test 10d: restore with empty cli_args ==="
 echo ""
 
 tmux new-session -d -s test-restore-empty -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-empty
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'REMPTY'
 {
@@ -4328,7 +4392,6 @@ REMPTY
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 empty_log=$(cat "$RESTORE_LOG")
 assert_contains "Empty cli_args: restore still works" "$empty_log" "ses_empty_cli"
@@ -4346,7 +4409,7 @@ echo "=== Test 10d2: restore adds --model from sidecar field ==="
 echo ""
 
 tmux new-session -d -s test-restore-model -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-model
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RMODEL'
 {
@@ -4368,7 +4431,6 @@ RMODEL
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 model_log=$(cat "$RESTORE_LOG")
 assert_contains "Model field: --model added to resume" "$model_log" "--model"
@@ -4377,7 +4439,7 @@ assert_contains "Model field: correct model value" "$model_log" "claude-opus-4-5
 # Verify --model is NOT duplicated when already in cli_args
 tmux kill-session -t test-restore-model 2>/dev/null || true
 tmux new-session -d -s test-restore-model -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-model
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RMODELDUP'
 {
@@ -4399,7 +4461,6 @@ RMODELDUP
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 nodup_log=$(cat "$RESTORE_LOG")
 # Count occurrences of --model — should be exactly 1 (from cli_args, not doubled)
@@ -4409,7 +4470,7 @@ assert_eq "Model field: no duplicate --model when already in cli_args" "1" "$nod
 # Verify model is NOT added for non-Claude tools
 tmux kill-session -t test-restore-model 2>/dev/null || true
 tmux new-session -d -s test-restore-model -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-model
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RMODELOC'
 {
@@ -4431,7 +4492,6 @@ RMODELOC
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 oc_model_log=$(cat "$RESTORE_LOG")
 if echo "$oc_model_log" | grep -q '\-\-model'; then
@@ -4449,7 +4509,7 @@ echo "=== Test 10e: restore filters built-in env vars ==="
 echo ""
 
 tmux new-session -d -s test-restore-envfilter -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-envfilter
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RENVF'
 {
@@ -4473,7 +4533,6 @@ tmux set-option -g @assistant-resurrect-capture-env 'MY_CUSTOM' 2>/dev/null || t
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 envfilter_log=$(cat "$RESTORE_LOG")
 # MY_CUSTOM should be in the env prefix
@@ -4496,7 +4555,7 @@ echo "=== Test 10e2: restore rejects invalid env var names ==="
 echo ""
 
 tmux new-session -d -s test-restore-badvar -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-badvar
 
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'BADVAREOF'
 {
@@ -4552,7 +4611,7 @@ echo "=== Test 10f: restore quotes cli_args with brackets (zsh glob safety) ==="
 echo ""
 
 tmux new-session -d -s test-restore-bracket -c /tmp 2>/dev/null || true
-sleep 0.5
+wait_for_pane_shell test-restore-bracket
 
 # Model name with brackets — this caused "zsh: no matches found" before the fix
 cat >"$HOME/.tmux/resurrect/assistant-sessions.json" <<'RBRACKET'
@@ -4575,7 +4634,6 @@ RBRACKET
 : >"$RESTORE_LOG"
 restore_bracket_exit=0
 just restore 2>&1 || restore_bracket_exit=$?
-sleep 5
 
 bracket_log=$(cat "$RESTORE_LOG")
 assert_eq "Restore doesn't crash with bracket model name" "0" "$restore_bracket_exit"
@@ -4676,7 +4734,6 @@ RPIPEEOF
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 pipe_restore_log=$(cat "$RESTORE_LOG")
 assert_contains "Pipe name: restore targets the right pane" "$pipe_restore_log" "restoring claude in $PIPE_SESSION:0.0"
@@ -4713,7 +4770,6 @@ RLEGACYEOF
 
 : >"$RESTORE_LOG"
 just restore 2>&1
-sleep 5
 
 pipe_legacy_log=$(cat "$RESTORE_LOG")
 assert_contains "Legacy sidecar: label split back into a live pane" "$pipe_legacy_log" "restoring claude in $PIPE_SESSION:0.0"
@@ -4765,7 +4821,6 @@ RDOTEOF
 
 	: >"$RESTORE_LOG"
 	just restore 2>&1
-	sleep 5
 
 	dotted_log=$(cat "$RESTORE_LOG")
 	assert_contains "Dotted name: restore targets the right pane" "$dotted_log" "restoring claude in $DOTTED_WANTED:0.0"
