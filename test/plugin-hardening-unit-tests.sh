@@ -249,11 +249,14 @@ for json_tool in claude cursor; do
     assert_eq "$json_tool on reinstalls exactly the two native hooks" 2 \
         "$(jq --arg tool "$json_tool" '[.. | objects | .command? // empty | select(contains($tool + "-session-"))] | length' "$json_settings")"
 
+    # The enabled installer must leave the whole chain intact for both tools,
+    # so the refusal test below can reuse it without re-establishing it.
+    if [ -L "$json_settings" ] && [ -L "$json_middle" ]; then
+        pass "$json_tool on preserves the dotfile symlink chain"
+    else
+        fail "$json_tool on preserves the dotfile symlink chain"
+    fi
     printf '{invalid\n' > "$json_target"
-    # Claude's enabled installer replaces a symlink in existing behavior;
-    # re-establish it for this refusal test without changing that install path.
-    rm "$json_settings"
-    ln -s "$json_middle" "$json_settings"
     json_optout_run "$json_tool" "$json_home" off 2>/dev/null
     assert_eq "$json_tool off leaves malformed JSON unchanged" '{invalid' "$(cat "$json_target")"
     assert_eq "$json_tool opt-out leaves no temporary file" '' \
@@ -827,6 +830,92 @@ if command -v just >/dev/null 2>&1; then
     esac
 else
     skip "status resolver test (just is unavailable)"
+fi
+
+# Dotfile managers commonly symlink settings.json. Updating Claude hooks must
+# preserve that file identity instead of replacing the link with a regular file,
+# the same way the Cursor update above already does.
+SYMLINK_CLAUDE_HOME="$TEST_ROOT/symlink-claude-home"
+SYMLINK_CLAUDE_TARGET="$TEST_ROOT/claude-settings-target.json"
+SYMLINK_CLAUDE_LINK="$TEST_ROOT/links/claude-settings-link.json"
+mkdir -p "$SYMLINK_CLAUDE_HOME/.claude" "$TEST_ROOT/links"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"user-own-hook"}]}]}}\n' >"$SYMLINK_CLAUDE_TARGET"
+chmod 2640 "$SYMLINK_CLAUDE_TARGET"
+ln -s ../claude-settings-target.json "$SYMLINK_CLAUDE_LINK"
+ln -s ../../links/claude-settings-link.json "$SYMLINK_CLAUDE_HOME/.claude/settings.json"
+HOME="$SYMLINK_CLAUDE_HOME" PATH="$FAKE_BIN:$PATH" \
+    "$UNDER_TEST" "$ROOT_DIR/tmux-assistant-resurrect.tmux"
+if [ -L "$SYMLINK_CLAUDE_HOME/.claude/settings.json" ] && [ -L "$SYMLINK_CLAUDE_LINK" ] && \
+    jq -e '
+        ([.hooks.SessionStart[]?.hooks[]? | select((.command // "") == "user-own-hook")] | length == 1) and
+        ([.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))] | length == 1) and
+        ([.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))] | length == 1)
+    ' \
+    "$SYMLINK_CLAUDE_TARGET" >/dev/null; then
+    pass "Claude hook update preserves a symlinked settings.json"
+else
+    fail "Claude hook update preserves a symlinked settings.json"
+fi
+assert_file_mode "Claude hook update preserves the symlink target mode" 2640 "$SYMLINK_CLAUDE_TARGET"
+assert_eq "Claude hook update leaves no temporary file" '' \
+    "$(find "$TEST_ROOT" -name 'claude-settings-target.json.tmp.*' -print -quit)"
+
+# The Claude install loop has its own depth bound; pin both sides of it, the way
+# the Cursor fixtures above pin theirs. Links are relative throughout: on macOS
+# /var is itself a symlink, so an absolute chain under $TMPDIR costs two kernel
+# traversals per hop and trips ELOOP before this guard is reached.
+BOUNDARY_CLAUDE_HOME="$TEST_ROOT/boundary-claude-home"
+BOUNDARY_CLAUDE_TARGET="$TEST_ROOT/boundary-claude-target.json"
+BOUNDARY_CLAUDE_LINKS="$TEST_ROOT/boundary-claude-links"
+mkdir -p "$BOUNDARY_CLAUDE_HOME/.claude" "$BOUNDARY_CLAUDE_LINKS"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"command":"boundary-user-hook"}]}]}}\n' >"$BOUNDARY_CLAUDE_TARGET"
+i=14
+while [ "$i" -ge 0 ]; do
+    if [ "$i" -eq 14 ]; then
+        ln -s ../boundary-claude-target.json "$BOUNDARY_CLAUDE_LINKS/link-$i"
+    else
+        ln -s "link-$((i + 1))" "$BOUNDARY_CLAUDE_LINKS/link-$i"
+    fi
+    i=$((i - 1))
+done
+ln -s ../../boundary-claude-links/link-0 "$BOUNDARY_CLAUDE_HOME/.claude/settings.json"
+HOME="$BOUNDARY_CLAUDE_HOME" PATH="$FAKE_BIN:$PATH" \
+    "$UNDER_TEST" "$ROOT_DIR/tmux-assistant-resurrect.tmux"
+if jq -e '
+    ([.hooks.SessionStart[]?.hooks[]? | select((.command // "") == "boundary-user-hook")] | length == 1) and
+    ([.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))] | length == 1) and
+    ([.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))] | length == 1)
+' "$BOUNDARY_CLAUDE_TARGET" >/dev/null; then
+    pass "Claude install accepts exactly 16 symlink hops"
+else
+    fail "Claude install accepts exactly 16 symlink hops"
+fi
+
+DEEP_CLAUDE_HOME="$TEST_ROOT/deep-claude-home"
+DEEP_CLAUDE_TARGET="$TEST_ROOT/deep-claude-target.json"
+DEEP_CLAUDE_LINKS="$TEST_ROOT/deep-claude-links"
+mkdir -p "$DEEP_CLAUDE_HOME/.claude" "$DEEP_CLAUDE_LINKS"
+printf '{"untouched":true}\n' >"$DEEP_CLAUDE_TARGET"
+i=15
+while [ "$i" -ge 0 ]; do
+    if [ "$i" -eq 15 ]; then
+        ln -s ../deep-claude-target.json "$DEEP_CLAUDE_LINKS/link-$i"
+    else
+        ln -s "link-$((i + 1))" "$DEEP_CLAUDE_LINKS/link-$i"
+    fi
+    i=$((i - 1))
+done
+ln -s ../../deep-claude-links/link-0 "$DEEP_CLAUDE_HOME/.claude/settings.json"
+deep_claude_output=$(HOME="$DEEP_CLAUDE_HOME" PATH="$FAKE_BIN:$PATH" \
+    "$UNDER_TEST" "$ROOT_DIR/tmux-assistant-resurrect.tmux" 2>&1)
+case "$deep_claude_output" in
+    *"refusing deep or cyclic symlink chain"*) pass "Claude install refuses an over-deep symlink chain" ;;
+    *) fail "Claude install refuses an over-deep symlink chain" ;;
+esac
+if jq -e '.untouched == true and (keys | length == 1)' "$DEEP_CLAUDE_TARGET" >/dev/null; then
+    pass "Claude install leaves an over-deep symlink target unchanged"
+else
+    fail "Claude install leaves an over-deep symlink target unchanged"
 fi
 
 if [ "${REQUIRE_JUST:-0}" = "1" ] && [ "$skips" -ne 0 ]; then
