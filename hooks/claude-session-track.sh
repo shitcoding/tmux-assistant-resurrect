@@ -44,9 +44,12 @@ CLAUDE_PID=$(find_claude_pid 2>/dev/null || true)
 
 # Build env object: always capture TMUX_PANE and SHELL, plus user-configured
 # vars from the tmux option @assistant-resurrect-capture-env (space-separated).
-ENV_JSON=$(jq -n --arg tmux_pane "${TMUX_PANE:-}" --arg shell "${SHELL:-}" \
-	'{tmux_pane: $tmux_pane, shell: $shell}' 2>/dev/null || true)
-[ -n "$ENV_JSON" ] || ENV_JSON='{}'
+# Accept jq output only on success: a jq that writes partial output and then
+# fails would otherwise hand --argjson invalid JSON and lose the whole file.
+if ! ENV_JSON=$(jq -n --arg tmux_pane "${TMUX_PANE:-}" --arg shell "${SHELL:-}" \
+	'{tmux_pane: $tmux_pane, shell: $shell}' 2>/dev/null); then
+	ENV_JSON='{}'
+fi
 
 CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
 # The option value is data: a `*` in it must not expand against the hook's cwd
@@ -59,9 +62,10 @@ for var in $CAPTURE_ENV; do
 		continue
 	fi
 	# A jq failure drops this one variable, not the whole state file.
-	NEXT_ENV_JSON=$(printf '%s' "$ENV_JSON" | jq --arg k "$var" --arg v "${!var:-}" \
-		'. + {($k): $v}' 2>/dev/null || true)
-	[ -z "$NEXT_ENV_JSON" ] || ENV_JSON="$NEXT_ENV_JSON"
+	if NEXT_ENV_JSON=$(printf '%s' "$ENV_JSON" | jq --arg k "$var" --arg v "${!var:-}" \
+		'. + {($k): $v}' 2>/dev/null); then
+		ENV_JSON="$NEXT_ENV_JSON"
+	fi
 done
 set +f
 

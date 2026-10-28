@@ -622,7 +622,8 @@ FLAKY_BIN="$TEST_ROOT/flaky-bin"
 mkdir -p "$FLAKY_BIN"
 cat >"$FLAKY_BIN/jq" <<JQ
 #!/usr/bin/env bash
-case " \$* " in *' --arg k '*) exit 1 ;; esac
+# Partial output before the failure: the hook must discard it, not splice it in.
+case " \$* " in *' --arg k '*) printf '{"tmux_pane":"%%7","GOOD_ENV":"val'; exit 1 ;; esac
 exec "$REAL_JQ" "\$@"
 JQ
 chmod +x "$FLAKY_BIN/jq"
