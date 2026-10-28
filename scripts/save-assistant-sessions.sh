@@ -772,7 +772,7 @@ get_codex_session() {
 	# Method 2: resume arg in process args (chicken-and-egg fallback)
 	# After restore, codex is launched as `codex resume <session_id>`.
 	local sid
-	sid=$(echo "$args" | sed -n "s/.*resume  *\([A-Za-z0-9_-]*\).*/\1/p")
+	sid=$(_codex_resume_arg "$args" "$child_pid")
 	if [ -n "$sid" ]; then
 		echo "$sid"
 		return
@@ -828,6 +828,89 @@ get_codex_session() {
 			return
 		fi
 	fi
+}
+
+# Session id given to codex's `resume` subcommand, or nothing.
+#
+# Token-based rather than a regex over the flattened line: `resume` must be the
+# first positional after the binary, and its argument must not be an option.
+# The old `.*resume  *\([A-Za-z0-9_-]*\)` regex accepted a leading dash, so
+# `codex resume --last` (the picker, no id at all) saved the session id
+# `--last`, which restore then rejected -- and because an argv hit short-
+# circuits the SQLite/rollout lookups, the pane was never recovered. It also
+# matched the word "resume" inside a prompt.
+#
+# Exact argv from /proc is preferred where the kernel still has the boundaries
+# (Linux/WSL). On the flattened `ps` line a quoted value such as
+# `-C '/tmp/My Project'` arrives as several bare tokens, so there every bare
+# token after a value-taking option is read as that value's continuation until
+# the next option or `resume`. That keeps the id for the common case and only
+# misreads a prompt that both follows a valued option and contains the word
+# "resume" -- the residual limit of a flattened argv.
+#
+# Usage: _codex_resume_arg <flattened_args> [pid]
+_codex_resume_arg() {
+	local args="$1" pid="${2:-}" tok reglob=""
+	local -a exact_argv=()
+	if [ -n "$pid" ]; then
+		while IFS= read -r -d '' tok; do
+			exact_argv[${#exact_argv[@]}]="$tok"
+		done < <(_exact_argv "$pid" codex)
+	fi
+	if [ "${#exact_argv[@]}" -gt 0 ]; then
+		_codex_resume_from_tokens 1 "${exact_argv[@]}"
+		return 0
+	fi
+
+	case "$-" in *f*) ;; *) reglob=1 ;; esac
+	set -f
+	# shellcheck disable=SC2086 # deliberate tokenization of flattened ps argv
+	set -- $args
+	[ -n "$reglob" ] && set +f
+	# Drop everything up to the binary, and a repeated script path after it
+	# (`node /opt/codex ...`, `codex /usr/local/bin/codex ...`).
+	while [ "$#" -gt 0 ]; do
+		tok="$1"
+		shift
+		[ "${tok##*/}" = "codex" ] && break
+	done
+	if [ "$#" -gt 0 ] && [ "${1##*/}" = "codex" ]; then shift; fi
+	[ "$#" -gt 0 ] || return 0
+	_codex_resume_from_tokens 0 "$@"
+}
+
+# Usage: _codex_resume_from_tokens <exact:0|1> <tokens after the binary>...
+_codex_resume_from_tokens() {
+	local exact="$1" tok value_flags skip=0 want_id=0 in_value=0
+	shift
+	value_flags=" $(_discover_option_value_flags codex) "
+	for tok in "$@"; do
+		if [ "$want_id" -eq 1 ]; then
+			# `resume --last` / `resume --all` are pickers with no id.
+			case "$tok" in
+			-*) return 0 ;;
+			*)
+				printf '%s\n' "$tok"
+				return 0
+				;;
+			esac
+		fi
+		if [ "$skip" -eq 1 ]; then
+			skip=0
+			[ "$exact" -eq 1 ] || in_value=1
+			continue
+		fi
+		case "$tok" in
+		--*=* | -?=*) in_value=0 ;;
+		-*)
+			in_value=0
+			case "$value_flags" in *" $tok "*) skip=1 ;; esac
+			;;
+		resume) want_id=1 ;;
+		*) [ "$in_value" -eq 1 ] || return 0 ;; # a positional that is not the subcommand
+		esac
+	done
+	return 0
 }
 
 _arg_value() {
@@ -1957,8 +2040,15 @@ _strip_bool_opt() {
 # tokens (e.g. option values like "o3" in `--model o3 resume`) are
 # skipped — scanning continues past them to find the actual subcommand.
 _strip_subcmds() {
+	# Word-split with pathname expansion off, like every other splitter here:
+	# argv is data, and a value such as `-c 'x=["*.md"]'` must not be expanded
+	# against the save hook's working directory.
+	local reglob=""
+	case "$-" in *f*) ;; *) reglob=1 ;; esac
+	set -f
 	# shellcheck disable=SC2206  # deliberate word-split of argv string
 	local -a words=($1)
+	[ -n "$reglob" ] && set +f
 	shift
 	local -a targets=("$@")
 	local i=0 n=${#words[@]}

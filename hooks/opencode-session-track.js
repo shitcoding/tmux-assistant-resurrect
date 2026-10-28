@@ -8,6 +8,7 @@
 
 import {
   writeFileSync,
+  readFileSync,
   mkdirSync,
   renameSync,
   unlinkSync,
@@ -107,6 +108,24 @@ export const SessionTracker = async ({ client, directory }) => {
     const sessionInfo = event.properties?.info || {};
     const sessionID = sessionInfo.id || event.properties?.id;
     if (!sessionID) return;
+    // Subagent (child) and archived sessions are not resumable top-level
+    // conversations. The DB fallback (scripts/py/opencode_db.py) excludes them
+    // too; recording one here would let it win over the DB on the next save
+    // and resume the wrong session. A child never touches the file. An
+    // archived session is dropped only if it is the one on record: the save
+    // script reads the file before the DB, so a stale id would still be
+    // restored. Removing it hands the next save to the DB fallback.
+    if (sessionInfo.parentID) return;
+    if (sessionInfo.time?.archived) {
+      let stored = null;
+      try {
+        stored = JSON.parse(readFileSync(stateFile, "utf8")).session_id;
+      } catch {
+        // No file or unreadable: nothing of ours to invalidate
+      }
+      if (stored === sessionID) cleanup();
+      return;
+    }
 
     // Build env object: always capture TMUX_PANE and SHELL, plus user-configured vars
     const env = {
