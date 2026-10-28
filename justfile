@@ -220,16 +220,24 @@ uninstall-claude-hook:
         (if .hooks.SessionStart then
             .hooks.SessionStart = [
                 .hooks.SessionStart[] |
-                .hooks = [.hooks[] | select((.command // "") | contains("claude-session-track") | not)] |
-                select(.hooks | length > 0)
+                # A group without a hooks array (Claude accepts that) is kept as is;
+                # iterating null would abort jq and leave the managed hooks behind.
+                if (.hooks | type) == "array" then
+                    .hooks = [.hooks[] | select((.command // "") | contains("claude-session-track") | not)] |
+                    select(.hooks | length > 0)
+                else . end
             ] |
             if .hooks.SessionStart | length == 0 then del(.hooks.SessionStart) else . end
         else . end) |
         (if .hooks.SessionEnd then
             .hooks.SessionEnd = [
                 .hooks.SessionEnd[] |
-                .hooks = [.hooks[] | select((.command // "") | contains("claude-session-cleanup") | not)] |
-                select(.hooks | length > 0)
+                # A group without a hooks array (Claude accepts that) is kept as is;
+                # iterating null would abort jq and leave the managed hooks behind.
+                if (.hooks | type) == "array" then
+                    .hooks = [.hooks[] | select((.command // "") | contains("claude-session-cleanup") | not)] |
+                    select(.hooks | length > 0)
+                else . end
             ] |
             if .hooks.SessionEnd | length == 0 then del(.hooks.SessionEnd) else . end
         else . end) |

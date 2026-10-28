@@ -981,6 +981,20 @@ if command -v just >/dev/null 2>&1; then
     assert_file_mode "Claude uninstall preserves the symlink target mode" 2640 "$SYMLINK_CLAUDE_TARGET"
     assert_eq "Claude uninstall cleans up its target-side temporary file" "" \
         "$(find "$TEST_ROOT" -name 'claude-settings-target.json.tmp.*' -print -quit)"
+    # A SessionStart group with no hooks array must not abort the filter (jq
+    # cannot iterate null); the managed hook beside it must still be removed.
+    NOHOOKS_HOME="$TEST_ROOT/nohooks-claude-home"
+    mkdir -p "$NOHOOKS_HOME/.claude"
+    printf '%s\n' '{"hooks":{"SessionStart":[{"matcher":"x"},{"hooks":null},{"hooks":[{"command":"bash /old/claude-session-track.sh"}]}],"SessionEnd":[{"matcher":"y"}]}}' \
+        >"$NOHOOKS_HOME/.claude/settings.json"
+    if HOME="$NOHOOKS_HOME" PATH="$FAKE_BIN:$PATH" \
+        just --justfile "$ROOT_DIR/justfile" uninstall-claude-hook >/dev/null 2>&1; then
+        assert_eq "Claude uninstall keeps groups without a hooks array and drops the managed hook" \
+            '[{"matcher":"x"},{"hooks":null}]|[{"matcher":"y"}]' \
+            "$(jq -c '[.hooks.SessionStart, .hooks.SessionEnd] | map(tojson) | join("|")' -r "$NOHOOKS_HOME/.claude/settings.json")"
+    else
+        fail "Claude uninstall recipe succeeds when a group lacks a hooks array"
+    fi
 else
     skip "Claude symlink uninstall test (just unavailable)"
 fi

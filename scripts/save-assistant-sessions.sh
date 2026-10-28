@@ -1231,10 +1231,14 @@ get_omp_session() {
 # Resolve grok's active-sessions registry path. grok records every live
 # interactive session in ~/.grok/active_sessions.json as an array of
 #   { "session_id": "<uuid>", "pid": <int>, "cwd": "<path>", "opened_at": "..." }
-# and updates it on session open/close. GROK_HOME lets tests (and unusual
-# installs) point this at a fixture directory.
+# and updates it on session open/close. GROK_HOME replaces the whole ~/.grok
+# path; the candidate process's own value wins where /proc exposes it, then
+# the hook's environment, then the default (same order as CODEX_HOME).
 grok_active_sessions_file() {
-	echo "${GROK_HOME:-$HOME/.grok}/active_sessions.json"
+	local pid="${1:-}" home=""
+	home=$(_process_env_var "$pid" GROK_HOME)
+	[ -n "$home" ] || home="${GROK_HOME:-$HOME/.grok}"
+	printf '%s/active_sessions.json\n' "$home"
 }
 
 get_grok_session() {
@@ -1248,7 +1252,7 @@ get_grok_session() {
 	# cwd-scoped ambiguity that opencode/codex/pi fallbacks suffer from does
 	# not apply to grok).
 	local registry sid
-	registry=$(grok_active_sessions_file)
+	registry=$(grok_active_sessions_file "$child_pid")
 	if [ -f "$registry" ]; then
 		sid=$(jq -r --arg pid "$child_pid" \
 			'.[]? | select((.pid | tostring) == $pid) | .session_id // empty' \
