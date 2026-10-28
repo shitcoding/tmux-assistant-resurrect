@@ -1567,6 +1567,22 @@ assert_eq "Codex bare resume (picker) yields no argv id" "" "$(get_codex_session
 assert_eq "Codex prompt containing 'resume' is not a session" "" "$(get_codex_session 99999 "codex please resume the-work")"
 assert_eq "Codex resume after a valued option" "ses_codex_opt" "$(get_codex_session 99999 "codex -m o3 resume ses_codex_opt")"
 assert_eq "Codex resume via node launcher" "ses_codex_node" "$(get_codex_session 99999 "node /opt/codex resume ses_codex_node")"
+# ps flattens a quoted value into several tokens; the continuation must not be
+# mistaken for the first positional.
+assert_eq "Codex resume after a multiword option value (flattened)" "ses_codex_mw" \
+	"$(get_codex_session 99999 "codex -C /tmp/My Project resume ses_codex_mw")"
+# With a live PID, exact argv from /proc settles the boundaries: here the -c
+# value contains the word "resume", which the flattened line cannot tell apart.
+if [ -d /proc ]; then
+	(exec -a codex python3 -c 'import time; resume = 1; time.sleep(60)' -C '/tmp/My Project' resume ses_codex_exact) &
+	codex_exact_pid=$!
+	sleep 0.5
+	codex_exact_args=$(ps -o args= -p "$codex_exact_pid")
+	assert_eq "Codex resume via exact argv beats a flattened 'resume' inside a value" "ses_codex_exact" \
+		"$(get_codex_session "$codex_exact_pid" "$codex_exact_args")"
+	kill "$codex_exact_pid" 2>/dev/null || true
+	wait "$codex_exact_pid" 2>/dev/null || true
+fi
 
 # --- Codex: state_*.sqlite thread DB (Method 3) ---
 # Codex >= ~0.118 persists thread state in SQLite. The save script queries

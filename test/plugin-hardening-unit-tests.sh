@@ -619,21 +619,26 @@ assert_eq "OpenCode state write is private, valid, and atomic" $'600\topen-test\
 # leave the last top-level id in place, matching opencode_db.py's exclusions.
 node_result=$(MODULE_URL="$MODULE_URL" TMUX_ASSISTANT_RESURRECT_DIR="$OPEN_STATE" \
     PATH="$FAKE_BIN:$PATH" node --input-type=module <<'NODE'
-import { readFileSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 const { SessionTracker } = await import(process.env.MODULE_URL);
 const plugin = await SessionTracker({ client: {}, directory: "/work" });
 const file = `${process.env.TMUX_ASSISTANT_RESURRECT_DIR}/opencode-${process.pid}.json`;
-const current = () => JSON.parse(readFileSync(file, "utf8")).session_id;
-await plugin.event({ event: { type: "session.created", properties: { info: { id: "parent" } } } });
-await plugin.event({ event: { type: "session.updated", properties: { info: { id: "child", parentID: "parent" } } } });
+const current = () => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")).session_id : "<none>");
+const send = (info) => plugin.event({ event: { type: "session.updated", properties: { info } } });
+await send({ id: "parent" });
+await send({ id: "child", parentID: "parent" });
 const afterChild = current();
-await plugin.event({ event: { type: "session.updated", properties: { info: { id: "archived", time: { archived: 1 } } } } });
-const afterArchived = current();
-await plugin.event({ event: { type: "session.updated", properties: { info: { id: "next-parent", time: { created: 1 } } } } });
-console.log(`${afterChild}\t${afterArchived}\t${current()}`);
+await send({ id: "other", time: { archived: 1 } });
+const afterOtherArchived = current();
+await send({ id: "next-parent", time: { created: 1 } });
+const afterNext = current();
+await send({ id: "next-parent", time: { created: 1, archived: 2 } });
+const afterOwnArchived = current();
+console.log(`${afterChild}\t${afterOtherArchived}\t${afterNext}\t${afterOwnArchived}`);
 NODE
 )
-assert_eq "OpenCode plugin ignores subagent and archived sessions" $'parent\tparent\tnext-parent' "$node_result"
+assert_eq "OpenCode plugin ignores subagent sessions and drops its own archived one" \
+    $'parent\tparent\tnext-parent\t<none>' "$node_result"
 
 # A plugin must not turn SIGTERM into a successful process exit. This subprocess
 # stays alive after plugin initialization so the observed status is signal-based.

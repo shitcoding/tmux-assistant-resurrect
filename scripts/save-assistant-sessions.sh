@@ -772,7 +772,7 @@ get_codex_session() {
 	# Method 2: resume arg in process args (chicken-and-egg fallback)
 	# After restore, codex is launched as `codex resume <session_id>`.
 	local sid
-	sid=$(_codex_resume_arg "$args")
+	sid=$(_codex_resume_arg "$args" "$child_pid")
 	if [ -n "$sid" ]; then
 		echo "$sid"
 		return
@@ -838,26 +838,53 @@ get_codex_session() {
 # `codex resume --last` (the picker, no id at all) saved the session id
 # `--last`, which restore then rejected -- and because an argv hit short-
 # circuits the SQLite/rollout lookups, the pane was never recovered. It also
-# matched the word "resume" inside a prompt. Values of known options
-# (`--model o3`) are skipped so they are not taken for the first positional.
+# matched the word "resume" inside a prompt.
+#
+# Exact argv from /proc is preferred where the kernel still has the boundaries
+# (Linux/WSL). On the flattened `ps` line a quoted value such as
+# `-C '/tmp/My Project'` arrives as several bare tokens, so there every bare
+# token after a value-taking option is read as that value's continuation until
+# the next option or `resume`. That keeps the id for the common case and only
+# misreads a prompt that both follows a valued option and contains the word
+# "resume" -- the residual limit of a flattened argv.
+#
+# Usage: _codex_resume_arg <flattened_args> [pid]
 _codex_resume_arg() {
-	local args="$1" tok reglob="" value_flags seen_tool=0 first_after=1 skip=0 want_id=0
+	local args="$1" pid="${2:-}" tok reglob=""
+	local -a exact_argv=()
+	if [ -n "$pid" ]; then
+		while IFS= read -r -d '' tok; do
+			exact_argv[${#exact_argv[@]}]="$tok"
+		done < <(_exact_argv "$pid" codex)
+	fi
+	if [ "${#exact_argv[@]}" -gt 0 ]; then
+		_codex_resume_from_tokens 1 "${exact_argv[@]}"
+		return 0
+	fi
+
 	case "$-" in *f*) ;; *) reglob=1 ;; esac
 	set -f
 	# shellcheck disable=SC2086 # deliberate tokenization of flattened ps argv
 	set -- $args
 	[ -n "$reglob" ] && set +f
+	# Drop everything up to the binary, and a repeated script path after it
+	# (`node /opt/codex ...`, `codex /usr/local/bin/codex ...`).
+	while [ "$#" -gt 0 ]; do
+		tok="$1"
+		shift
+		[ "${tok##*/}" = "codex" ] && break
+	done
+	if [ "$#" -gt 0 ] && [ "${1##*/}" = "codex" ]; then shift; fi
+	[ "$#" -gt 0 ] || return 0
+	_codex_resume_from_tokens 0 "$@"
+}
+
+# Usage: _codex_resume_from_tokens <exact:0|1> <tokens after the binary>...
+_codex_resume_from_tokens() {
+	local exact="$1" tok value_flags skip=0 want_id=0 in_value=0
+	shift
 	value_flags=" $(_discover_option_value_flags codex) "
 	for tok in "$@"; do
-		if [ "$seen_tool" -eq 0 ]; then
-			[ "${tok##*/}" = "codex" ] && seen_tool=1
-			continue
-		fi
-		if [ "$first_after" -eq 1 ]; then
-			first_after=0
-			# Node launchers repeat the script path: `codex /path/codex resume`.
-			[ "${tok##*/}" = "codex" ] && continue
-		fi
 		if [ "$want_id" -eq 1 ]; then
 			# `resume --last` / `resume --all` are pickers with no id.
 			case "$tok" in
@@ -870,15 +897,17 @@ _codex_resume_arg() {
 		fi
 		if [ "$skip" -eq 1 ]; then
 			skip=0
+			[ "$exact" -eq 1 ] || in_value=1
 			continue
 		fi
 		case "$tok" in
-		--*=* | -?=*) ;;
+		--*=* | -?=*) in_value=0 ;;
 		-*)
+			in_value=0
 			case "$value_flags" in *" $tok "*) skip=1 ;; esac
 			;;
 		resume) want_id=1 ;;
-		*) return 0 ;; # the first positional is not the subcommand
+		*) [ "$in_value" -eq 1 ] || return 0 ;; # a positional that is not the subcommand
 		esac
 	done
 	return 0
