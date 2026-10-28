@@ -36,22 +36,34 @@ if [ -z "$SESSION_ID" ]; then
 	exit 0
 fi
 
-CLAUDE_PID=$(find_claude_pid)
+# Hooks are best-effort: a failed ancestry walk must not abort the hook under
+# set -e. A non-numeric answer (a ps that printed nothing or garbage) falls
+# back to $PPID, the same answer find_claude_pid gives when it finds no claude.
+CLAUDE_PID=$(find_claude_pid 2>/dev/null || true)
+[[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || CLAUDE_PID="$PPID"
 
 # Build env object: always capture TMUX_PANE and SHELL, plus user-configured
 # vars from the tmux option @assistant-resurrect-capture-env (space-separated).
 ENV_JSON=$(jq -n --arg tmux_pane "${TMUX_PANE:-}" --arg shell "${SHELL:-}" \
-	'{tmux_pane: $tmux_pane, shell: $shell}')
+	'{tmux_pane: $tmux_pane, shell: $shell}' 2>/dev/null || true)
+[ -n "$ENV_JSON" ] || ENV_JSON='{}'
 
 CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
+# The option value is data: a `*` in it must not expand against the hook's cwd
+# and turn a file name into a captured variable (same guard as the Cursor hook).
+set -f
 for var in $CAPTURE_ENV; do
 	# Bash indirect expansion aborts on malformed variable names. Ignore invalid
 	# option tokens rather than taking down the hook.
 	if [[ ! "$var" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
 		continue
 	fi
-	ENV_JSON=$(printf '%s' "$ENV_JSON" | jq --arg k "$var" --arg v "${!var:-}" '. + {($k): $v}')
+	# A jq failure drops this one variable, not the whole state file.
+	NEXT_ENV_JSON=$(printf '%s' "$ENV_JSON" | jq --arg k "$var" --arg v "${!var:-}" \
+		'. + {($k): $v}' 2>/dev/null || true)
+	[ -z "$NEXT_ENV_JSON" ] || ENV_JSON="$NEXT_ENV_JSON"
 done
+set +f
 
 # Merge the full stdin JSON with our added fields + env.
 # This preserves all fields Claude sends (model, source, permission_mode, etc.)
