@@ -1559,6 +1559,14 @@ STATE_DIR="$TEST_STATE_DIR"
 assert_eq "Codex resume extraction" "ses_codex_789" "$(get_codex_session 99999 "codex resume ses_codex_789")"
 assert_eq "Codex resume with path" "ses_codex_789" "$(get_codex_session 99999 "/usr/bin/codex resume ses_codex_789")"
 assert_eq "Codex bare (no resume)" "" "$(get_codex_session 99999 "codex")"
+# Picker forms carry no id; the old regex saved the literal `--last` and
+# short-circuited the SQLite/rollout lookups behind it.
+assert_eq "Codex resume --last yields no argv id" "" "$(get_codex_session 99999 "codex resume --last")"
+assert_eq "Codex resume --all yields no argv id" "" "$(get_codex_session 99999 "codex resume --all --include-non-interactive")"
+assert_eq "Codex bare resume (picker) yields no argv id" "" "$(get_codex_session 99999 "codex resume")"
+assert_eq "Codex prompt containing 'resume' is not a session" "" "$(get_codex_session 99999 "codex please resume the-work")"
+assert_eq "Codex resume after a valued option" "ses_codex_opt" "$(get_codex_session 99999 "codex -m o3 resume ses_codex_opt")"
+assert_eq "Codex resume via node launcher" "ses_codex_node" "$(get_codex_session 99999 "node /opt/codex resume ses_codex_node")"
 
 # --- Codex: state_*.sqlite thread DB (Method 3) ---
 # Codex >= ~0.118 persists thread state in SQLite. The save script queries
@@ -3675,6 +3683,14 @@ assert_eq "Codex fork --last" "--full-auto" \
 # Codex: resume --all --include-non-interactive
 assert_eq "Codex resume --all --include-non-interactive" "" \
 	"$(extract_cli_args "codex" "codex resume --all --include-non-interactive")"
+
+# Codex: a glob-shaped option value is data. _strip_subcmds used to word-split
+# with pathname expansion on, replacing `x=*` with matching files in the cwd.
+glob_dir=$(mktemp -d)
+touch "$glob_dir/x=1" "$glob_dir/x=2"
+assert_eq "Codex glob-shaped value is not expanded" "-c x=*" \
+	"$(cd "$glob_dir" && extract_cli_args "codex" "codex -c x=* resume abc")"
+rm -rf "$glob_dir"
 
 # Codex: --model o3 resume (option value before subcommand)
 assert_eq "Codex --model o3 resume" "--model o3" \

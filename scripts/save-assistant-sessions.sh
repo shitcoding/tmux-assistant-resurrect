@@ -772,7 +772,7 @@ get_codex_session() {
 	# Method 2: resume arg in process args (chicken-and-egg fallback)
 	# After restore, codex is launched as `codex resume <session_id>`.
 	local sid
-	sid=$(echo "$args" | sed -n "s/.*resume  *\([A-Za-z0-9_-]*\).*/\1/p")
+	sid=$(_codex_resume_arg "$args")
 	if [ -n "$sid" ]; then
 		echo "$sid"
 		return
@@ -828,6 +828,60 @@ get_codex_session() {
 			return
 		fi
 	fi
+}
+
+# Session id given to codex's `resume` subcommand, or nothing.
+#
+# Token-based rather than a regex over the flattened line: `resume` must be the
+# first positional after the binary, and its argument must not be an option.
+# The old `.*resume  *\([A-Za-z0-9_-]*\)` regex accepted a leading dash, so
+# `codex resume --last` (the picker, no id at all) saved the session id
+# `--last`, which restore then rejected -- and because an argv hit short-
+# circuits the SQLite/rollout lookups, the pane was never recovered. It also
+# matched the word "resume" inside a prompt. Values of known options
+# (`--model o3`) are skipped so they are not taken for the first positional.
+_codex_resume_arg() {
+	local args="$1" tok reglob="" value_flags seen_tool=0 first_after=1 skip=0 want_id=0
+	case "$-" in *f*) ;; *) reglob=1 ;; esac
+	set -f
+	# shellcheck disable=SC2086 # deliberate tokenization of flattened ps argv
+	set -- $args
+	[ -n "$reglob" ] && set +f
+	value_flags=" $(_discover_option_value_flags codex) "
+	for tok in "$@"; do
+		if [ "$seen_tool" -eq 0 ]; then
+			[ "${tok##*/}" = "codex" ] && seen_tool=1
+			continue
+		fi
+		if [ "$first_after" -eq 1 ]; then
+			first_after=0
+			# Node launchers repeat the script path: `codex /path/codex resume`.
+			[ "${tok##*/}" = "codex" ] && continue
+		fi
+		if [ "$want_id" -eq 1 ]; then
+			# `resume --last` / `resume --all` are pickers with no id.
+			case "$tok" in
+			-*) return 0 ;;
+			*)
+				printf '%s\n' "$tok"
+				return 0
+				;;
+			esac
+		fi
+		if [ "$skip" -eq 1 ]; then
+			skip=0
+			continue
+		fi
+		case "$tok" in
+		--*=* | -?=*) ;;
+		-*)
+			case "$value_flags" in *" $tok "*) skip=1 ;; esac
+			;;
+		resume) want_id=1 ;;
+		*) return 0 ;; # the first positional is not the subcommand
+		esac
+	done
+	return 0
 }
 
 _arg_value() {
@@ -1957,8 +2011,15 @@ _strip_bool_opt() {
 # tokens (e.g. option values like "o3" in `--model o3 resume`) are
 # skipped — scanning continues past them to find the actual subcommand.
 _strip_subcmds() {
+	# Word-split with pathname expansion off, like every other splitter here:
+	# argv is data, and a value such as `-c 'x=["*.md"]'` must not be expanded
+	# against the save hook's working directory.
+	local reglob=""
+	case "$-" in *f*) ;; *) reglob=1 ;; esac
+	set -f
 	# shellcheck disable=SC2206  # deliberate word-split of argv string
 	local -a words=($1)
+	[ -n "$reglob" ] && set +f
 	shift
 	local -a targets=("$@")
 	local i=0 n=${#words[@]}

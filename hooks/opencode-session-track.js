@@ -107,6 +107,11 @@ export const SessionTracker = async ({ client, directory }) => {
     const sessionInfo = event.properties?.info || {};
     const sessionID = sessionInfo.id || event.properties?.id;
     if (!sessionID) return;
+    // Subagent (child) and archived sessions are not resumable top-level
+    // conversations. The DB fallback (scripts/py/opencode_db.py) excludes them
+    // too; recording one here would let it win over the DB on the next save
+    // and resume the wrong session. Leave the last top-level id in place.
+    if (sessionInfo.parentID || sessionInfo.time?.archived) return;
 
     // Build env object: always capture TMUX_PANE and SHELL, plus user-configured vars
     const env = {
