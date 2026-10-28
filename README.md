@@ -67,7 +67,7 @@ Session ID extraction uses tool-native mechanisms (infrastructure plumbing):
 | **Claude Code** | `SessionStart` hook state file (keyed by Claude PID) | `--resume` / `--session-id` in process args | Newest non-empty cwd-scoped transcript under `~/.claude/projects/` | Transcript lookup excludes IDs reserved by PID-specific state/argv and already emitted for another pane, but two unresolved Claude instances in one cwd remain ambiguous and an abandoned session can be selected |
 | **Cursor Agent CLI** | `sessionStart` hook state file (keyed by Cursor PID) | `--resume` in process args | - | Supports both the current `agent` and compatibility `cursor-agent` executable names; desktop Cursor hook events are ignored |
 | **GitHub Copilot CLI** | `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` written by the live session | `--session-id` / `--resume` in process args | - | Plain glob keyed on the native PID — no `/proc`, no `lsof`, so it behaves identically on Linux, WSL and macOS |
-| **OpenCode** | `-s` / `--session` in process args | Plugin state file | SQLite DB query (`~/.local/share/opencode/opencode.db`) | Go binary overwrites process title; DB fallback matches most recent session by cwd |
+| **OpenCode** | `-s` / `--session` in process args | Plugin state file | SQLite DB query (`$XDG_DATA_HOME/opencode/opencode.db`, default `~/.local/share`) | Go binary overwrites process title; DB fallback matches most recent session by cwd |
 | **Codex CLI** | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | SQLite `~/.codex/state_*.sqlite` `threads` table (Codex >= 0.118); rollout JSONL `~/.codex/sessions/` (Codex ~0.100-0.117) | Codex runs via Node.js, so args are always visible in `ps` |
 | **Pi** | Session header lookup in `~/.pi/agent/sessions/--<cwd>--/*.jsonl` | `--session` in process args | - | Session-file lookup is cwd-scoped and uses process-time scoring + dedup |
 | **Oh My Pi** | Terminal breadcrumb + session JSONL lookup (`$XDG_STATE_HOME/omp`, `$XDG_DATA_HOME/omp`) | `--resume` / `-r` in process args | `--session-dir` / `--profile` scoped lookup | Distinct `omp` tool; no hook/plugin required |
@@ -487,9 +487,10 @@ cat "$RESURRECT_DIR/assistant-save.log"
 | Session ID missing for Claude | Verify the hook is installed: `jq '.hooks.SessionStart' ~/.claude/settings.json` |
 | Session ID missing, hook *is* installed | Check `assistant-save.log` — a `no session ID available` line names the state file it looked for. If that directory is empty but `ls ~/.local/state/tmux-assistant-resurrect` elsewhere is not, the two sides disagree on the path; see **State directory** below |
 | Session ID missing for Copilot | Check `ls ~/.copilot/session-state/*/inuse.*.lock` — the number in the filename must be the native Copilot PID from `ps`. If you set `COPILOT_HOME`, the save hook must see it too (tmux hooks do not inherit your shell profile; use `tmux set-environment -g COPILOT_HOME ...`) |
-| Session ID missing for OpenCode | Launch with `-s <id>`, or verify the plugin: `ls ~/.config/opencode/plugins/session-tracker.js` |
+| Session ID missing for OpenCode | Launch with `-s <id>`, or verify the plugin: `ls ~/.config/opencode/plugins/session-tracker.js`. The DB fallback follows `XDG_DATA_HOME` (default `~/.local/share`); on macOS set it for tmux too (`tmux set-environment -g XDG_DATA_HOME ...`) |
+| Session ID missing for Codex | Verify `session-tags.jsonl` under `CODEX_HOME` (default `~/.codex`) lists your Codex PID. If you set `CODEX_HOME`, the save hook reads it from the process on Linux/WSL; on macOS set it for tmux too (`tmux set-environment -g CODEX_HOME ...`) |
 | Session ID missing for Pi | Verify session files exist under `~/.pi/agent/sessions/--<cwd>--/*.jsonl` and that pane cwd matches the Pi session cwd |
-| Session ID missing for Grok | Verify `~/.grok/active_sessions.json` exists and contains an entry with your Grok process's PID: `jq '.[] | select(.pid == <PID>)' ~/.grok/active_sessions.json`. If you set `GROK_HOME`, the save hook must see it too — use `tmux set-environment -g GROK_HOME ...` |
+| Session ID missing for Grok | Verify `~/.grok/active_sessions.json` exists and contains an entry with your Grok process's PID: `jq '.[] | select(.pid == <PID>)' ~/.grok/active_sessions.json`. If you set `GROK_HOME`, the save hook reads it from the Grok process on Linux/WSL; on macOS set it for tmux too (`tmux set-environment -g GROK_HOME ...`) |
 | Session ID missing for Oh My Pi | The primary method is a terminal breadcrumb under `$XDG_STATE_HOME/omp` (or `~/.local/state/omp`); verify the pane tty matches the breadcrumb file. Fallback is `--resume` / `-r` in process args. `--session-dir` or `--profile` scoped JSONL lookup is also used when those flags are present |
 | Codex/OpenCode/Pi session ID missing (python3 methods) | The save hook auto-detects `python3` in common locations. If your setup uses a non-standard path, set it in tmux: `set-environment -g PATH "/your/python3/dir:$PATH"` |
 | Restore launches but assistant says "session not found" | The session ID may have expired. This is normal — start a fresh session and the next save will pick up the new ID |
@@ -853,7 +854,10 @@ also cleans up its state file on process exit (SIGINT, SIGTERM).
 
 Codex natively writes PID-to-session mappings in
 `~/.codex/session-tags.jsonl`. The save script reads this file directly -- no
-additional hook is needed.
+additional hook is needed. `CODEX_HOME` replaces the whole `~/.codex` path, the
+same way `COPILOT_HOME` and `GROK_HOME` do: on Linux/WSL the save hook reads the
+Codex process's own value from `/proc`; on macOS, set it for tmux too
+(`tmux set-environment -g CODEX_HOME ...`).
 
 ### GitHub Copilot CLI
 

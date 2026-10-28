@@ -121,6 +121,13 @@ process args as a reliable fallback.
   cannot read another process's env unprivileged, so hookless tools capture no
   env there — document the shell-profile / `tmux set-environment` workaround
   instead.
+- State-root overrides (`COPILOT_HOME`, `CODEX_HOME`, `GROK_HOME`, OpenCode's
+  `XDG_DATA_HOME`) are resolved through one helper each (`copilot_session_state_dir()`,
+  `codex_home()`, `opencode_db_file()`), never inlined. Each prefers the candidate
+  process's own value read via `_process_env_var()` from `/proc/<pid>/environ`
+  (Linux/WSL), then the hook's environment, then the documented default: a tmux
+  hook does not inherit the shell profile, so the hook-side value alone is not
+  enough. `ASSISTANT_PROC_ROOT` is the test seam for the `/proc` root.
 - Copilot exposes a PID-specific active-session signal: the live session writes
   `$COPILOT_HOME/session-state/<uuid>/inuse.<pid>.lock` (content = the same PID).
   Resolve it with a single glob — no `/proc`, no `lsof`, no platform branch, and
@@ -310,8 +317,8 @@ changes after an upgrade, check the relevant source to confirm.
 | **Claude hides `--system-prompt-file` and `--append-system-prompt-file` from `--help`** | Both are accepted, but neither appears in the option list -- they are named only in the prose of `--setting-sources`. `_discover_option_value_flags()` therefore cannot see them, and only `OPTION_VALUE_FLAGS_FALLBACK_claude` pins them as value-taking. Read as booleans, the path becomes the first positional and `_drop_positional_args()` discards it along with the whole tail; restore then replays a bare flag and claude consumes the next one as its filename. If a future release documents them, discovery covers it and the fallback entries become redundant rather than wrong | `claude --help \| grep -- '--system-prompt-file'` -- currently no match in the option list; `test/save-hardening-unit-tests.sh` pins the resulting behaviour |
 | **OpenCode plugins run in-process** | `process.pid` in the plugin IS the opencode binary's PID; state file is keyed by this PID | OpenCode source: search for `await import(` in the plugin loader (approx. `packages/opencode/src/plugin/index.ts` -- path may move) |
 | **OpenCode Go binary overwrites process title** | `-s <id>` is NOT visible in `ps`; plugin state file or SQLite DB are the reliable sources | Run `ps -eo args=` on a running `opencode -s <id>` process |
-| **OpenCode SQLite DB** at `~/.local/share/opencode/opencode.db` | Fallback session ID extraction when plugin state file and args are unavailable; matches by cwd + most recent `time_updated` | Check DB schema: `sqlite3 ~/.local/share/opencode/opencode.db ".schema session"` |
-| **Codex writes `~/.codex/session-tags.jsonl`** | Primary session ID source for Codex (PID → session mapping) | Run Codex and check `cat ~/.codex/session-tags.jsonl` |
+| **OpenCode SQLite DB** at `$XDG_DATA_HOME/opencode/opencode.db` (default `~/.local/share`; resolved by `opencode_db_file()`, process value first) | Fallback session ID extraction when plugin state file and args are unavailable; matches by cwd + most recent `time_updated` | Check DB schema: `sqlite3 ~/.local/share/opencode/opencode.db ".schema session"` |
+| **Codex writes `$CODEX_HOME/session-tags.jsonl`** (default `~/.codex`; resolved by `codex_home()`, process value first) | Primary session ID source for Codex (PID → session mapping) | Run Codex and check `cat ~/.codex/session-tags.jsonl` |
 | **Pi session files live in `~/.pi/agent/sessions/--<cwd>--/*.jsonl`** | Primary session ID source for Pi when `--session` is absent in args; save script reads header `type=id/cwd/timestamp` and scores candidates by process lifetime + mtime | Run Pi and inspect `~/.pi/agent/sessions`, verify first JSONL line has `{"type":"session","id":"..."}` |
 | **grok writes `~/.grok/active_sessions.json`** | Primary session ID source for Grok: an array of `{session_id, pid, cwd, opened_at}` for every live session, updated on open/close. `get_grok_session()` looks up by PID (works even for a bare `grok` with no args); `-r`/`--resume <uuid>` in process args is the fallback. `GROK_HOME` overrides the `~/.grok` base. | Run `grok`, then `cat ~/.grok/active_sessions.json`; confirm each running `grok` PID appears with its `session_id` |
 | **tmux-resurrect pane content archive** layout: `./pane_contents/pane-{session}:{window}.{pane}` inside `pane_contents.tar.gz` | `strip_assistant_pane_contents()` removes assistant pane files from this archive to prevent stale TUI flash on restore. The filename shape is dictated by upstream, so `.sessions[].pane` has to keep the joined `session:window.pane` form to match it — this is the one place that string is correct to use, and it is a filename, never a tmux target | tmux-resurrect source: `scripts/helpers.sh:pane_contents_file()` |

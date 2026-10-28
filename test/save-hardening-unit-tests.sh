@@ -598,6 +598,38 @@ assert_eq "--verbose is not credential" "no" "$(_cred_rc "--verbose")"
 assert_eq "--debug is not credential" "no" "$(_cred_rc "--debug")"
 
 echo
+echo "== state roots honor CODEX_HOME and XDG_DATA_HOME =="
+# A tmux hook does not inherit the shell profile, so the candidate process's own
+# value must win; the hook's environment is next; the documented default last.
+ROOT_PROC="$SANDBOX/root-proc"
+mkdir -p "$ROOT_PROC/5151" "$ROOT_PROC/5252"
+printf 'CODEX_HOME=/srv/codex home\0XDG_DATA_HOME=/srv/data\0' >"$ROOT_PROC/5151/environ"
+printf 'PATH=/usr/bin\0' >"$ROOT_PROC/5252/environ"
+assert_eq "codex_home reads CODEX_HOME from the process" "/srv/codex home" \
+	"$(ASSISTANT_PROC_ROOT="$ROOT_PROC" CODEX_HOME=/hook/codex codex_home 5151)"
+assert_eq "codex_home falls back to the hook's CODEX_HOME" "/hook/codex" \
+	"$(ASSISTANT_PROC_ROOT="$ROOT_PROC" CODEX_HOME=/hook/codex codex_home 5252)"
+assert_eq "codex_home defaults to ~/.codex" "$HOME/.codex" \
+	"$(ASSISTANT_PROC_ROOT="$ROOT_PROC" CODEX_HOME='' codex_home 5252)"
+assert_eq "codex_home with no pid uses the hook environment" "/hook/codex" \
+	"$(CODEX_HOME=/hook/codex codex_home)"
+assert_eq "opencode_db_file reads XDG_DATA_HOME from the process" "/srv/data/opencode/opencode.db" \
+	"$(ASSISTANT_PROC_ROOT="$ROOT_PROC" XDG_DATA_HOME=/hook/data opencode_db_file 5151)"
+assert_eq "opencode_db_file falls back to the hook's XDG_DATA_HOME" "/hook/data/opencode/opencode.db" \
+	"$(ASSISTANT_PROC_ROOT="$ROOT_PROC" XDG_DATA_HOME=/hook/data opencode_db_file 5252)"
+assert_eq "opencode_db_file defaults to ~/.local/share" "$HOME/.local/share/opencode/opencode.db" \
+	"$(ASSISTANT_PROC_ROOT="$ROOT_PROC" XDG_DATA_HOME='' opencode_db_file 5252)"
+# The Codex tag lookup must follow the resolved root, not a hardcoded ~/.codex.
+CODEX_ALT="$SANDBOX/codex-alt"
+mkdir -p "$CODEX_ALT"
+printf '{"pid": 5252, "session": "ses_from_alt_home"}\n' >"$CODEX_ALT/session-tags.jsonl"
+assert_eq "get_codex_session reads session-tags.jsonl under CODEX_HOME" "ses_from_alt_home" \
+	"$(ASSISTANT_PROC_ROOT="$ROOT_PROC" CODEX_HOME="$CODEX_ALT" get_codex_session 5252 "codex" "")"
+assert_eq "a hardcoded ~/.codex or opencode.db path no longer exists in the save script" "" \
+	"$(grep -nE 'HOME\}?/\.codex|HOME\}?/\.local/share/opencode' "$REPO_DIR/scripts/save-assistant-sessions.sh" |
+		grep -vE '^[0-9]*:[[:space:]]*#|CODEX_HOME:-|XDG_DATA_HOME:-' || true)"
+
+echo
 echo "== ps field selection =="
 # procps-ng 3.3.x (Amazon Linux 2, RHEL/CentOS 7) reads `-o pid=,ppid=` as one
 # `pid` column headed ",ppid=", so every process-table walk silently finds
