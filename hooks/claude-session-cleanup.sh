@@ -17,5 +17,6 @@ source "$HOOK_DIR/../scripts/lib-detect.sh"
 
 STATE_DIR="$(assistant_state_dir)"
 
-CLAUDE_PID=$(find_claude_pid)
+CLAUDE_PID=$(find_claude_pid 2>/dev/null || true)
+[[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || CLAUDE_PID="$PPID"
 rm -f "$STATE_DIR/claude-$CLAUDE_PID.json" 2>/dev/null || true

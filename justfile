@@ -158,39 +158,108 @@ uninstall-claude-hook:
     #!/usr/bin/env bash
     set -euo pipefail
     settings="$HOME/.claude/settings.json"
-
     if [ ! -f "$settings" ]; then
         echo "No Claude settings to modify"
         exit 0
     fi
-
-    # Remove both hooks in one pass.
-    # Use contains() matching to remove both old (unquoted) and new (quoted)
-    # forms — ensures clean upgrade without leftover entries.
-    tmp=$(mktemp)
-    jq '
-        # Remove SessionStart hook entries containing "claude-session-track"
+    # settings.json is commonly a symlink into a dotfiles repo. Resolve it and
+    # publish beside the resolved target so the link survives; keep this
+    # sequence aligned with install_claude_hooks() in tmux-assistant-resurrect.tmux
+    # and with uninstall-cursor-hook below.
+    target="$settings"
+    link_depth=0
+    while [ -L "$target" ] && [ "$link_depth" -lt 16 ]; do
+        link=$(readlink "$target") || {
+            echo "tmux-assistant-resurrect: cannot read symlink $target; left unchanged" >&2
+            exit 0
+        }
+        case "$link" in
+            /*) target="$link" ;;
+            *) target="$(dirname "$target")/$link" ;;
+        esac
+        link_depth=$((link_depth + 1))
+    done
+    if [ -L "$target" ]; then
+        echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $settings" >&2
+        exit 0
+    fi
+    # BSD stat's %p includes the file type plus all permission bits; keep its
+    # final four octal digits. The literal prefix makes GNU stat -f output fail
+    # the octal guard before -c retries.
+    target_mode=$(stat -f 'mode:%p' "$target" 2>/dev/null || true)
+    case "$target_mode" in
+        mode:*) target_mode=${target_mode#mode:} ;;
+        *) target_mode="" ;;
+    esac
+    case "$target_mode" in
+        '' | *[!0-7]*) target_mode="" ;;
+        *)
+            if [ "${#target_mode}" -ge 4 ]; then
+                target_mode=${target_mode#"${target_mode%????}"}
+            else
+                target_mode=""
+            fi
+            ;;
+    esac
+    case "$target_mode" in
+        '' | *[!0-7]*) target_mode=$(stat -c '%a' "$target" 2>/dev/null || true) ;;
+    esac
+    case "$target_mode" in
+        '' | *[!0-7]*)
+            echo "tmux-assistant-resurrect: cannot read mode for $settings; left unchanged" >&2
+            exit 0
+            ;;
+    esac
+    tmp=$(mktemp "${target}.tmp.XXXXXX") || {
+        echo "tmux-assistant-resurrect: cannot prepare update for $settings; left unchanged" >&2
+        exit 0
+    }
+    if ! jq '
+        # Remove both hooks in one pass. contains() matching removes old
+        # (unquoted) and new (quoted) forms, so an upgrade leaves no stragglers.
         (if .hooks.SessionStart then
             .hooks.SessionStart = [
                 .hooks.SessionStart[] |
-                .hooks = [.hooks[] | select((.command // "") | contains("claude-session-track") | not)] |
-                select(.hooks | length > 0)
+                # A group without a hooks array (Claude accepts that) is kept as is;
+                # iterating null would abort jq and leave the managed hooks behind.
+                if (.hooks | type) == "array" then
+                    .hooks = [.hooks[] | select((.command // "") | contains("claude-session-track") | not)] |
+                    select(.hooks | length > 0)
+                else . end
             ] |
             if .hooks.SessionStart | length == 0 then del(.hooks.SessionStart) else . end
         else . end) |
-        # Remove SessionEnd hook entries containing "claude-session-cleanup"
         (if .hooks.SessionEnd then
             .hooks.SessionEnd = [
                 .hooks.SessionEnd[] |
-                .hooks = [.hooks[] | select((.command // "") | contains("claude-session-cleanup") | not)] |
-                select(.hooks | length > 0)
+                # A group without a hooks array (Claude accepts that) is kept as is;
+                # iterating null would abort jq and leave the managed hooks behind.
+                if (.hooks | type) == "array" then
+                    .hooks = [.hooks[] | select((.command // "") | contains("claude-session-cleanup") | not)] |
+                    select(.hooks | length > 0)
+                else . end
             ] |
             if .hooks.SessionEnd | length == 0 then del(.hooks.SessionEnd) else . end
         else . end) |
-        # Clean up empty hooks object
         if .hooks and (.hooks | length == 0) then del(.hooks) else . end
-    ' "$settings" > "$tmp" && mv "$tmp" "$settings"
-
+    ' "$settings" > "$tmp"; then
+        rm -f "$tmp"
+        echo "tmux-assistant-resurrect: $settings is not valid JSON; left unchanged" >&2
+        exit 0
+    fi
+    if ! chmod "$target_mode" "$tmp"; then
+        rm -f "$tmp"
+        echo "tmux-assistant-resurrect: cannot preserve mode for $settings; left unchanged" >&2
+        exit 0
+    fi
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp"
+        echo "tmux-assistant-resurrect: cannot update $settings; left unchanged" >&2
+        exit 0
+    fi
+    # Atomic replacement requires the resolved target directory to be writable.
+    # Hard links, ownership/group, ACLs and xattrs are intentionally not
+    # retained; a target in a read-only dotfile store is left unchanged above.
     echo "Claude hooks removed"
 
 # Remove Cursor Agent CLI hooks without disturbing user-owned hooks.
@@ -558,7 +627,9 @@ clean:
             claude)
                 pid=$(jq -r '.ppid' "$f" 2>/dev/null || echo "")
                 ;;
-            opencode)
+            # The Cursor hook keys its file by `pid` (see
+            # hooks/cursor-session-track.sh), not `ppid` like Claude's.
+            cursor | opencode)
                 pid=$(jq -r '.pid' "$f" 2>/dev/null || echo "")
                 ;;
             *)

@@ -597,6 +597,84 @@ assert_file_mode "Claude state file is private" 600 "$claude_file"
 assert_eq "Claude state write leaves no temporary file" 0 \
     "$(find "$CLAUDE_STATE" -name '*.tmp' -o -name '.claude-*' | wc -l | tr -d ' ')"
 
+# The capture-env option is data: a `*` in it must not glob against the hook's
+# cwd and promote a file name to a captured variable.
+GLOB_CWD="$TEST_ROOT/claude-glob-cwd"
+mkdir -p "$GLOB_CWD"
+: >"$GLOB_CWD/GLOBBED"
+rm -f "$CLAUDE_STATE"/claude-*.json
+(cd "$GLOB_CWD" && FAKE_TMUX_OPTION='*' GLOBBED='leaked' \
+    TMUX_ASSISTANT_RESURRECT_DIR="$CLAUDE_STATE" PATH="$FAKE_BIN:$PATH" \
+    "$UNDER_TEST" "$ROOT_DIR/hooks/claude-session-track.sh" <<<'{"session_id":"claude-glob"}')
+claude_file=$(find "$CLAUDE_STATE" -name 'claude-*.json' -type f -print -quit)
+assert_eq "Claude hook does not glob-expand the capture-env option" false \
+    "$(jq '.env | has("GLOBBED")' "$claude_file")"
+
+# The hook is best-effort: a ps that answers nothing must not abort the
+# ancestry walk, and a jq that fails on one variable must not lose the file.
+cat >"$FAKE_BIN/ps" <<'PS'
+#!/usr/bin/env bash
+exit 1
+PS
+chmod +x "$FAKE_BIN/ps"
+REAL_JQ=$(command -v jq)
+FLAKY_BIN="$TEST_ROOT/flaky-bin"
+mkdir -p "$FLAKY_BIN"
+cat >"$FLAKY_BIN/jq" <<JQ
+#!/usr/bin/env bash
+# Partial output before the failure: the hook must discard it, not splice it in.
+case " \$* " in *' --arg k '*) printf '{"tmux_pane":"%%7","GOOD_ENV":"val'; exit 1 ;; esac
+exec "$REAL_JQ" "\$@"
+JQ
+chmod +x "$FLAKY_BIN/jq"
+rm -f "$CLAUDE_STATE"/claude-*.json
+if FAKE_TMUX_OPTION='GOOD_ENV' GOOD_ENV='value' TMUX_PANE='%7' \
+    TMUX_ASSISTANT_RESURRECT_DIR="$CLAUDE_STATE" PATH="$FLAKY_BIN:$FAKE_BIN:$PATH" \
+    "$UNDER_TEST" "$ROOT_DIR/hooks/claude-session-track.sh" <<<'{"session_id":"claude-flaky"}'; then
+    pass "Claude hook exits 0 when ps and a per-variable jq call fail"
+else
+    fail "Claude hook exits 0 when ps and a per-variable jq call fail"
+fi
+claude_file=$(find "$CLAUDE_STATE" -name 'claude-*.json' -type f -print -quit)
+assert_eq "Claude hook still records the session when env capture degrades" \
+    $'claude-flaky\t%7\tfalse' \
+    "$(jq -r '[.session_id, .env.tmux_pane, (.env | has("GOOD_ENV"))] | @tsv' "${claude_file:-/dev/null}" 2>/dev/null)"
+if PATH="$FAKE_BIN:$PATH" TMUX_ASSISTANT_RESURRECT_DIR="$CLAUDE_STATE" \
+    "$UNDER_TEST" "$ROOT_DIR/hooks/claude-session-cleanup.sh" <<<'{"session_id":"claude-flaky"}' &&
+    [ -z "$(find "$CLAUDE_STATE" -name 'claude-*.json' -type f -print -quit)" ]; then
+    pass "Claude cleanup hook removes the file when ps answers nothing"
+else
+    fail "Claude cleanup hook removes the file when ps answers nothing"
+fi
+cat >"$FAKE_BIN/ps" <<'PS'
+#!/usr/bin/env bash
+case " $* " in
+    *' comm= '*) printf 'claude\n' ;;
+    *' ppid= '*) printf '1\n' ;;
+esac
+PS
+chmod +x "$FAKE_BIN/ps"
+
+# `just clean` must reap every tool's state file, including Cursor's, which
+# keys its file by `pid` rather than Claude's `ppid`.
+CLEAN_STATE="$TEST_ROOT/clean-state"
+mkdir -p "$CLEAN_STATE"
+printf '{"tool":"cursor","session_id":"dead","pid":2147483000}\n' >"$CLEAN_STATE/cursor-2147483000.json"
+printf '{"tool":"cursor","session_id":"alive","pid":%s}\n' "$$" >"$CLEAN_STATE/cursor-$$.json"
+printf '{"tool":"claude","session_id":"alive","ppid":%s}\n' "$$" >"$CLEAN_STATE/claude-$$.json"
+if command -v just >/dev/null 2>&1; then
+    if TMUX_ASSISTANT_RESURRECT_DIR="$CLEAN_STATE" PATH="$FAKE_BIN:$PATH" \
+        just --justfile "$ROOT_DIR/justfile" --working-directory "$ROOT_DIR" clean >/dev/null 2>&1; then
+        assert_eq "just clean removes a dead Cursor state file and keeps live ones" \
+            $'claude-'"$$"$'.json\ncursor-'"$$"'.json' \
+            "$(find "$CLEAN_STATE" -name '*.json' -exec basename {} \; | sort)"
+    else
+        fail "just clean succeeds with Cursor state files present"
+    fi
+else
+    skip "just clean Cursor test (just unavailable)"
+fi
+
 # OpenCode writes use a private temporary inode followed by atomic rename.
 OPEN_STATE="$TEST_ROOT/open state"
 mkdir -m 0755 "$OPEN_STATE"
@@ -884,6 +962,42 @@ fi
 assert_file_mode "Claude hook update preserves the symlink target mode" 2640 "$SYMLINK_CLAUDE_TARGET"
 assert_eq "Claude hook update leaves no temporary file" '' \
     "$(find "$TEST_ROOT" -name 'claude-settings-target.json.tmp.*' -print -quit)"
+if command -v just >/dev/null 2>&1; then
+    if HOME="$SYMLINK_CLAUDE_HOME" PATH="$FAKE_BIN:$PATH" \
+        just --justfile "$ROOT_DIR/justfile" uninstall-claude-hook >/dev/null 2>&1; then
+        if [ -L "$SYMLINK_CLAUDE_HOME/.claude/settings.json" ] && [ -L "$SYMLINK_CLAUDE_LINK" ] && \
+            jq -e '
+                ([.hooks.SessionStart[]?.hooks[]? | select((.command // "") == "user-own-hook")] | length == 1) and
+                ([.hooks.SessionStart[]?.hooks[]? | select((.command // "") | contains("claude-session-track"))] | length == 0) and
+                ([.hooks.SessionEnd[]?.hooks[]? | select((.command // "") | contains("claude-session-cleanup"))] | length == 0)
+            ' "$SYMLINK_CLAUDE_TARGET" >/dev/null; then
+            pass "Claude uninstall atomically updates a symlink target"
+        else
+            fail "Claude uninstall atomically updates a symlink target"
+        fi
+    else
+        fail "Claude uninstall recipe succeeds for a symlink target"
+    fi
+    assert_file_mode "Claude uninstall preserves the symlink target mode" 2640 "$SYMLINK_CLAUDE_TARGET"
+    assert_eq "Claude uninstall cleans up its target-side temporary file" "" \
+        "$(find "$TEST_ROOT" -name 'claude-settings-target.json.tmp.*' -print -quit)"
+    # A SessionStart group with no hooks array must not abort the filter (jq
+    # cannot iterate null); the managed hook beside it must still be removed.
+    NOHOOKS_HOME="$TEST_ROOT/nohooks-claude-home"
+    mkdir -p "$NOHOOKS_HOME/.claude"
+    printf '%s\n' '{"hooks":{"SessionStart":[{"matcher":"x"},{"hooks":null},{"hooks":[{"command":"bash /old/claude-session-track.sh"}]}],"SessionEnd":[{"matcher":"y"}]}}' \
+        >"$NOHOOKS_HOME/.claude/settings.json"
+    if HOME="$NOHOOKS_HOME" PATH="$FAKE_BIN:$PATH" \
+        just --justfile "$ROOT_DIR/justfile" uninstall-claude-hook >/dev/null 2>&1; then
+        assert_eq "Claude uninstall keeps groups without a hooks array and drops the managed hook" \
+            '[{"matcher":"x"},{"hooks":null}]|[{"matcher":"y"}]' \
+            "$(jq -c '[.hooks.SessionStart, .hooks.SessionEnd] | map(tojson) | join("|")' -r "$NOHOOKS_HOME/.claude/settings.json")"
+    else
+        fail "Claude uninstall recipe succeeds when a group lacks a hooks array"
+    fi
+else
+    skip "Claude symlink uninstall test (just unavailable)"
+fi
 
 # The Claude install loop has its own depth bound; pin both sides of it, the way
 # the Cursor fixtures above pin theirs. Links are relative throughout: on macOS

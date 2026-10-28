@@ -447,23 +447,50 @@ copilot_session_state_dir() {
 }
 
 _copilot_home_from_process() {
-	local pid="$1"
-	# COPILOT_PROC_ROOT is a test seam so the hermetic suite can exercise this
-	# without a live process; production always reads the real /proc.
-	local environ_file="${COPILOT_PROC_ROOT:-/proc}/${pid}/environ"
+	_process_env_var "$1" COPILOT_HOME
+}
+
+# One variable from a live process's environment (Linux/WSL /proc only; empty
+# elsewhere or when the process is gone). A tmux hook does not inherit the
+# interactive shell's environment, so a state-root override exported from a
+# shell profile is invisible here unless it is read from the process itself.
+# ASSISTANT_PROC_ROOT is a test seam so the hermetic suites can exercise this
+# without a live process; production always reads the real /proc.
+_process_env_var() {
+	local pid="$1" name="$2"
+	[ -n "$pid" ] || return 0
+	local environ_file="${ASSISTANT_PROC_ROOT:-/proc}/${pid}/environ"
 	# Open first: the process may exit between detection and inspection.
 	{ exec 3<"$environ_file"; } 2>/dev/null || return 0
 	local entry
 	while IFS= read -r -d '' entry; do
 		case "$entry" in
-		COPILOT_HOME=?*)
-			printf '%s' "${entry#COPILOT_HOME=}"
+		"$name"=?*)
+			printf '%s' "${entry#"$name"=}"
 			break
 			;;
 		esac
 	done <&3
 	exec 3<&-
 	return 0
+}
+
+# Codex's state root: CODEX_HOME replaces the whole ~/.codex path (Codex's own
+# convention, same shape as COPILOT_HOME / GROK_HOME). The candidate process's
+# value wins where it can be read; the hook's own environment is the fallback.
+codex_home() {
+	local pid="${1:-}" root=""
+	root=$(_process_env_var "$pid" CODEX_HOME)
+	[ -n "$root" ] || root="${CODEX_HOME:-$HOME/.codex}"
+	printf '%s\n' "$root"
+}
+
+# OpenCode's SQLite database lives under XDG_DATA_HOME; resolved the same way.
+opencode_db_file() {
+	local pid="${1:-}" data_home=""
+	data_home=$(_process_env_var "$pid" XDG_DATA_HOME)
+	[ -n "$data_home" ] || data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+	printf '%s/opencode/opencode.db\n' "$data_home"
 }
 
 # 8-4-4-4-12 hex. Glob-only so it costs no fork: the character class rejects
@@ -663,7 +690,8 @@ get_opencode_session() {
 	fi
 
 	# Method 4: SQLite database (version-resilient fallback).
-	# OpenCode stores sessions in ~/.local/share/opencode/opencode.db.
+	# OpenCode stores sessions in $XDG_DATA_HOME/opencode/opencode.db
+	# (default ~/.local/share); see opencode_db_file().
 	# Query the most recently updated session matching the pane's cwd.
 	# Uses python3 (available on Linux and macOS) since sqlite3 CLI
 	# is not always installed (e.g. missing on Ubuntu minimal).
@@ -672,7 +700,8 @@ get_opencode_session() {
 	# the same directory (both without -s flags and without plugin state files),
 	# both panes get the most recently updated session ID — one of them will be
 	# wrong. To avoid this, launch with explicit session IDs: opencode -s <id>.
-	local db_file="${HOME}/.local/share/opencode/opencode.db"
+	local db_file
+	db_file=$(opencode_db_file "$child_pid")
 	if [ "$allow_db_fallback" = "1" ] && [ -n "$cwd" ] && [ -f "$db_file" ] && command -v python3 >/dev/null 2>&1; then
 		local db_rc=0
 		sid=$(python3 "$PY_DIR/opencode_db.py" "$db_file" "$cwd" 2>/dev/null) || db_rc=$?
@@ -693,8 +722,11 @@ get_codex_session() {
 	local args="$2"
 	local cwd="${3:-}"
 
+	local codex_root
+	codex_root=$(codex_home "$child_pid")
+
 	# Method 1: session-tags.jsonl (written by Codex at runtime)
-	local tags_file="${HOME}/.codex/session-tags.jsonl"
+	local tags_file="${codex_root}/session-tags.jsonl"
 	if [ -f "$tags_file" ]; then
 		local sid
 		sid=$(grep "\"pid\": *${child_pid}[,}]" "$tags_file" 2>/dev/null |
@@ -716,7 +748,7 @@ get_codex_session() {
 	fi
 
 	# Method 3: Codex thread state DB (Codex >= ~0.118 persist state in
-	# SQLite: ~/.codex/state_*.sqlite, table `threads`, columns id/cwd/
+	# SQLite: $CODEX_HOME/state_*.sqlite, table `threads`, columns id/cwd/
 	# updated_at/archived).  This is the canonical current source — codex
 	# writes a `threads` row per session and bumps `updated_at` on every
 	# user turn.  A long-lived session that started days ago keeps its
@@ -734,7 +766,7 @@ get_codex_session() {
 		local process_start
 		process_start=$(get_process_start_epoch "$child_pid")
 		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_state_db.py" "$HOME/.codex" "$cwd" "$process_start"
+			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_state_db.py" "$codex_root" "$cwd" "$process_start" 2>/dev/null || true
 		)
 		if [ -n "$sid" ]; then
 			echo "$sid"
@@ -745,7 +777,7 @@ get_codex_session() {
 	# Method 4: Codex rollout session files (Codex ~0.100-0.117 wrote
 	# these; newer versions have moved to SQLite, see Method 3).
 	# Releases in that window persisted session metadata under
-	# ~/.codex/sessions/*/*.jsonl and included a session_meta record
+	# $CODEX_HOME/sessions/*/*.jsonl and included a session_meta record
 	# with both id and cwd.
 	# We rank candidates by:
 	# - matching cwd
@@ -753,12 +785,12 @@ get_codex_session() {
 	# - preferring sessions created before the current process start time
 	# - preferring sessions closest to the current process start time
 	# - preferring recently modified rollout files
-	local sessions_root="${HOME}/.codex/sessions"
+	local sessions_root="${codex_root}/sessions"
 	if [ -n "$cwd" ] && [ -d "$sessions_root" ] && command -v python3 >/dev/null 2>&1; then
 		local process_start
 		process_start=$(get_process_start_epoch "$child_pid")
 		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_rollout.py" "$sessions_root" "$cwd" "$process_start"
+			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 "$PY_DIR/codex_rollout.py" "$sessions_root" "$cwd" "$process_start" 2>/dev/null || true
 		)
 		if [ -n "$sid" ]; then
 			echo "$sid"
@@ -1136,10 +1168,14 @@ get_omp_session() {
 # Resolve grok's active-sessions registry path. grok records every live
 # interactive session in ~/.grok/active_sessions.json as an array of
 #   { "session_id": "<uuid>", "pid": <int>, "cwd": "<path>", "opened_at": "..." }
-# and updates it on session open/close. GROK_HOME lets tests (and unusual
-# installs) point this at a fixture directory.
+# and updates it on session open/close. GROK_HOME replaces the whole ~/.grok
+# path; the candidate process's own value wins where /proc exposes it, then
+# the hook's environment, then the default (same order as CODEX_HOME).
 grok_active_sessions_file() {
-	echo "${GROK_HOME:-$HOME/.grok}/active_sessions.json"
+	local pid="${1:-}" home=""
+	home=$(_process_env_var "$pid" GROK_HOME)
+	[ -n "$home" ] || home="${GROK_HOME:-$HOME/.grok}"
+	printf '%s/active_sessions.json\n' "$home"
 }
 
 get_grok_session() {
@@ -1153,7 +1189,7 @@ get_grok_session() {
 	# cwd-scoped ambiguity that opencode/codex/pi fallbacks suffer from does
 	# not apply to grok).
 	local registry sid
-	registry=$(grok_active_sessions_file)
+	registry=$(grok_active_sessions_file "$child_pid")
 	if [ -f "$registry" ]; then
 		sid=$(jq -r --arg pid "$child_pid" \
 			'.[]? | select((.pid | tostring) == $pid) | .session_id // empty' \

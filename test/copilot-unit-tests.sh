@@ -260,13 +260,13 @@ printf 'PATH=/usr/bin\0COPILOT_HOME=%s\0SHELL=/bin/bash\0' "$PROC_ROOT" \
 	>"$FAKE_PROC/4242/environ"
 assert_eq "COPILOT_HOME is read from the Copilot process environment" \
 	"$SID_PROCENV" \
-	"$(COPILOT_PROC_ROOT="$FAKE_PROC" COPILOT_HOME='' get_copilot_session 4242 "copilot" 0)"
+	"$(ASSISTANT_PROC_ROOT="$FAKE_PROC" COPILOT_HOME='' get_copilot_session 4242 "copilot" 0)"
 assert_eq "--config-dir still outranks the process environment" \
 	"$CFG_ROOT/session-state" \
-	"$(COPILOT_PROC_ROOT="$FAKE_PROC" copilot_session_state_dir "copilot --config-dir $CFG_ROOT" 4242)"
+	"$(ASSISTANT_PROC_ROOT="$FAKE_PROC" copilot_session_state_dir "copilot --config-dir $CFG_ROOT" 4242)"
 assert_eq "process environment without COPILOT_HOME falls through" \
 	"$HOME/.copilot/session-state" \
-	"$(COPILOT_PROC_ROOT="$SANDBOX/absent-proc" COPILOT_HOME='' copilot_session_state_dir "copilot" 4242)"
+	"$(ASSISTANT_PROC_ROOT="$SANDBOX/absent-proc" COPILOT_HOME='' copilot_session_state_dir "copilot" 4242)"
 
 # The save sidecar must retain the resolved state root. Discovery alone is not
 # enough: restore needs the same root to find the UUID again.
