@@ -1544,8 +1544,7 @@ handle_sessionless_relaunch() {
 	fi
 
 	# Five fields by design: keep the established session TSV schema untouched.
-	printf '%s\t%s\t%s\t%s\t%s\n' \
-		"$target" "$tool" "$cwd" "$pid" "$vouched_line" >>"$relaunch_parts"
+	tsv_row "$target" "$tool" "$cwd" "$pid" "$vouched_line" >>"$relaunch_parts"
 	[ "$log_missing" = "1" ] && log "$prefix: relaunch vouched: $vouched_line"
 	return 0
 }
@@ -2549,7 +2548,7 @@ resolve_pane_candidates() {
 				if [ -n "$state_file" ] && [ -f "$state_file" ]; then
 					[ -z "$model" ] && model=$(jq -r '.model // empty' "$state_file" 2>/dev/null || true)
 					if [ "$env_json" = "null" ]; then
-						env_json=$(jq '.env // null' "$state_file" 2>/dev/null || echo "null")
+						env_json=$(jq -c '.env // null' "$state_file" 2>/dev/null || echo "null")
 					fi
 				fi
 				env_json=$(merge_process_env "$cand_pid" "$env_json")
@@ -2563,8 +2562,7 @@ resolve_pane_candidates() {
 
 				# Write TSV for batch JSON conversion (replaces per-entry jq -n).
 				# New columns are appended so the existing indices stay put.
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" \
+				tsv_row "$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$copilot_home" \
 					"$pane_session" "$pane_window" "$pane_pane_index" "$cursor_binary" >>"$parts_file"
 
 				case "$cand_tool" in
@@ -2935,7 +2933,7 @@ main() {
 		return 1
 	fi
 	if ! jq -Rs --slurpfile envelope "$SESSIONS_TMP" '
-		split("\n") | map(select(length > 0) | split("\t") |
+		split("\n") | map(select(length > 0) | split("\t") | '"$TSV_DECODE"' |
 		{pane:.[0], tool:.[1], cwd:.[2], pid:.[3], cmd:.[4]}) as $relaunch |
 		$envelope[0] + {relaunch: $relaunch}
 	' "$RELAUNCH_PARTS_FILE" >"$OUTPUT_TMP"; then
@@ -3017,6 +3015,23 @@ strip_assistant_pane_contents() {
 	rm -rf "$tmpdir"
 }
 
+# One row of the per-pane parts files. Columns are free-form (a cwd or a prompt
+# can hold a tab or a newline, and env is JSON), so every column is escaped
+# reversibly with no forks: backslash, tab and newline become \\, \t and \n.
+# TSV_DECODE is the matching jq expression; readers apply it to every column.
+tsv_row() {
+	local tsv_line="" col sep=""
+	for col in "$@"; do
+		col="${col//\\/\\\\}"
+		col="${col//$'\t'/\\t}"
+		col="${col//$'\n'/\\n}"
+		tsv_line="$tsv_line$sep$col"
+		sep=$'\t'
+	done
+	printf '%s\n' "$tsv_line"
+}
+TSV_DECODE='map(gsub("\\\\(?<c>[\\\\tn])"; if .c == "n" then "\n" elif .c == "t" then "\t" else "\\" end))'
+
 # The per-pane TSV rows in PARTS_FILE (one session per line, columns in the
 # order resolve_pane_candidates and emit_session write them) as a JSON array.
 # New columns are appended so the existing indices stay put. Keep this the
@@ -3024,7 +3039,7 @@ strip_assistant_pane_contents() {
 # the tests all go through it.
 sessions_parts_to_json() {
 	jq -Rs '
-		split("\n") | map(select(length > 0) | split("\t") |
+		split("\n") | map(select(length > 0) | split("\t") | '"$TSV_DECODE"' |
 		{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
 		 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // ""),
 		 session_name:(.[9] // ""), window_index:(.[10] // ""), pane_index:(.[11] // ""),
@@ -3077,7 +3092,7 @@ emit_session() {
 
 		if [ -n "$state_file" ] && [ -f "$state_file" ]; then
 			model=$(jq -r '.model // empty' "$state_file" 2>/dev/null || true)
-			env_json=$(jq '.env // null' "$state_file" 2>/dev/null || echo "null")
+			env_json=$(jq -c '.env // null' "$state_file" 2>/dev/null || echo "null")
 		fi
 		env_json=$(merge_process_env "$cpid" "$env_json")
 		if replay_has_exclusions "$tool" env; then
@@ -3094,8 +3109,7 @@ emit_session() {
 		split_pane_target "$target" || true
 
 		# Same TSV row as the batched resolver; sessions_parts_to_json reads both.
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-			"$target" "$tool" "$session_id" "$cwd" "$cpid" "$model" "$cli_args" "${env_json:-null}" "$copilot_home" \
+		tsv_row "$target" "$tool" "$session_id" "$cwd" "$cpid" "$model" "$cli_args" "${env_json:-null}" "$copilot_home" \
 			"$PANE_TARGET_SESSION" "$PANE_TARGET_WINDOW" "$PANE_TARGET_INDEX" "$cursor_binary" >>"$PARTS_FILE"
 		case "$tool" in
 		claude) register_claude_session_id "$session_id" ;;
