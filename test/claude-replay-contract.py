@@ -252,7 +252,7 @@ esac
 PARTS_FILE="$REPLAY_TEST_CWD/parts.json"
 : >"$PARTS_FILE"
 emit_session contract:0.0 claude 99999999 'claude --model opus --settings={"theme":"dark"}' "$REPLAY_TEST_CWD"
-jq -s '{sessions:.}' "$PARTS_FILE" >"$TMUX_RESURRECT_DIR/assistant-sessions.json"
+sessions_parts_to_json "$PARTS_FILE" | jq '{sessions:.}' >"$TMUX_RESURRECT_DIR/assistant-sessions.json"
 """
         for name, drop_flags, drop_env, expected in [
             ("unchanged", "", "", initial),

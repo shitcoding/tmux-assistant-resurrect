@@ -39,6 +39,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-detect.sh
 source "$SCRIPT_DIR/lib-detect.sh"
+# shellcheck source=lib-log.sh
+source "$SCRIPT_DIR/lib-log.sh"
 # shellcheck source=lib-replay.sh
 source "$SCRIPT_DIR/lib-replay.sh"
 
@@ -64,7 +66,6 @@ UNRESOLVED_PANES=0
 RESURRECT_DIR="$(resurrect_data_dir)"
 OUTPUT_FILE="${RESURRECT_DIR}/assistant-sessions.json"
 LOG_FILE="${RESURRECT_DIR}/assistant-save.log"
-LOG_ENABLED=0
 CAPTURE_ENV=$(tmux show-option -gqv @assistant-resurrect-capture-env 2>/dev/null || true)
 DROP_FLAGS=$(tmux show-option -gqv @assistant-resurrect-drop-flags 2>/dev/null || true)
 DROP_ENV=$(tmux show-option -gqv @assistant-resurrect-drop-env 2>/dev/null || true)
@@ -89,72 +90,8 @@ esac
 ensure_assistant_state_dir "$STATE_DIR"
 mkdir -p "$RESURRECT_DIR"
 
-# Move an existing log aside without following it, then create the replacement
-# atomically under noclobber and retain its descriptor. Later path replacement
-# cannot redirect writes. The moved file is rechecked before it is read so a
-# raced symlink is never used as rotation input.
-_log_previous=""
-_log_previous_copied=0
-if [ -e "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
-	if [ -L "$LOG_FILE" ]; then
-		printf '%s\n' "tmux-assistant-resurrect: refusing symlinked save log: $LOG_FILE" >&2
-	elif [ ! -f "$LOG_FILE" ]; then
-		printf '%s\n' "tmux-assistant-resurrect: refusing non-regular save log: $LOG_FILE" >&2
-	else
-		_log_previous=$(mktemp "${LOG_FILE}.rotate.XXXXXX" 2>/dev/null || true)
-		if [ -z "$_log_previous" ] || ! mv "$LOG_FILE" "$_log_previous" 2>/dev/null; then
-			printf '%s\n' "tmux-assistant-resurrect: cannot rotate save log, disabling file logging: $LOG_FILE" >&2
-			[ -z "$_log_previous" ] || rm -f "$_log_previous"
-			_log_previous=""
-		fi
-	fi
-fi
-
-if { [ ! -e "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ]; } &&
-	{ [ -z "$_log_previous" ] || { [ -f "$_log_previous" ] && [ ! -L "$_log_previous" ]; }; }; then
-	_log_had_noclobber=0
-	case "$-" in *C*) _log_had_noclobber=1 ;; esac
-	_log_old_umask=$(umask)
-	umask 077
-	set -C
-	if exec 9>"$LOG_FILE"; then
-		LOG_ENABLED=1
-	fi
-	[ "$_log_had_noclobber" -eq 1 ] || set +C
-	umask "$_log_old_umask"
-	if [ "$LOG_ENABLED" -eq 1 ] && [ -n "$_log_previous" ]; then
-		if tail -n 500 "$_log_previous" >&9 2>/dev/null; then
-			_log_previous_copied=1
-		fi
-	fi
-fi
-
-if [ -n "$_log_previous" ]; then
-	if [ "$LOG_ENABLED" -eq 1 ] && [ "$_log_previous_copied" -eq 1 ]; then
-		rm -f "$_log_previous"
-	else
-		printf '%s\n' "tmux-assistant-resurrect: previous save log retained at $_log_previous" >&2
-	fi
-fi
-if [ "$LOG_ENABLED" -ne 1 ] && [ ! -e "$LOG_FILE" ]; then
-	printf '%s\n' "tmux-assistant-resurrect: cannot securely open save log, disabling file logging: $LOG_FILE" >&2
-fi
-unset _log_previous _log_previous_copied _log_had_noclobber _log_old_umask
-
-log() {
-	local msg
-	msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
-	msg="${msg//$'\r'/\\r}"
-	msg="${msg//$'\n'/\\n}"
-	msg="${msg//$'\033'/\\e}"
-	printf '%s\n' "$msg" >&2
-	if [ "$LOG_ENABLED" -eq 1 ]; then
-		if ! printf '%s\n' "$msg" >&9 2>/dev/null; then
-			LOG_ENABLED=0
-			printf '%s\n' "tmux-assistant-resurrect: cannot write save log, disabling file logging: $LOG_FILE" >&2
-		fi
-	fi
-}
+# Log rotation and log() live in lib-log.sh, shared with the restore hook.
+open_assistant_log "$LOG_FILE" save
 
 # Move state files left in any pre-$HOME default into the current state dir.
 #
@@ -1642,6 +1579,19 @@ merge_process_env() {
 		'($saved // {}) + $process'
 }
 
+# Model fallback when the state file carries none: the first `--model <value>`
+# or `--model=<value>` in the process args. One definition for both producers
+# (the batched resolver and the compatibility emit_session), which had drifted
+# into a bash regex and a sed expression that disagreed on repeated flags.
+# Regex kept in a variable for bash 3.2, where an inline group fails to parse.
+model_from_args() {
+	local args="$1" re='--model[= ]([^ ]+)'
+	if [[ "$args" =~ $re ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	fi
+	return 0
+}
+
 # --- CLI args extraction helpers ---
 
 # Exact argv, boundaries intact, from /proc/<pid>/cmdline (NUL-separated).
@@ -2571,12 +2521,7 @@ resolve_pane_candidates() {
 					env_json=$(replay_filter_env "$cand_tool" "$env_json")
 				fi
 
-				# Fallback: parse --model from CLI args if not in state file.
-				# Regex stored in variable for bash 3.2 compat (inline capture groups fail).
-				local _model_re='--model[= ]([^ ]+)'
-				if [ -z "$model" ] && [[ "$cand_args" =~ $_model_re ]]; then
-					model="${BASH_REMATCH[1]}"
-				fi
+				[ -n "$model" ] || model=$(model_from_args "$cand_args")
 
 				if replay_flag_is_dropped "$cand_tool" --model; then model=""; fi
 
@@ -2948,14 +2893,7 @@ main() {
 	local count=0 relaunch_count=0
 	SESSIONS_TMP=$(mktemp "${OUTPUT_FILE}.sessions.tmp.XXXXXX")
 	OUTPUT_TMP=$(mktemp "${OUTPUT_FILE}.tmp.XXXXXX")
-	if ! jq -Rs --arg ts "$SAVE_TS" '
-			split("\n") | map(select(length > 0) | split("\t") |
-			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
-			 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // ""),
-			 session_name:(.[9] // ""), window_index:(.[10] // ""), pane_index:(.[11] // ""),
-			 cursor_binary:(.[12] // "")})
-			| {timestamp: $ts, sessions: .}
-		' "$PARTS_FILE" >"$SESSIONS_TMP"; then
+	if ! sessions_parts_to_json "$PARTS_FILE" | jq --arg ts "$SAVE_TS" '{timestamp: $ts, sessions: .}' >"$SESSIONS_TMP"; then
 		rm -f "$SESSIONS_TMP" "$OUTPUT_TMP"
 		log "warning: failed to serialize sessions; keeping previous $OUTPUT_FILE"
 		return 1
@@ -3043,9 +2981,25 @@ strip_assistant_pane_contents() {
 	rm -rf "$tmpdir"
 }
 
+# The per-pane TSV rows in PARTS_FILE (one session per line, columns in the
+# order resolve_pane_candidates and emit_session write them) as a JSON array.
+# New columns are appended so the existing indices stay put. Keep this the
+# only reader of that shape: the batched path, the compatibility emitter and
+# the tests all go through it.
+sessions_parts_to_json() {
+	jq -Rs '
+		split("\n") | map(select(length > 0) | split("\t") |
+		{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
+		 env:(.[7] // "null" | try fromjson catch null), copilot_home:(.[8] // ""),
+		 session_name:(.[9] // ""), window_index:(.[10] // ""), pane_index:(.[11] // ""),
+		 cursor_binary:(.[12] // "")})
+	' "$1"
+}
+
 # Retained for backward compatibility — main() no longer calls this directly
 # (batched processing replaced per-pane emit), but external scripts or tests
-# may source this file and call emit_session().
+# may source this file and call emit_session(). It appends the same TSV row
+# the batched path writes; read PARTS_FILE back with sessions_parts_to_json.
 emit_session() {
 	local target="$1" tool="$2" cpid="$3" cargs="$4" cwd="$5"
 	local allow_opencode_db="${6:-1}"
@@ -3094,10 +3048,7 @@ emit_session() {
 			env_json=$(replay_filter_env "$tool" "$env_json")
 		fi
 
-		# Fallback: parse --model from CLI args if not in state file
-		if [ -z "$model" ]; then
-			model=$(echo "$cargs" | sed -n 's/.*--model[= ] *\([^ ]*\).*/\1/p')
-		fi
+		[ -n "$model" ] || model=$(model_from_args "$cargs")
 
 		if replay_flag_is_dropped "$tool" --model; then model=""; fi
 
@@ -3106,21 +3057,10 @@ emit_session() {
 		PANE_TARGET_SESSION="" PANE_TARGET_WINDOW="" PANE_TARGET_INDEX=""
 		split_pane_target "$target" || true
 
-		jq -n \
-			--arg pane "$target" \
-			--arg tool "$tool" \
-			--arg sid "$session_id" \
-			--arg cwd "$cwd" \
-			--arg pid "$cpid" \
-			--arg model "$model" \
-			--arg cli_args "$cli_args" \
-			--arg copilot_home "$copilot_home" \
-			--arg session_name "$PANE_TARGET_SESSION" \
-			--arg window_index "$PANE_TARGET_WINDOW" \
-			--arg pane_index "$PANE_TARGET_INDEX" \
-			--arg cursor_binary "$cursor_binary" \
-			--argjson env "${env_json:-null}" \
-			'{pane: $pane, tool: $tool, session_id: $sid, cwd: $cwd, pid: $pid, model: $model, cli_args: $cli_args, env: $env, copilot_home: $copilot_home, session_name: $session_name, window_index: $window_index, pane_index: $pane_index, cursor_binary: $cursor_binary}' >>"$PARTS_FILE"
+		# Same TSV row as the batched resolver; sessions_parts_to_json reads both.
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$target" "$tool" "$session_id" "$cwd" "$cpid" "$model" "$cli_args" "${env_json:-null}" "$copilot_home" \
+			"$PANE_TARGET_SESSION" "$PANE_TARGET_WINDOW" "$PANE_TARGET_INDEX" "$cursor_binary" >>"$PARTS_FILE"
 		case "$tool" in
 		claude) register_claude_session_id "$session_id" ;;
 		codex) register_codex_session_id "$session_id" ;;

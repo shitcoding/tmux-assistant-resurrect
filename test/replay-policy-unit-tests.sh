@@ -104,8 +104,8 @@ get_claude_session() { echo sid-review; }
 printf '%s\n' '{"model":"opus","env":{"ANTHROPIC_MODEL":"opus","KEEP":"yes"}}' >"$STATE_DIR/claude-999999.json"
 PARTS_FILE="$SANDBOX/parts.json"
 emit_session review:0.0 claude 999999 'claude --model opus --verbose' "$SANDBOX"
-assert_eq 'compatibility emitter removes the model fallback' '' "$(jq -r .model "$PARTS_FILE")"
-assert_eq 'compatibility emitter removes excluded environment' '{"KEEP":"yes"}' "$(jq -c .env "$PARTS_FILE")"
+assert_eq 'compatibility emitter removes the model fallback' '' "$(sessions_parts_to_json "$PARTS_FILE" | jq -r '.[0].model')"
+assert_eq 'compatibility emitter removes excluded environment' '{"KEEP":"yes"}' "$(sessions_parts_to_json "$PARTS_FILE" | jq -c '.[0].env')"
 : >"$PARTS_FILE"
 resolve_pane_candidates review:0.0 "$SANDBOX" /dev/pts/1 \
 	$'claude\x1f999999\x1fclaude --model opus --verbose' $'\x1f' 0 "$SANDBOX/no-cache" "$PARTS_FILE" review 0 0

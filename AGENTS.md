@@ -12,6 +12,7 @@ restore them automatically.
 - `tmux-assistant-resurrect.tmux` -- TPM plugin entry point (sets tmux options, installs hooks)
 - `hooks/` -- Native hooks/plugins for each assistant tool (write session IDs to state files)
 - `scripts/lib-detect.sh` -- Shared library: `detect_tool()`, `pane_has_assistant()`, `posix_quote()`
+- `scripts/lib-log.sh` -- Shared log handling: `open_assistant_log()` (rotation, owner-only, retained fd 9) and `log()`, used by both hooks
 - `scripts/save-assistant-sessions.sh` -- Resurrect post-save hook (process detection + session IDs + enriched fields via `extract_cli_args()`)
 - `scripts/restore-assistant-sessions.sh` -- Resurrect post-restore hook (resumes assistants with CLI flags + env vars)
 - `config/` -- tmux configuration snippet (used by `just install`, not TPM)
@@ -215,7 +216,7 @@ process args as a reliable fallback.
   Otherwise `<tool> --help` re-execs once per pane on every save.
 - Log files go to `assistant-{save,restore}.log` in tmux-resurrect's save dir
   (resolved by `resurrect_data_dir` in `lib-detect.sh`; truncated to 500 lines per
-  run). Sidecars, state files, and logs contain session/environment data: create
+  run) and are opened only through `open_assistant_log()` in `scripts/lib-log.sh`. Sidecars, state files, and logs contain session/environment data: create
   them owner-only, publish JSON atomically, use unpredictable same-directory
   temporary files, and never append through a symlinked log path.
 - Process inspection uses `ps -eo pid= -o ppid=` (not `pgrep -P` -- unreliable on macOS)
