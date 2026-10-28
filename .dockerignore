@@ -1,1 +1,9 @@
 .git
+.github
+.claude
+.test-deps
+test-results
+docs
+*.md
+!README.md
+*.log

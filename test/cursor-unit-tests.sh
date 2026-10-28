@@ -18,18 +18,8 @@ source "$REPO_DIR/scripts/lib-detect.sh"
 # shellcheck source=../scripts/save-assistant-sessions.sh
 source "$REPO_DIR/scripts/save-assistant-sessions.sh" >/dev/null 2>&1
 
-PASS=0
-FAIL=0
-assert_eq() {
-	local desc="$1" expected="$2" actual="$3"
-	if [ "$expected" = "$actual" ]; then
-		PASS=$((PASS + 1))
-		printf '  [pass] %s\n' "$desc"
-	else
-		FAIL=$((FAIL + 1))
-		printf '  [FAIL] %s\n        expected: [%s]\n        actual:   [%s]\n' "$desc" "$expected" "$actual"
-	fi
-}
+# shellcheck source=lib-assert.sh
+source "$REPO_DIR/test/lib-assert.sh"
 
 echo "== detect_tool =="
 assert_eq "legacy cursor-agent binary" "cursor" "$(detect_tool 'cursor-agent --resume 750b1c55-f1b2-4ff1-804e-9c38d1b2c7e2')"

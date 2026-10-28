@@ -25,11 +25,8 @@ _tool_help() {
 	pi) printf '  -t, --tools <tools>  Tools\n' ;;
 	esac
 }
-PASS=0 FAIL=0
-assert_eq() {
-	if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '[pass] %s\n' "$1"
-	else FAIL=$((FAIL+1)); printf '[FAIL] %s: expected [%s], got [%s]\n' "$1" "$2" "$3"; fi
-}
+# shellcheck source=lib-assert.sh
+source "$REPO_DIR/test/lib-assert.sh"
 
 DROP_FLAGS=--model
 assert_eq 'all adjacent occurrences disappear' '--verbose' \

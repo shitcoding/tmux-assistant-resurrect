@@ -14,31 +14,8 @@ TMUX_LOG="$SANDBOX/tmux.log"
 ASSISTANT_MARKER="$SANDBOX/assistant.marker"
 mkdir -p "$MOCK_BIN" "$RESURRECT_DIR"
 
-PASS=0
-FAIL=0
-pass() {
-	PASS=$((PASS + 1))
-	printf '  [pass] %s\n' "$1"
-}
-fail() {
-	FAIL=$((FAIL + 1))
-	printf '  [FAIL] %s\n' "$1"
-}
-assert_eq() {
-	local desc="$1" expected="$2" actual="$3"
-	if [ "$expected" = "$actual" ]; then
-		pass "$desc"
-	else
-		fail "$desc (expected [$expected], got [$actual])"
-	fi
-}
-assert_contains() {
-	local desc="$1" haystack="$2" needle="$3"
-	case "$haystack" in
-	*"$needle"*) pass "$desc" ;;
-	*) fail "$desc (missing [$needle])" ;;
-	esac
-}
+# shellcheck source=lib-assert.sh
+source "$REPO_DIR/test/lib-assert.sh"
 assert_not_contains() {
 	local desc="$1" haystack="$2" needle="$3"
 	case "$haystack" in
@@ -1141,15 +1118,6 @@ assert_eq 'conflicting required state root sends no command' '' "$(cat "$TMUX_LO
 assert_contains 'conflicting required state root is diagnosed' "$RESTORE_OUTPUT" 'cannot drop COPILOT_HOME'
 
 echo
-# This suite is already run on Linux, macOS and the Windows portability canary.
-# Keep the shared policy regressions on that same matrix without a new workflow.
-if replay_policy_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/replay-policy-unit-tests.sh" 2>&1); then
-	echo "$replay_policy_output"
-	pass "shared replay policy suite"
-else
-	echo "$replay_policy_output"
-	fail "shared replay policy suite"
-fi
 # Antigravity restores with its own selector and preserves ordinary flags.
 export MOCK_EXEC_SHELL='' MOCK_DROP_ENV='' MOCK_DROP_FLAGS=''
 export MOCK_SHELLS='' MOCK_PANES='%90|0|0|agy-test'
@@ -1160,13 +1128,5 @@ run_restore
 assert_eq 'agy restore succeeds' 0 "$RESTORE_STATUS"
 assert_contains 'agy uses exact conversation selector' "$(cat "$TMUX_LOG")" "command agy '--model' 'test' '--effort' 'high' --conversation 'e8d5d5bb-d278-44cc-9ba3-79b6896dce97'"
 
-# Use this existing cross-platform CI entry point for agy's hermetic suite.
-if agy_unit_output=$("${TEST_BASH:-bash}" "$REPO_DIR/test/agy-unit-tests.sh" 2>&1); then
-	echo "$agy_unit_output"
-	pass "Antigravity CLI session suite"
-else
-	echo "$agy_unit_output"
-	fail "Antigravity CLI session suite"
-fi
 echo "restore unit tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

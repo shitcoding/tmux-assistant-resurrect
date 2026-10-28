@@ -19,18 +19,8 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../scripts/lib-detect.sh
 source "$REPO_DIR/scripts/lib-detect.sh"
 
-PASS=0
-FAIL=0
-assert_eq() {
-	local desc="$1" expected="$2" actual="$3"
-	if [ "$expected" = "$actual" ]; then
-		PASS=$((PASS + 1))
-		printf '  [pass] %s\n' "$desc"
-	else
-		FAIL=$((FAIL + 1))
-		printf '  [FAIL] %s\n        expected: [%s]\n        actual:   [%s]\n' "$desc" "$expected" "$actual"
-	fi
-}
+# shellcheck source=lib-assert.sh
+source "$REPO_DIR/test/lib-assert.sh"
 
 # Call split_pane_target and render the outcome as "session|window|index", or
 # "<rejected>" when it returns non-zero. The variables are cleared first so a
