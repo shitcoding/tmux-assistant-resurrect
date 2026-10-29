@@ -33,7 +33,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: '26'
 
       # Gate at error+warning severity (info-level findings are not blockers).
       # SC1091: shellcheck cannot follow dynamic source paths — expected.
@@ -109,7 +109,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: '26'
 
       # The contract suite drives a real Copilot under tmux, so tmux is required.
       # It is not preinstalled on macOS runners.
