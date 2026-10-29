@@ -758,6 +758,29 @@ Add to `~/.tmux.conf`:
 set -g @continuum-save-interval '10'  # minutes (default: 5)
 ```
 
+### Restore pacing (per-pane delays)
+
+Restore paces itself twice per assistant pane: a short settle after clearing the
+pane, and a stagger between launches so a machine with many agents does not start
+them all at once. Both default to the values they replace, so leaving them unset
+restores exactly as before.
+
+```bash
+set -g @assistant-resurrect-clear-delay '0.3'      # seconds after clearing, before the replay
+set -g @assistant-resurrect-launch-stagger '1'     # seconds between launches
+```
+
+They matter at scale, because they are paid per pane and the per-session client
+wait no longer is. On a server with 38 assistant panes they account for roughly
+`38 x 1.3s` of the restore. Lowering them trades startup smoothness for
+wall-clock; `0` removes a delay entirely.
+
+Non-negative decimals are accepted (`0`, `0.05`, `2.5`). Anything else falls back
+to the default rather than being passed to `sleep`.
+
+> `@assistant-resurrect-clear-delay` sits between `clear-history` and the replay,
+> giving the pane a moment to settle before the resume command is sent.
+
 ### Save-hook timeout (watchdog)
 
 Once the save hook reaches its main work — process detection, session-ID

@@ -32,6 +32,9 @@ if [ -n "${MOCK_SWAP_LOG_PATH:-}" ] && [ ! -e "${MOCK_SWAP_LOG_MARKER:-}" ]; the
 	rm -f "$MOCK_SWAP_LOG_PATH"
 	ln -s "$MOCK_SWAP_LOG_TARGET" "$MOCK_SWAP_LOG_PATH"
 fi
+if [ -n "${MOCK_SLEEP_LOG:-}" ]; then
+	printf '%s\n' "${1:-}" >>"$MOCK_SLEEP_LOG"
+fi
 exit 0
 MOCK_SLEEP
 
@@ -190,6 +193,8 @@ show-option)
 	@assistant-resurrect-capture-env) printf '%s\n' "${MOCK_CAPTURE_ENV:-}" ;;
 	@assistant-resurrect-drop-flags) printf '%s\n' "${MOCK_DROP_FLAGS:-}" ;;
 	@assistant-resurrect-drop-env) printf '%s\n' "${MOCK_DROP_ENV:-}" ;;
+	@assistant-resurrect-clear-delay) printf '%s\n' "${MOCK_CLEAR_DELAY:-}" ;;
+	@assistant-resurrect-launch-stagger) printf '%s\n' "${MOCK_LAUNCH_STAGGER:-}" ;;
 	@assistant-resurrect-claude-drop-flags) printf '%s\n' "${MOCK_CLAUDE_DROP_FLAGS:-}" ;;
 	@assistant-resurrect-claude-drop-env) printf '%s\n' "${MOCK_CLAUDE_DROP_ENV:-}" ;;
 	@assistant-resurrect-relaunch) printf '%s\n' "${MOCK_RELAUNCH_ENABLED:-on}" ;;
@@ -262,9 +267,12 @@ export PATH="$MOCK_BIN:$PATH"
 export TMUX_RESURRECT_DIR="$RESURRECT_DIR"
 export MOCK_TMUX_LOG="$TMUX_LOG"
 export MOCK_ASSISTANT_MARKER="$ASSISTANT_MARKER"
+SLEEP_LOG="$SANDBOX/sleep.log"
+export MOCK_SLEEP_LOG="$SLEEP_LOG"
 
 run_restore() {
 	: >"$TMUX_LOG"
+	: >"$SLEEP_LOG"
 	rm -f "$ASSISTANT_MARKER"
 	RESTORE_OUTPUT=""
 	RESTORE_STATUS=0
@@ -1127,6 +1135,50 @@ JSON
 run_restore
 assert_eq 'agy restore succeeds' 0 "$RESTORE_STATUS"
 assert_contains 'agy uses exact conversation selector' "$(cat "$TMUX_LOG")" "command agy '--model' 'test' '--effort' 'high' --conversation 'e8d5d5bb-d278-44cc-9ba3-79b6896dce97'"
+
+# --- per-pane pacing is configurable, and defaults to what it replaces --------
+# Two panes in one session, so each per-pane sleep appears twice.
+export MOCK_EXEC_SHELL=''
+export MOCK_FAIL_CLEAR_PANE=''
+export MOCK_CAPTURE_ENV=''
+export MOCK_PANES='%40|0|0|pace
+%41|0|1|pace'
+export MOCK_SHELLS=''
+jq -n '{sessions:[
+{pane:"pace:0.0",session_name:"pace",window_index:"0",pane_index:"0",tool:"claude",session_id:"sid-p0",cwd:""},
+{pane:"pace:0.1",session_name:"pace",window_index:"0",pane_index:"1",tool:"claude",session_id:"sid-p1",cwd:""}
+]}' >"$RESURRECT_DIR/assistant-sessions.json"
+
+# -F -x: a bare "." is one of the rejected values under test and would match
+# any single-character line as a regex.
+pace_counts() { grep -c -F -x -- "$1" "$SLEEP_LOG" || true; }
+
+export MOCK_CLEAR_DELAY='' MOCK_LAUNCH_STAGGER=''
+run_restore
+assert_eq "unset options keep the clear delay at 0.3" "2" "$(pace_counts 0.3)"
+assert_eq "unset options keep the launch stagger at 1" "2" "$(pace_counts 1)"
+
+export MOCK_CLEAR_DELAY='0' MOCK_LAUNCH_STAGGER='0'
+run_restore
+assert_eq "clear delay honours the option" "4" "$(pace_counts 0)"
+assert_eq "no 0.3 sleeps remain once the clear delay is overridden" "0" "$(pace_counts 0.3)"
+assert_eq "both panes are still replayed with the delays at zero" "2" \
+	"$(grep -c '^send-keys|%4[01]|command claude' "$TMUX_LOG")"
+
+export MOCK_CLEAR_DELAY='0.05' MOCK_LAUNCH_STAGGER='2.5'
+run_restore
+assert_eq "fractional clear delay is passed through" "2" "$(pace_counts 0.05)"
+assert_eq "fractional launch stagger is passed through" "2" "$(pace_counts 2.5)"
+
+# A bad value must never reach sleep(1) as an argument.
+for bad in 'abc' '1;rm' '1.2.3' '.' '-1'; do
+	export MOCK_CLEAR_DELAY="$bad" MOCK_LAUNCH_STAGGER="$bad"
+	run_restore
+	assert_eq "rejected clear delay [$bad] falls back to 0.3" "2" "$(pace_counts 0.3)"
+	assert_eq "rejected launch stagger [$bad] falls back to 1" "2" "$(pace_counts 1)"
+	assert_eq "rejected value [$bad] never reaches sleep" "0" "$(pace_counts "$bad")"
+done
+export MOCK_CLEAR_DELAY='' MOCK_LAUNCH_STAGGER=''
 
 echo "restore unit tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

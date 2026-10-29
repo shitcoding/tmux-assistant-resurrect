@@ -103,6 +103,23 @@ DROP_FLAGS=$(tmux show-option -gqv @assistant-resurrect-drop-flags 2>/dev/null |
 # shellcheck disable=SC2034 # consumed by the shared replay policy
 DROP_ENV=$(tmux show-option -gqv @assistant-resurrect-drop-env 2>/dev/null || true)
 
+# Per-pane pacing. Both default to the values they replace, so an unset
+# configuration restores exactly as before. A machine with tens of assistant
+# panes pays these once per pane, which is the dominant cost of a restore once
+# the per-session client wait is in play, so they are worth being able to tune.
+# Non-negative decimals; anything else falls back to the default rather than
+# reaching sleep(1) as a bad argument.
+_valid_delay() {
+	case "$1" in
+		'' | . | *[!0-9.]* | *.*.*) return 1 ;;
+	esac
+	return 0
+}
+CLEAR_DELAY=$(tmux show-option -gqv @assistant-resurrect-clear-delay 2>/dev/null || true)
+_valid_delay "$CLEAR_DELAY" || CLEAR_DELAY=0.3
+LAUNCH_STAGGER=$(tmux show-option -gqv @assistant-resurrect-launch-stagger 2>/dev/null || true)
+_valid_delay "$LAUNCH_STAGGER" || LAUNCH_STAGGER=1
+
 # Wait for panes to be fully initialized after resurrect restore
 sleep 2
 
@@ -589,7 +606,7 @@ while read -r entry; do
 		log "pane $pane disappeared while clearing, skipping"
 		continue
 	fi
-	sleep 0.3
+	sleep "$CLEAR_DELAY"
 
 	if ! tmux send-keys -t "$pane_id" "$full_cmd" Enter 2>/dev/null; then
 		log "pane $pane disappeared before replay, skipping"
@@ -600,7 +617,7 @@ while read -r entry; do
 	restored=$((restored + 1))
 
 	# Stagger launches to avoid overwhelming the system
-	sleep 1
+	sleep "$LAUNCH_STAGGER"
 done <"$tmpfile"
 
 rm -f "$tmpfile"
