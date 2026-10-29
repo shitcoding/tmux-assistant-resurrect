@@ -76,6 +76,7 @@ install-cursor-hook: install-claude-hook
 configure-tmux:
     #!/usr/bin/env bash
     set -euo pipefail
+    source "{{repo_dir}}/scripts/lib-fs.sh"
     conf="$HOME/.tmux.conf"
     tpm_line="run '~/.tmux/plugins/tpm/tpm'"
     begin_marker="# --- begin tmux-assistant-resurrect ---"
@@ -83,18 +84,48 @@ configure-tmux:
 
     touch "$conf"
 
+    # ~/.tmux.conf is commonly a symlink into a dotfiles repo. Resolve it and
+    # publish beside the resolved target so the link, and its mode, survive.
+    conf_rc=0
+    conf_target=$(resolve_symlink_target "$conf") || conf_rc=$?
+    case "$conf_rc" in
+        1)
+            echo "tmux-assistant-resurrect: cannot read symlink chain at $conf; left unchanged" >&2
+            exit 0
+            ;;
+        2)
+            echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $conf" >&2
+            exit 0
+            ;;
+    esac
+    conf_mode=$(file_mode_of "$conf_target") || {
+        echo "tmux-assistant-resurrect: cannot read mode for $conf; left unchanged" >&2
+        exit 0
+    }
+    # Policy, not safety: a config the user made read-only is left alone, the
+    # same call uninstall-claude-hook makes for a read-only dotfile store.
+    # Nothing is lost without this guard -- each replacement is a fresh
+    # caller-owned mktemp file, so the appends below still succeed and the
+    # mode is restored at the end -- the config simply gets edited against
+    # the user's wishes. (Cyclic chains do not reach the refusal at all: the
+    # `touch` above fails on them first.)
+    if [ ! -w "$conf_target" ]; then
+        echo "tmux-assistant-resurrect: $conf_target is not writable; left unchanged" >&2
+        exit 0
+    fi
+
     # Remove any existing marker block (handles re-runs and repo_dir changes).
     if grep -qF "$begin_marker" "$conf"; then
-        tmp=$(mktemp)
+        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
         sed "/$begin_marker/,/$end_marker/d" "$conf" > "$tmp"
-        mv "$tmp" "$conf"
+        mv -f "$tmp" "$conf_target"
     fi
 
     # Remove legacy source-file line from pre-marker installs
     if grep -qF "resurrect-assistants.conf" "$conf"; then
-        tmp=$(mktemp)
+        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
         grep -v "resurrect-assistants.conf" "$conf" | grep -v "# tmux-assistant-resurrect" > "$tmp" || true
-        mv "$tmp" "$conf"
+        mv -f "$tmp" "$conf_target"
     fi
 
     # Capture and remove the TPM init line so we can re-add it at the very
@@ -107,10 +138,10 @@ configure-tmux:
     existing_tpm_line=""
     if grep -F "tpm/tpm" "$conf" | grep -qv '^[[:space:]]*#' 2>/dev/null; then
         existing_tpm_line=$(grep -F "tpm/tpm" "$conf" | grep -v '^[[:space:]]*#' | tail -1)
-        tmp=$(mktemp)
+        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
         # Only remove non-comment lines containing tpm/tpm (preserve comments)
         grep -v '^[^#]*tpm/tpm' "$conf" > "$tmp" || true
-        mv "$tmp" "$conf"
+        mv -f "$tmp" "$conf_target"
     fi
 
     # Write the new block with begin/end markers. The markers allow
@@ -146,6 +177,15 @@ configure-tmux:
         echo "Added TPM init to $conf"
     fi
 
+    # Everything is written; put the config's own mode back on it -- but only
+    # if a replacement changed it. With no managed block, legacy line or TPM
+    # line to strip, nothing was replaced, the file is still the user's own,
+    # and chmod on a file this recipe does not own fails under set -e after
+    # the appends have already landed.
+    if [ "$(file_mode_of "$conf_target")" != "$conf_mode" ]; then
+        chmod "$conf_mode" "$conf_target"
+    fi
+
 # Remove all installed hooks and config
 uninstall: uninstall-claude-hook uninstall-cursor-hook uninstall-opencode-plugin unconfigure-tmux
     @echo ""
@@ -157,6 +197,7 @@ uninstall: uninstall-claude-hook uninstall-cursor-hook uninstall-opencode-plugin
 uninstall-claude-hook:
     #!/usr/bin/env bash
     set -euo pipefail
+    source "{{repo_dir}}/scripts/lib-fs.sh"
     settings="$HOME/.claude/settings.json"
     if [ ! -f "$settings" ]; then
         echo "No Claude settings to modify"
@@ -166,50 +207,22 @@ uninstall-claude-hook:
     # publish beside the resolved target so the link survives; keep this
     # sequence aligned with install_claude_hooks() in tmux-assistant-resurrect.tmux
     # and with uninstall-cursor-hook below.
-    target="$settings"
-    link_depth=0
-    while [ -L "$target" ] && [ "$link_depth" -lt 16 ]; do
-        link=$(readlink "$target") || {
-            echo "tmux-assistant-resurrect: cannot read symlink $target; left unchanged" >&2
+    resolve_rc=0
+    target=$(resolve_symlink_target "$settings") || resolve_rc=$?
+    case "$resolve_rc" in
+        1)
+            echo "tmux-assistant-resurrect: cannot read symlink chain at $settings; left unchanged" >&2
             exit 0
-        }
-        case "$link" in
-            /*) target="$link" ;;
-            *) target="$(dirname "$target")/$link" ;;
-        esac
-        link_depth=$((link_depth + 1))
-    done
-    if [ -L "$target" ]; then
-        echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $settings" >&2
+            ;;
+        2)
+            echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $settings" >&2
+            exit 0
+            ;;
+    esac
+    target_mode=$(file_mode_of "$target") || {
+        echo "tmux-assistant-resurrect: cannot read mode for $settings; left unchanged" >&2
         exit 0
-    fi
-    # BSD stat's %p includes the file type plus all permission bits; keep its
-    # final four octal digits. The literal prefix makes GNU stat -f output fail
-    # the octal guard before -c retries.
-    target_mode=$(stat -f 'mode:%p' "$target" 2>/dev/null || true)
-    case "$target_mode" in
-        mode:*) target_mode=${target_mode#mode:} ;;
-        *) target_mode="" ;;
-    esac
-    case "$target_mode" in
-        '' | *[!0-7]*) target_mode="" ;;
-        *)
-            if [ "${#target_mode}" -ge 4 ]; then
-                target_mode=${target_mode#"${target_mode%????}"}
-            else
-                target_mode=""
-            fi
-            ;;
-    esac
-    case "$target_mode" in
-        '' | *[!0-7]*) target_mode=$(stat -c '%a' "$target" 2>/dev/null || true) ;;
-    esac
-    case "$target_mode" in
-        '' | *[!0-7]*)
-            echo "tmux-assistant-resurrect: cannot read mode for $settings; left unchanged" >&2
-            exit 0
-            ;;
-    esac
+    }
     tmp=$(mktemp "${target}.tmp.XXXXXX") || {
         echo "tmux-assistant-resurrect: cannot prepare update for $settings; left unchanged" >&2
         exit 0
@@ -266,6 +279,7 @@ uninstall-claude-hook:
 uninstall-cursor-hook:
     #!/usr/bin/env bash
     set -euo pipefail
+    source "{{repo_dir}}/scripts/lib-fs.sh"
     settings="$HOME/.cursor/hooks.json"
     if [ ! -f "$settings" ]; then
         echo "No Cursor hooks to modify"
@@ -273,50 +287,22 @@ uninstall-cursor-hook:
     fi
     # Keep this resolution/update sequence aligned with install_cursor_hooks()
     # in tmux-assistant-resurrect.tmux.
-    target="$settings"
-    link_depth=0
-    while [ -L "$target" ] && [ "$link_depth" -lt 16 ]; do
-        link=$(readlink "$target") || {
-            echo "tmux-assistant-resurrect: cannot read symlink $target; left unchanged" >&2
+    resolve_rc=0
+    target=$(resolve_symlink_target "$settings") || resolve_rc=$?
+    case "$resolve_rc" in
+        1)
+            echo "tmux-assistant-resurrect: cannot read symlink chain at $settings; left unchanged" >&2
             exit 0
-        }
-        case "$link" in
-            /*) target="$link" ;;
-            *) target="$(dirname "$target")/$link" ;;
-        esac
-        link_depth=$((link_depth + 1))
-    done
-    if [ -L "$target" ]; then
-        echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $settings" >&2
+            ;;
+        2)
+            echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $settings" >&2
+            exit 0
+            ;;
+    esac
+    target_mode=$(file_mode_of "$target") || {
+        echo "tmux-assistant-resurrect: cannot read mode for $settings; left unchanged" >&2
         exit 0
-    fi
-    # BSD stat's %p includes the file type plus all permission bits; keep its
-    # final four octal digits. The literal prefix makes GNU stat -f output fail
-    # the octal guard before -c retries.
-    target_mode=$(stat -f 'mode:%p' "$target" 2>/dev/null || true)
-    case "$target_mode" in
-        mode:*) target_mode=${target_mode#mode:} ;;
-        *) target_mode="" ;;
-    esac
-    case "$target_mode" in
-        '' | *[!0-7]*) target_mode="" ;;
-        *)
-            if [ "${#target_mode}" -ge 4 ]; then
-                target_mode=${target_mode#"${target_mode%????}"}
-            else
-                target_mode=""
-            fi
-            ;;
-    esac
-    case "$target_mode" in
-        '' | *[!0-7]*) target_mode=$(stat -c '%a' "$target" 2>/dev/null || true) ;;
-    esac
-    case "$target_mode" in
-        '' | *[!0-7]*)
-            echo "tmux-assistant-resurrect: cannot read mode for $settings; left unchanged" >&2
-            exit 0
-            ;;
-    esac
+    }
     tmp=$(mktemp "${target}.tmp.XXXXXX") || {
         echo "tmux-assistant-resurrect: cannot prepare update for $settings; left unchanged" >&2
         exit 0
@@ -367,10 +353,30 @@ uninstall-opencode-plugin:
 unconfigure-tmux:
     #!/usr/bin/env bash
     set -euo pipefail
+    source "{{repo_dir}}/scripts/lib-fs.sh"
     conf="$HOME/.tmux.conf"
     if [ ! -f "$conf" ]; then
         exit 0
     fi
+
+    # ~/.tmux.conf is commonly a symlink into a dotfiles repo. Resolve it and
+    # publish beside the resolved target so the link, and its mode, survive.
+    conf_rc=0
+    conf_target=$(resolve_symlink_target "$conf") || conf_rc=$?
+    case "$conf_rc" in
+        1)
+            echo "tmux-assistant-resurrect: cannot read symlink chain at $conf; left unchanged" >&2
+            exit 0
+            ;;
+        2)
+            echo "tmux-assistant-resurrect: refusing deep or cyclic symlink chain at $conf" >&2
+            exit 0
+            ;;
+    esac
+    conf_mode=$(file_mode_of "$conf_target") || {
+        echo "tmux-assistant-resurrect: cannot read mode for $conf; left unchanged" >&2
+        exit 0
+    }
 
     begin_marker="# --- begin tmux-assistant-resurrect ---"
     end_marker="# --- end tmux-assistant-resurrect ---"
@@ -379,16 +385,18 @@ unconfigure-tmux:
     # NOTE: sed range pattern works because markers contain no sed-special
     # characters. If markers ever change, escaping may be needed.
     if grep -qF "$begin_marker" "$conf"; then
-        tmp=$(mktemp)
+        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
         sed "/$begin_marker/,/$end_marker/d" "$conf" > "$tmp"
-        mv "$tmp" "$conf"
+        chmod "$conf_mode" "$tmp"
+        mv -f "$tmp" "$conf_target"
     fi
 
     # Also remove legacy format (source-file + comment, pre-marker installs)
     if grep -qF "resurrect-assistants.conf" "$conf"; then
-        tmp=$(mktemp)
+        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
         grep -v "resurrect-assistants.conf" "$conf" | grep -v "# tmux-assistant-resurrect" > "$tmp" || true
-        mv "$tmp" "$conf"
+        chmod "$conf_mode" "$tmp"
+        mv -f "$tmp" "$conf_target"
     fi
 
     echo "Removed tmux-assistant-resurrect settings from $conf"
