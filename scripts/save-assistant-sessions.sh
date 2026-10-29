@@ -2002,18 +2002,35 @@ _copilot_drop_flattened_values() {
 
 # Strip a long option: --flag, --flag=val, or --flag val.
 # Value (if space-separated) must not start with "-" to avoid consuming next flag.
+# The pattern consumes the separator on BOTH sides and replaces the pair with a
+# single space, so under /g the separator an adjacent repeat needs in order to
+# match has already been eaten and only every other occurrence goes
+# ("--flag a --flag b" left "--flag b" behind). Loop with t instead: each branch
+# restarts on the whole pattern space, so the eaten separator does not matter.
+#
+# The loop terminates because each substitution removes one occurrence of the
+# flag and the replacement -- a single space -- cannot create another. That
+# argument fails only when the flag is itself empty or whitespace: then the
+# pattern matches a lone space and writes a lone space back, and t branches
+# forever. /g could not spin, so this is the class of input the loop made
+# worse, and each helper refuses it first. No caller passes such a flag today
+# (_discover_session_flags drops blank lines and every fallback entry starts
+# with "--"), which is why the guard is here rather than at one call site.
 _strip_long_opt() {
-	echo "$2" | sed -E "s/(^| )$1(=[^ ]*| +[^- ][^ ]*)?( |$)/ /g"
+	case "$1" in '' | *[[:space:]]*) echo "$2"; return ;; esac
+	echo "$2" | sed -E -e :a -e "s/(^| )$1(=[^ ]*| +[^- ][^ ]*)?( |$)/ /" -e ta
 }
 
-# Strip a short option: -X or -X val.
+# Strip a short option: -X or -X val. Same t loop, same reason.
 _strip_short_opt() {
-	echo "$2" | sed -E "s/(^| )$1( +[^- ][^ ]*)?( |$)/ /g"
+	case "$1" in '' | *[[:space:]]*) echo "$2"; return ;; esac
+	echo "$2" | sed -E -e :a -e "s/(^| )$1( +[^- ][^ ]*)?( |$)/ /" -e ta
 }
 
 # Strip a boolean long option (no value): --flag
 _strip_bool_opt() {
-	echo "$2" | sed -E "s/(^| )$1( |$)/ /g"
+	case "$1" in '' | *[[:space:]]*) echo "$2"; return ;; esac
+	echo "$2" | sed -E -e :a -e "s/(^| )$1( |$)/ /" -e ta
 }
 
 # Strip known subcommands from args (e.g. "resume <id>" or "fork <id>").
