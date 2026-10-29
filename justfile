@@ -104,28 +104,53 @@ configure-tmux:
     }
     # Policy, not safety: a config the user made read-only is left alone, the
     # same call uninstall-claude-hook makes for a read-only dotfile store.
-    # Nothing is lost without this guard -- each replacement is a fresh
-    # caller-owned mktemp file, so the appends below still succeed and the
-    # mode is restored at the end -- the config simply gets edited against
-    # the user's wishes. (Cyclic chains do not reach the refusal at all: the
-    # `touch` above fails on them first.)
+    # Nothing is lost without this guard -- the update below is assembled in a
+    # caller-owned temp file and lands in one rename -- the config would simply
+    # be edited against the user's wishes. (Cyclic chains do not reach the
+    # refusal at all: the `touch` above fails on them first.)
     if [ ! -w "$conf_target" ]; then
         echo "tmux-assistant-resurrect: $conf_target is not writable; left unchanged" >&2
         exit 0
     fi
 
+    # Assemble the whole update in one sibling temp file and publish it once.
+    # Replacing the config per edit (strip the managed block, strip the legacy
+    # line, strip the TPM line) and appending afterwards left it wearing the
+    # temp file's 0600 from the first replacement until a final chmod, and a
+    # failure inside that window made the next run read 0600 as the mode to
+    # restore. One publish has no such window: until the rename the config is
+    # exactly as the user left it, and the temp file carries the config's own
+    # mode before it lands. The EXIT trap removes the working files on any
+    # failure, so nothing is left beside the target either.
+    tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
+    next=""
+    trap 'rm -f "$tmp" ${next:+"$next"}' EXIT
+    cp "$conf" "$tmp"
+
+    # Rewrite the working copy through a second sibling temp (a filter cannot
+    # read and write the same file). grep -v exits 1 when it drops every line,
+    # which is a legitimate result here, not a failure.
+    drop_lines() {
+        next=$(mktemp "${conf_target}.tmp.XXXXXX")
+        grep -v "$@" "$tmp" > "$next" || [ "$?" -eq 1 ]
+        mv -f "$next" "$tmp"
+        next=""
+    }
+
     # Remove any existing marker block (handles re-runs and repo_dir changes).
-    if grep -qF "$begin_marker" "$conf"; then
-        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
-        sed "/$begin_marker/,/$end_marker/d" "$conf" > "$tmp"
-        mv -f "$tmp" "$conf_target"
+    # NOTE: The sed range works because the marker strings contain no
+    # sed-special characters (no /, *, ., etc.). If the markers ever change,
+    # the sed command may need escaping.
+    if grep -qF "$begin_marker" "$tmp"; then
+        next=$(mktemp "${conf_target}.tmp.XXXXXX")
+        sed "/$begin_marker/,/$end_marker/d" "$tmp" > "$next"
+        mv -f "$next" "$tmp"
+        next=""
     fi
 
-    # Remove legacy source-file line from pre-marker installs
-    if grep -qF "resurrect-assistants.conf" "$conf"; then
-        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
-        grep -v "resurrect-assistants.conf" "$conf" | grep -v "# tmux-assistant-resurrect" > "$tmp" || true
-        mv -f "$tmp" "$conf_target"
+    # Remove legacy source-file line (and its comment) from pre-marker installs
+    if grep -qF "resurrect-assistants.conf" "$tmp"; then
+        drop_lines -e "resurrect-assistants.conf" -e "# tmux-assistant-resurrect"
     fi
 
     # Capture and remove the TPM init line so we can re-add it at the very
@@ -136,20 +161,15 @@ configure-tmux:
     # Filter out comment lines when capturing — a commented example like
     # "# run '/old/tpm/tpm'" must not be mistaken for the real init line.
     existing_tpm_line=""
-    if grep -F "tpm/tpm" "$conf" | grep -qv '^[[:space:]]*#' 2>/dev/null; then
-        existing_tpm_line=$(grep -F "tpm/tpm" "$conf" | grep -v '^[[:space:]]*#' | tail -1)
-        tmp=$(mktemp "${conf_target}.tmp.XXXXXX")
+    if grep -F "tpm/tpm" "$tmp" | grep -qv '^[[:space:]]*#' 2>/dev/null; then
+        existing_tpm_line=$(grep -F "tpm/tpm" "$tmp" | grep -v '^[[:space:]]*#' | tail -1)
         # Only remove non-comment lines containing tpm/tpm (preserve comments)
-        grep -v '^[^#]*tpm/tpm' "$conf" > "$tmp" || true
-        mv -f "$tmp" "$conf_target"
+        drop_lines '^[^#]*tpm/tpm'
     fi
 
     # Write the new block with begin/end markers. The markers allow
     # unconfigure-tmux to remove exactly what we added (including plugin
     # lines) without affecting user settings outside the block.
-    # NOTE: The sed patterns in this recipe work because the marker
-    # strings contain no sed-special characters (no /, *, ., etc.).
-    # If the markers ever change, the sed commands may need escaping.
     {
         echo ""
         echo "$begin_marker"
@@ -164,27 +184,27 @@ configure-tmux:
         echo "set -g @continuum-save-interval '5'"
         echo "set -g @continuum-restore 'on'"
         echo "$end_marker"
-    } >> "$conf"
-    echo "Added tmux-assistant-resurrect settings to $conf"
+    } >> "$tmp"
 
     # Re-add TPM init as the very last line (required by TPM).
     # Use the user's original line if we captured one, otherwise the default.
     if [ -n "$existing_tpm_line" ]; then
-        echo "$existing_tpm_line" >> "$conf"
-        echo "TPM init moved to end of $conf"
+        echo "$existing_tpm_line" >> "$tmp"
+        tpm_message="TPM init moved to end of $conf"
     else
-        echo "$tpm_line" >> "$conf"
-        echo "Added TPM init to $conf"
+        echo "$tpm_line" >> "$tmp"
+        tpm_message="Added TPM init to $conf"
     fi
 
-    # Everything is written; put the config's own mode back on it -- but only
-    # if a replacement changed it. With no managed block, legacy line or TPM
-    # line to strip, nothing was replaced, the file is still the user's own,
-    # and chmod on a file this recipe does not own fails under set -e after
-    # the appends have already landed.
-    if [ "$(file_mode_of "$conf_target")" != "$conf_mode" ]; then
-        chmod "$conf_mode" "$conf_target"
-    fi
+    # Publish. The temp file takes the config's own mode first, so the rename
+    # never exposes mktemp's 0600 and there is nothing to restore afterwards.
+    # A mode without owner-write (a group-writable config owned by someone
+    # else) is fine at this point: every append has already landed.
+    chmod "$conf_mode" "$tmp"
+    mv -f "$tmp" "$conf_target"
+    trap - EXIT
+    echo "Added tmux-assistant-resurrect settings to $conf"
+    echo "$tpm_message"
 
 # Remove all installed hooks and config
 uninstall: uninstall-claude-hook uninstall-cursor-hook uninstall-opencode-plugin unconfigure-tmux

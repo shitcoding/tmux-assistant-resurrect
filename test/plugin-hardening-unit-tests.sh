@@ -1064,6 +1064,29 @@ else
     assert_eq "unconfigure-tmux leaves no temp file beside the target" "" \
         "$(find "$TMUX_CONF_STORE" -name 'tmux.conf.tmp.*' 2>/dev/null)"
 
+    # A plain (non-symlinked) config keeps its own mode too, and the legacy
+    # pre-marker lines go in the same pass. configure-tmux now assembles the
+    # whole update in one temp file and publishes it once, so there is no
+    # window in which the config carries mktemp's 0600; this pins the mode,
+    # the legacy strip, the TPM line ending up last, and no leftover temp.
+    PLAIN_CONF_HOME="$TEST_ROOT/tmuxconf-plain-home"
+    mkdir -p "$PLAIN_CONF_HOME"
+    printf 'set -g mouse on\n# tmux-assistant-resurrect\nsource-file ~/.tmux/resurrect-assistants.conf\nrun %s~/.tmux/plugins/tpm/tpm%s\n' "'" "'" \
+        >"$PLAIN_CONF_HOME/.tmux.conf"
+    chmod 644 "$PLAIN_CONF_HOME/.tmux.conf"
+    plain_conf_rc=0
+    HOME="$PLAIN_CONF_HOME" just --justfile "$ROOT_DIR/justfile" configure-tmux >/dev/null 2>&1 || plain_conf_rc=$?
+    assert_eq "configure-tmux succeeds on a plain legacy config" "0" "$plain_conf_rc"
+    assert_file_mode "configure-tmux keeps a plain config's mode" 644 "$PLAIN_CONF_HOME/.tmux.conf"
+    assert_eq "configure-tmux drops the legacy source-file line and its comment" "0" \
+        "$(grep -cE -- 'resurrect-assistants\.conf|^# tmux-assistant-resurrect$' "$PLAIN_CONF_HOME/.tmux.conf")"
+    assert_eq "configure-tmux writes one managed block into a plain config" "1" \
+        "$(grep -cF -- '--- begin tmux-assistant-resurrect ---' "$PLAIN_CONF_HOME/.tmux.conf")"
+    assert_eq "configure-tmux keeps the user's TPM line as the last line" "run '~/.tmux/plugins/tpm/tpm'" \
+        "$(tail -n 1 "$PLAIN_CONF_HOME/.tmux.conf")"
+    assert_eq "configure-tmux leaves no temp file beside a plain config" "" \
+        "$(find "$PLAIN_CONF_HOME" -name '.tmux.conf.tmp.*' 2>/dev/null)"
+
     # A read-only config is left alone rather than edited against the user's
     # wishes. Nothing would be lost without the refusal -- it would simply be
     # rewritten -- so the assertion is that the file is untouched.
